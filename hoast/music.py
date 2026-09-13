@@ -1,0 +1,1141 @@
+"""Music Assistant 2.10.3 HTTP RPC and conservative existing-stream controls.
+
+Pause/unpause never request media, source selection, or queue resume. They require
+a retained pause-capable source and player; idle external audio sources may also
+resume. They recheck before dispatch and observe once afterward. These snapshots
+are not atomic: stock MA can redirect
+commands or rebuild playback if state changes during dispatch. Source drift is
+reported without retries or restoration. An acknowledgement is not proof of audio.
+Explicit new music replaces a queue with a dynamic Endless Mix; its seed need not
+play first and recommendation providers determine how long it can continue.
+Blank play_music arguments use native resume without requesting a new stream.
+"""
+
+import json
+import logging
+import unicodedata
+from collections.abc import Callable
+from http.client import HTTPException
+from traceback import TracebackException
+from typing import Any, Literal, Self
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, OpenerDirector, Request, build_opener
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    ValidationError,
+    model_validator,
+)
+
+from hoast.config import MusicConfig
+from hoast.llm import Tool, ToolArguments
+
+_MAX_BYTES = 4 * 1024 * 1024
+_SEARCH_LIMIT = 25
+_LOGGER = logging.getLogger(__name__)
+
+
+class MusicAssistantError(RuntimeError):
+    """Transport, malformed response, or unsupported player operation error."""
+
+
+class MusicArguments(ToolArguments):
+    """No arguments for existing-stream pause and resume."""
+
+
+class PlayMusicArguments(ToolArguments):
+    """Optional new-music constraints; two blank fields resume existing playback."""
+
+    title: str = Field(default="", max_length=300, description="Song title, if known")
+    """Exact title constraint after Unicode, case, and whitespace normalization."""
+
+    artist: str = Field(
+        default="", max_length=300, description="Recording artist, if known"
+    )
+    """Exact recording artist constraint; blank with a blank title means native resume."""
+
+
+class VolumeMusicArguments(ToolArguments):
+    """Strict volume request; zero is the omitted relative-level sentinel."""
+
+    action: Literal["set", "louder", "quieter"] = Field(
+        description="set for a numeric volume; louder/quieter for relative changes"
+    )
+    """Five-point adjustment direction or absolute setting."""
+
+    level: int = Field(
+        default=0,
+        ge=0,
+        le=100,
+        description="Volume 1–100 with action=set; omit for louder/quieter",
+    )
+    """Absolute percentage from 1–100 for set; zero for relative actions."""
+
+    @model_validator(mode="after")
+    def validate_level(self) -> Self:
+        """Validate absolute/relative levels and return the unchanged argument instance."""
+        if (self.action == "set") != (self.level != 0):
+            raise ValueError("Set requires level 1–100; louder/quieter omit level")
+        return self
+
+
+class _Response(BaseModel):
+    """Validate only the response fields consumed by this client."""
+
+    model_config: ConfigDict = ConfigDict(strict=True, extra="ignore")
+    """Reject coercion while ignoring unrelated external response fields."""
+
+
+class _Source(_Response):
+    """Native source pause capability."""
+
+    id: str
+    """Source identifier from the player's source list."""
+
+    can_play_pause: bool = False
+    """Whether the source advertises pause and unpause support."""
+
+
+class _Player(_Response):
+    """Small player state projection; unrelated media metadata is ignored."""
+
+    player_id: str = Field(min_length=1)
+    """Registered player identifier."""
+
+    name: str
+    """Human-readable player name."""
+
+    type: str
+    """MA player type, including protocol players excluded from selection."""
+
+    available: bool
+    """Whether the device is reachable."""
+
+    enabled: bool = True
+    """Whether MA enables this player."""
+
+    playback_state: Literal["idle", "paused", "playing"] = "idle"
+    """Observed native playback state."""
+
+    active_source: str | None = None
+    """Identifier of the currently retained source, if reported."""
+
+    source_list: list[_Source] = Field(default_factory=list)
+    """Source capabilities indexed locally by identifier."""
+
+    supported_features: list[str] = Field(default_factory=list)
+    """Advertised features; playback requires pause and volume requires volume_set."""
+
+    volume_level: int | None = Field(default=None, ge=0, le=100)
+    """Individual logical volume percentage; None means unavailable."""
+
+    group_volume: int | None = Field(default=None, ge=0, le=100)
+    """Group logical volume percentage; None means unavailable, not zero."""
+
+    group_members: list[str] = Field(default_factory=list)
+    """Group membership; a nonempty list identifies a native sync leader."""
+
+    synced_to: str | None = None
+    """Native sync leader, resolved before active_group."""
+
+    active_group: str | None = None
+    """Active group player whose source the member hears."""
+
+    active_output_protocol: str | None = None
+    """Active native/protocol output; changes invalidate a pre-dispatch snapshot."""
+
+    @property
+    def grouped(self) -> bool:
+        """Identify dedicated groups and native sync leaders as MA does."""
+        return self.type == "group" or bool(self.group_members)
+
+    @property
+    def current_volume(self) -> int | None:
+        """Return group volume for grouped targets, otherwise individual volume."""
+        return self.group_volume if self.grouped else self.volume_level
+
+    def volume_route(self) -> tuple[str, str, tuple[str, ...], str | None, bool]:
+        """Capture effective identity, membership, output, and volume capability."""
+        return (
+            self.player_id,
+            self.type,
+            tuple(sorted(self.group_members)),
+            self.active_output_protocol,
+            "volume_set" in self.supported_features,
+        )
+
+    def compact(self) -> dict[str, JsonValue]:
+        """Return compact state with this target's group-aware volume, or None."""
+        return {
+            "player_id": self.player_id,
+            "name": self.name,
+            "available": self.available,
+            "enabled": self.enabled,
+            "state": self.playback_state,
+            "source": self.active_source,
+            "synced_to": self.synced_to,
+            "active_group": self.active_group,
+            "volume_level": self.current_volume,
+        }
+
+
+class _QueueSource(_Response):
+    """URI-only projection of a queue's dynamic source."""
+
+    uri: str | None = None
+    """Container source URI, if reported by MA."""
+
+
+class _Queue(_Response):
+    """Queue identity and observable dynamic-playback state."""
+
+    queue_id: str = Field(min_length=1)
+    """Actual queue identifier, which can differ from the selected player."""
+
+    available: bool
+    """Whether this queue can receive playback."""
+
+    state: Literal["idle", "paused", "playing"] = "idle"
+    """Last reported queue playback state."""
+
+    is_dynamic: bool = False
+    """Whether MA reports a dynamic queue."""
+
+    sources: list[_QueueSource] = Field(default_factory=list)
+    """Small source-container list used to confirm the requested Endless Mix seed."""
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Refuse redirecting authenticated requests away from the configured API."""
+
+    def redirect_request(
+        self,
+        req: Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> None:
+        """Reject every redirect via urllib's HTTPError path.
+
+        Args:
+            req:
+                Original request.
+
+            fp:
+                Response stream.
+
+            code:
+                HTTP redirect status.
+
+            msg:
+                HTTP reason.
+
+            headers:
+                Response headers.
+
+            newurl:
+                Rejected redirect target.
+
+        """
+        return
+
+
+def _object(value: JsonValue) -> dict[str, JsonValue]:
+    """Require a response object without scanning unrelated nested arrays.
+
+    Args:
+        value:
+            Decoded JSON value.
+
+    """
+    if not isinstance(value, dict):
+        raise MusicAssistantError("Expected a Music Assistant response object")
+    return value
+
+
+def _array(value: JsonValue) -> list[JsonValue]:
+    """Require a JSON array without validating all its elements.
+
+    Args:
+        value:
+            Decoded JSON value.
+
+    """
+    if not isinstance(value, list):
+        raise MusicAssistantError("Expected a Music Assistant response array")
+    return value
+
+
+def _text(value: JsonValue) -> str:
+    """Require a nonblank string at the external boundary.
+
+    Args:
+        value:
+            Decoded field value.
+
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise MusicAssistantError("Expected nonblank Music Assistant text")
+    return value
+
+
+def _boolean(value: JsonValue) -> bool:
+    """Require a boolean without accepting integer coercion.
+
+    Args:
+        value:
+            Decoded field value.
+
+    """
+    if not isinstance(value, bool):
+        raise MusicAssistantError("Expected Music Assistant boolean")
+    return value
+
+
+def _parse[T: _Response](model: type[T], value: JsonValue) -> T:
+    """Validate a small projection without exposing server data in errors.
+
+    Args:
+        model:
+            Response projection class.
+
+        value:
+            Decoded JSON response.
+
+    """
+    try:
+        return model.model_validate(value)
+    except ValidationError:
+        raise MusicAssistantError("Malformed Music Assistant state response") from None
+
+
+def _normalize(value: str) -> str:
+    """Normalize Unicode compatibility, case, and whitespace, retaining punctuation.
+
+    Args:
+        value:
+            Title or artist text to compare exactly.
+
+    """
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _reject_constant(value: str) -> None:
+    """Reject non-JSON numeric constants accepted by Python's decoder.
+
+    Args:
+        value:
+            Invalid numeric constant spelling.
+
+    """
+    raise ValueError("Invalid JSON numeric constant")
+
+
+class MusicClient:
+    """Synchronous fixed-endpoint client; credentials are resolved by the caller."""
+
+    _config: MusicConfig
+    """Validated server and optional explicit player configuration."""
+
+    _token: str
+    """Bearer credential, never included in diagnostics or returned results."""
+
+    _url: str
+    """Configured server's fixed /api endpoint."""
+
+    _opener: OpenerDirector
+    """HTTP transport refusing all redirects."""
+
+    def __init__(self, config: MusicConfig, token: str) -> None:
+        """Construct the transport without making requests or reading environment.
+
+        Args:
+            config:
+                Server URL and optional player identifier.
+
+            token:
+                Required bearer token resolved separately by the configuration helper.
+
+        """
+        if (
+            not isinstance(token, str)
+            or not token.strip()
+            or any(ord(character) < 33 or ord(character) > 126 for character in token)
+        ):
+            raise ValueError("Music Assistant requires a nonblank bearer token")
+        parts = urlsplit(config.server_url)
+        if (
+            parts.scheme not in {"http", "https"}
+            or not parts.hostname
+            or parts.username is not None
+            or parts.password is not None
+            or parts.query
+            or parts.fragment
+            or parts.path not in {"", "/"}
+        ):
+            raise ValueError("Music Assistant server_url must be an HTTP(S) origin")
+        self._config = config
+        self._token = token
+        self._url = config.server_url.rstrip("/") + "/api"
+        self._opener = build_opener(_NoRedirect())
+
+    def _request(self, command: str, **args: JsonValue) -> JsonValue:
+        """Log one RPC's arguments and selected response fields without credentials.
+
+        Args:
+            command:
+                Fixed MA command name supplied by this client.
+
+            **args:
+                Command-specific JSON arguments, redacted before logging.
+
+        """
+        _LOGGER.debug("Music RPC %s args=%s", command, self._redact(json.dumps(args)))
+        try:
+            result = self._rpc(command, **args)
+        except MusicAssistantError as error:
+            self._log_failure(command, error)
+            raise
+        # Inspect only nonsecret state projections, never full provider metadata.
+        summary: dict[str, JsonValue] = {"type": type(result).__name__}
+        if isinstance(result, list):
+            summary["count"] = len(result)
+        elif isinstance(result, dict):
+            for key in (
+                "player_id",
+                "queue_id",
+                "playback_state",
+                "state",
+                "available",
+                "active_source",
+                "is_dynamic",
+                "volume_level",
+                "group_volume",
+            ):
+                value = result.get(key)
+                if key in result and (
+                    value is None or isinstance(value, (str, bool, int, float))
+                ):
+                    summary[key] = value
+            for key in ("tracks", "artists"):
+                value = result.get(key)
+                if isinstance(value, list):
+                    summary[f"{key}_count"] = len(value)
+        _LOGGER.debug(
+            "Music RPC %s status=ok response=%s",
+            command,
+            self._redact(json.dumps(summary)),
+        )
+        return result
+
+    def _redact(self, text: str) -> str:
+        """Remove the bearer token and its serialized spellings from diagnostic text.
+
+        Args:
+            text:
+                Formatted diagnostic text, never a raw provider inventory.
+
+        """
+        for secret in (
+            json.dumps(self._token)[1:-1],
+            repr(self._token)[1:-1],
+            self._token,
+        ):
+            text = text.replace(secret, "[redacted]")
+        return text
+
+    def _log_failure(self, operation: str, error: Exception) -> None:
+        """Log complete sanitized traceback chains and notes without local variables.
+
+        Args:
+            operation:
+                Public tool or RPC name whose execution failed.
+
+            error:
+                Failure, including contexts hidden from the user-facing exception.
+
+        """
+        trace = TracebackException.from_exception(error)
+        current: TracebackException | None = trace
+        while current is not None:
+            current.__suppress_context__ = False
+            current = current.__cause__ or current.__context__
+        _LOGGER.error(
+            "Music %s status=error\n%s",
+            operation,
+            self._redact("".join(trace.format(chain=True))),
+        )
+
+    def _run_tool(
+        self,
+        name: str,
+        args: dict[str, JsonValue],
+        operation: Callable[[], JsonValue],
+    ) -> JsonValue:
+        """Run a public music operation with consistent direct-call and tool diagnostics.
+
+        Args:
+            name:
+                Public tool name.
+
+            args:
+                Explicit nonsecret tool arguments, redacted before logging.
+
+            operation:
+                Validated operation returning a compact outcome.
+
+        """
+        _LOGGER.info("Music tool %s args=%s", name, self._redact(json.dumps(args)))
+        try:
+            result = operation()
+        except (MusicAssistantError, ValidationError) as error:
+            self._log_failure(name, error)
+            raise
+        outcome = _object(result)
+        status = outcome.get("status")
+        _LOGGER.info(
+            "Music tool %s status=%s confirmation=%s",
+            name,
+            self._redact(str(status)),
+            outcome.get("confirmation"),
+        )
+        _LOGGER.debug(
+            "Music tool %s result=%s", name, self._redact(json.dumps(outcome))
+        )
+        if status in {
+            "not_playing",
+            "cannot_resume",
+            "cannot_volume",
+            "player_required",
+            "not_found",
+            "ambiguous",
+        }:
+            reason = outcome.get("reason") or {
+                "player_required": "Configure a unique available player.",
+                "not_found": "No available match satisfies the title and artist constraints.",
+                "ambiguous": "Matches have different recording artist sets.",
+            }.get(str(status), "Existing playback cannot perform this operation.")
+            _LOGGER.warning(
+                "Music tool %s status=%s reason=%s",
+                name,
+                self._redact(str(status)),
+                self._redact(str(reason)),
+            )
+        return result
+
+    def _rpc(self, command: str, **args: JsonValue) -> JsonValue:
+        """Execute one RPC, checking HTTP status and limiting responses to 4 MiB.
+
+        No retries are performed, including after uncertain mutation failures.
+        Server error bodies and underlying exception text are never exposed.
+
+        Args:
+            command:
+                Fixed MA command name supplied by this client.
+
+            **args:
+                Command-specific JSON arguments.
+
+        """
+        request = Request(
+            self._url,
+            data=json.dumps({"command": command, "args": args}).encode(),
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with self._opener.open(request, timeout=30) as response:
+                if not 200 <= response.status < 300:
+                    raise MusicAssistantError(f"Music Assistant HTTP {response.status}")
+                body = response.read(_MAX_BYTES + 1)
+        except HTTPError as error:
+            code = error.code
+            error.close()
+            detail = " (check token and permissions)" if code in {401, 403} else ""
+            raise MusicAssistantError(f"Music Assistant HTTP {code}{detail}") from None
+        except URLError, OSError, ValueError, HTTPException:
+            raise MusicAssistantError("Music Assistant transport failed") from None
+        if len(body) > _MAX_BYTES:
+            raise MusicAssistantError("Music Assistant response exceeds 4 MiB")
+        try:
+            result: JsonValue = json.loads(body, parse_constant=_reject_constant)
+        except ValueError, UnicodeError, RecursionError:
+            raise MusicAssistantError(
+                "Music Assistant returned malformed JSON"
+            ) from None
+        return result
+
+    def tools(self) -> list[Tool[Any]]:
+        """Expose four compact music tools with strict argument models."""
+        return [
+            Tool(
+                "pause_music",
+                "Pause the existing music stream.",
+                MusicArguments,
+                lambda args: self.pause_music(),
+            ),
+            Tool(
+                "resume_music",
+                "Unpause the existing music stream.",
+                MusicArguments,
+                lambda args: self.resume_music(),
+            ),
+            Tool(
+                "play_music",
+                "No title or artist resumes existing playback; new explicit title/artist starts an endless mix.",
+                PlayMusicArguments,
+                lambda args: self.play_music(args.title, args.artist),
+            ),
+            Tool(
+                "volume_music",
+                "Set volume 1–100 using action=set; louder/quieter changes it by 5 points.",
+                VolumeMusicArguments,
+                lambda args: self.volume_music(args.action, args.level),
+            ),
+        ]
+
+    def _players(self) -> list[_Player]:
+        """Read registered nonprotocol players, including disabled/unavailable ones."""
+        return [
+            _parse(_Player, value)
+            for value in _array(
+                self._request(
+                    "players/all",
+                    return_unavailable=True,
+                    return_disabled=True,
+                    return_protocol_players=False,
+                )
+            )
+        ]
+
+    def players(self) -> JsonValue:
+        """List compact targets with their own group-aware volume, without resolving members."""
+        return [
+            player.compact() for player in self._players() if player.type != "protocol"
+        ]
+
+    def _select(self) -> _Player | dict[str, JsonValue]:
+        """Require a configured player or exactly one eligible nonprotocol player."""
+        players = self._players()
+        eligible = [
+            p for p in players if p.available and p.enabled and p.type != "protocol"
+        ]
+        if self._config.player_id:
+            selected = next(
+                (p for p in players if p.player_id == self._config.player_id), None
+            )
+            if selected is None or selected not in eligible:
+                raise MusicAssistantError(
+                    "Configured music player is missing, unavailable, disabled, or protocol-only"
+                )
+            return selected
+        if len(eligible) != 1:
+            return {
+                "status": "player_required",
+                "choices": [p.compact() for p in eligible],
+            }
+        return eligible[0]
+
+    def _effective(self, player_id: str) -> _Player:
+        """Resolve the native sync leader and active group, rejecting routing cycles.
+
+        Args:
+            player_id:
+                Selected player's identifier, re-read for every snapshot.
+
+        """
+        seen: set[str] = set()
+        for _ in range(16):
+            if player_id in seen:
+                raise MusicAssistantError("Music Assistant player group cycle")
+            seen.add(player_id)
+            player = _parse(_Player, self._request("players/get", player_id=player_id))
+            if player.player_id != player_id:
+                raise MusicAssistantError("Music Assistant returned a different player")
+            if not player.available or not player.enabled or player.type == "protocol":
+                raise MusicAssistantError(
+                    "Effective music player is unavailable or unsupported"
+                )
+            parent = next(
+                (
+                    p
+                    for p in (player.synced_to, player.active_group)
+                    if p and p != player_id
+                ),
+                None,
+            )
+            if parent is None:
+                return player
+            player_id = parent
+        raise MusicAssistantError("Music Assistant group nesting exceeds 16 players")
+
+    def status(self) -> JsonValue:
+        """Read effective state, group-aware volume, and queue without changing playback."""
+        selected = self._select()
+        if isinstance(selected, dict):
+            return selected
+        player = self._effective(selected.player_id)
+        result = player.compact()
+        queue = self._request(
+            "player_queues/get_active_queue", player_id=player.player_id
+        )
+        result["queue"] = (
+            None if queue is None else _parse(_Queue, queue).model_dump(mode="json")
+        )
+        return result
+
+    def pause_music(self) -> JsonValue:
+        """Pause only a playing, native-pause-capable existing source; never stop it."""
+        return self._run_tool("pause_music", {}, lambda: self._control(resume=False))
+
+    def resume_music(self) -> JsonValue:
+        """Resume retained paused playback or an idle external AudioSource session."""
+        return self._run_tool("resume_music", {}, lambda: self._control(resume=True))
+
+    def volume_music(
+        self, action: Literal["louder", "quieter", "set"], level: int = 0
+    ) -> JsonValue:
+        """Adjust idle or active volume without playback RPCs; observe once, never retry.
+
+        Args:
+            action:
+                Louder or quieter changes five points; set uses an absolute level.
+
+            level:
+                Set percentage 1–100; relative requests use the omitted default zero.
+
+        """
+        return self._run_tool(
+            "volume_music",
+            {"action": action, "level": level},
+            lambda: self._volume_music(
+                VolumeMusicArguments(action=action, level=level)
+            ),
+        )
+
+    def _volume_music(self, args: VolumeMusicArguments) -> JsonValue:
+        """Recheck routing and current volume before one native volume mutation.
+
+        Snapshots are non-atomic. Group targets use group_volume, never a member's
+        individual reading. Missing relative readings refuse dispatch; absolute
+        settings need only advertised volume support. Readback lag is requested,
+        while routing drift after dispatch reports cannot_volume and requested.
+
+        Args:
+            args:
+                Validated absolute or five-point relative volume request.
+
+        """
+        selected = self._select()
+        if isinstance(selected, dict):
+            return {**selected, "reason": "Configure a unique available player."}
+        before = self._effective(selected.player_id)
+        current = before.current_volume
+        target = args.level if args.action == "set" else current
+        if current is not None and args.action != "set":
+            target = (
+                min(100, current + 5)
+                if args.action == "louder"
+                else min(current, max(1, current - 5))
+            )
+        base: dict[str, JsonValue] = {
+            "player_id": before.player_id,
+            "level": target,
+        }
+        if "volume_set" not in before.supported_features:
+            return {
+                **base,
+                "status": "cannot_volume",
+                "reason": "This player does not support volume control.",
+            }
+        if target is None:
+            return {
+                **base,
+                "status": "cannot_volume",
+                "reason": "Current volume is unavailable; specify a level from 1 to 100.",
+            }
+        checked = self._effective(selected.player_id)
+        if (
+            checked.volume_route() != before.volume_route()
+            or checked.current_volume != current
+        ):
+            return {
+                **base,
+                "status": "cannot_volume",
+                "reason": "Player, group, capability, or volume changed; no command sent.",
+            }
+        if target == current:
+            return {**base, "status": "volume_unchanged", "confirmation": "observed"}
+        self._request(
+            "players/cmd/group_volume" if before.grouped else "players/cmd/volume_set",
+            player_id=before.player_id,
+            volume_level=target,
+        )
+        after = self._effective(selected.player_id)
+        if after.volume_route() != before.volume_route():
+            return {
+                **base,
+                "status": "cannot_volume",
+                "confirmation": "requested",
+                "reason": "Player or group changed during dispatch; no retry attempted.",
+                "observed_player_id": after.player_id,
+            }
+        return {
+            **base,
+            "status": "volume_set",
+            "confirmation": "observed"
+            if after.current_volume == target
+            else "requested",
+            "observed_level": after.current_volume,
+        }
+
+    def _control(self, *, resume: bool) -> JsonValue:
+        """Check source/state around one native command; report acknowledgement separately.
+
+        Args:
+            resume:
+                True to resume, False to pause. Idle external AudioSource sessions
+                may resume if their source does not identify an MA queue. Queue
+                lookups are read-only; no media or queue mutation is requested.
+
+        """
+        selected = self._select()
+        if isinstance(selected, dict):
+            return selected
+        before = self._effective(selected.player_id)
+        failure = "cannot_resume" if resume else "not_playing"
+        base: dict[str, JsonValue] = {
+            "player_id": before.player_id,
+            "source": before.active_source,
+        }
+        if not before.active_source:
+            return {
+                **base,
+                "status": failure,
+                "reason": "No retained source; explicitly request new music.",
+            }
+        idle_external = (
+            resume
+            and before.playback_state == "idle"
+            and "://audio_source/" in before.active_source
+        )
+        if before.playback_state == "idle" and not idle_external:
+            return {
+                **base,
+                "status": failure,
+                "reason": "Idle native resume requires a retained external audio source; use the source app or explicitly request new music.",
+            }
+        if before.playback_state == ("playing" if resume else "paused"):
+            return {
+                **base,
+                "status": "already_playing" if resume else "already_paused",
+                "confirmation": "observed",
+            }
+        if "pause" not in before.supported_features or not any(
+            source.id == before.active_source and source.can_play_pause
+            for source in before.source_list
+        ):
+            return {
+                **base,
+                "status": failure,
+                "reason": "Native pause/unpause is not supported by this player and source; use the source app.",
+            }
+        protocol_id = before.active_output_protocol
+        if protocol_id and protocol_id != "native":
+            output = _parse(
+                _Player, self._request("players/get", player_id=protocol_id)
+            )
+            if output.player_id != protocol_id:
+                raise MusicAssistantError(
+                    "Music Assistant returned a different output player"
+                )
+            if (
+                not output.available
+                or not output.enabled
+                or "pause" not in output.supported_features
+            ):
+                return {
+                    **base,
+                    "status": failure,
+                    "reason": "The active output does not support native pause/unpause; use the source app.",
+                }
+        if idle_external:
+            # MA's PLAY redirects idle queue sources to queue resume, whereas an
+            # external AudioSource URI reaches the provider's existing PLAY hook.
+            queue = self._request("player_queues/get", queue_id=before.active_source)
+            if queue is not None:
+                _parse(_Queue, queue)
+                return {
+                    **base,
+                    "status": failure,
+                    "reason": "Retained source resolves to an idle MA queue; resume it in the music app.",
+                }
+        checked = self._effective(selected.player_id)
+        if checked != before:
+            return {
+                **base,
+                "status": failure,
+                "reason": "Player, source, capability, or state changed before dispatch; no command sent.",
+            }
+        self._request(
+            "players/cmd/play" if resume else "players/cmd/pause",
+            player_id=before.player_id,
+        )
+        after = self._effective(selected.player_id)
+        if (after.player_id, after.active_source, after.active_output_protocol) != (
+            before.player_id,
+            before.active_source,
+            before.active_output_protocol,
+        ):
+            return {
+                **base,
+                "status": failure,
+                "confirmation": "requested",
+                "reason": "Player, source, or output changed during dispatch; no retry or restoration attempted.",
+                "observed_player_id": after.player_id,
+                "observed_source": after.active_source,
+            }
+        target = "playing" if resume else "paused"
+        return {
+            **base,
+            "status": "resumed" if resume else "paused",
+            "confirmation": "observed"
+            if after.playback_state == target
+            else "requested",
+            "observed_state": after.playback_state,
+        }
+
+    def _candidates(
+        self,
+        title: str,
+        artist: str,
+    ) -> tuple[list[dict[str, JsonValue]], list[JsonValue]]:
+        """Return exact available matches in search order and up to eight suggestions.
+
+        Search reads one bounded page and resolves matching track mappings for artist
+        checks. Suggestions can lack artist details when MA returned only a mapping.
+
+        Args:
+            title:
+                Nonblank title for track search, or empty for artist-only search.
+
+            artist:
+                Optional recording artist constraint or artist-only query.
+
+        """
+        kind = "track" if title else "artist"
+        query = f"{artist} - {title}" if artist and title else title or artist
+        response = _object(
+            self._request(
+                "music/search",
+                search_query=query,
+                media_types=[kind],
+                limit=_SEARCH_LIMIT,
+            )
+        )
+        values = _array(response.get("tracks" if title else "artists"))
+        if len(values) > _SEARCH_LIMIT:
+            raise MusicAssistantError(
+                "Music Assistant exceeded the requested search limit"
+            )
+        matches: dict[tuple[str, tuple[str, ...]], dict[str, JsonValue]] = {}
+        choices: list[JsonValue] = []
+        for value in values:
+            item = _object(value)
+            name = _text(item.get("name"))
+            uri = _text(item.get("uri"))
+            preview: dict[str, JsonValue] = {
+                "title": name if title else "",
+                "uri": uri,
+                "artists": [
+                    _text(_object(entry).get("name"))
+                    for entry in _array(item.get("artists", []))
+                ]
+                if title
+                else [name],
+            }
+            if len(choices) < 8:
+                choices.append(preview)
+            if _normalize(name) != _normalize(title or artist):
+                continue
+            if title and "artists" not in item:
+                item = _object(self._request("music/item_by_uri", uri=uri))
+                name = _text(item.get("name"))
+                if _normalize(name) != _normalize(title):
+                    continue
+                if _text(item.get("uri")) != uri:
+                    raise MusicAssistantError(
+                        "Music Assistant resolved a different media URI"
+                    )
+            names = (
+                [
+                    _text(_object(entry).get("name"))
+                    for entry in _array(item.get("artists"))
+                ]
+                if title
+                else [name]
+            )
+            if title and not names:
+                raise MusicAssistantError(
+                    "Music Assistant track has no recording artists"
+                )
+            preview["artists"] = list[JsonValue](names)
+            if artist and _normalize(artist) not in {
+                _normalize(name) for name in names
+            }:
+                continue
+            if not _boolean(item.get("available", True)) or not _boolean(
+                item.get("is_playable", True)
+            ):
+                continue
+            if "provider_mappings" in item and not any(
+                _boolean(_object(mapping).get("available", True))
+                for mapping in _array(item["provider_mappings"])
+            ):
+                continue
+            version = item.get("version", "")
+            if not isinstance(version, str):
+                raise MusicAssistantError("Music Assistant returned an invalid version")
+            key = (
+                _normalize(name),
+                tuple(sorted({_normalize(n) for n in names})),
+            )
+            matches.setdefault(
+                key,
+                {
+                    "title": name if title else "",
+                    "artists": list(names),
+                    "uri": uri,
+                    "version": version,
+                },
+            )
+        _LOGGER.debug(
+            "Music search matches=%s choices=%s",
+            self._redact(json.dumps(list(matches.values()))),
+            self._redact(json.dumps(choices)),
+        )
+        return list(matches.values()), choices
+
+    def play_music(self, title: str = "", artist: str = "") -> JsonValue:
+        """Resume existing playback for blank fields, otherwise start a new Endless Mix.
+
+        Provider duplicates and versions with identical normalized title and full
+        artist set collapse to the first available ranked result; the API has no
+        version selector. Title-only requests use the first available exact-title
+        match in MA search order, even when other artists have recordings with the
+        same title. Explicit artist constraints remain strict; different matching
+        collaborator sets require clarification. Artist-only
+        homonyms can collapse because names alone do not establish artist identity.
+        One immediate queue observation distinguishes requested from
+        observed dynamic playback; it cannot prove audible playback or endless supply.
+
+        Args:
+            title:
+                Song title, matched exactly after Unicode/case/whitespace normalization.
+                Blank with a blank artist delegates to native resume without search.
+
+            artist:
+                Recording artist, matched exactly against a track's artists. Blank
+                with a blank title resumes the retained source without replacement.
+
+        """
+        return self._run_tool(
+            "play_music",
+            {"title": title, "artist": artist},
+            lambda: self._play_music(title, artist),
+        )
+
+    def _play_music(self, title: str, artist: str) -> JsonValue:
+        """Validate play arguments and route blank requests before any search or queue RPC.
+
+        Args:
+            title:
+                Optional exact song title; whitespace counts as blank.
+
+            artist:
+                Optional exact recording artist; whitespace counts as blank.
+
+        """
+        args = PlayMusicArguments(title=title, artist=artist)
+        if not args.title.strip() and not args.artist.strip():
+            return self.resume_music()
+        selected = self._select()
+        if isinstance(selected, dict):
+            return selected
+        candidates, choices = self._candidates(args.title.strip(), args.artist.strip())
+        if not candidates:
+            return {
+                "status": "not_found",
+                "title": args.title,
+                "artist": args.artist,
+                "choices": choices,
+            }
+        if len(candidates) != 1 and args.artist.strip():
+            return {
+                "status": "ambiguous",
+                "choices": list[JsonValue](candidates[:8]),
+                "count": len(candidates),
+            }
+        if len(candidates) > 1:
+            _LOGGER.info(
+                "Music title-only selection status=ranked_match candidates=%d",
+                len(candidates),
+            )
+            _LOGGER.debug(
+                "Music title-only selected=%s",
+                self._redact(json.dumps(candidates[0])),
+            )
+        player = self._effective(selected.player_id)
+        value = self._request(
+            "player_queues/get_active_queue", player_id=player.player_id
+        )
+        if value is None:
+            value = self._request("player_queues/get", queue_id=player.player_id)
+        if value is None:
+            raise MusicAssistantError("No existing queue is available for new music")
+        queue = _parse(_Queue, value)
+        if not queue.available:
+            raise MusicAssistantError("Music Assistant queue is unavailable")
+        seed = candidates[0]
+        media = f"radio_playlist://playlist/{_text(seed['uri'])}"
+        self._request(
+            "player_queues/play_media",
+            queue_id=queue.queue_id,
+            media=media,
+            option="replace",
+        )
+        observed = _parse(
+            _Queue, self._request("player_queues/get", queue_id=queue.queue_id)
+        )
+        if observed.queue_id != queue.queue_id:
+            raise MusicAssistantError(
+                "Music Assistant returned a different queue after dispatch"
+            )
+        return {
+            "status": "started",
+            "player_id": player.player_id,
+            "queue_id": queue.queue_id,
+            "seed": seed,
+            "mode": "endless_mix",
+            "seed_first": False,
+            "confirmation": "observed"
+            if (
+                observed.available
+                and observed.is_dynamic
+                and observed.state == "playing"
+                and any(source.uri == media for source in observed.sources)
+            )
+            else "requested",
+            "observed_state": observed.state,
+            "is_dynamic": observed.is_dynamic,
+        }
