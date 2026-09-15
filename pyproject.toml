@@ -5,6 +5,7 @@ description = "Home Assistant with local inference and tool-based actions"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
+    "python-kasa>=0.10.2,<0.11",
     "huggingface-hub>=0.36,<1.0",
     "pydantic>=2.12,<3",
     "torch>=2.9,<2.10",
@@ -12,6 +13,16 @@ dependencies = [
     "optimum-intel[openvino,nncf]>=1.26,<2",
     "openvino-genai>=2026.3,<2027",
     "python-dotenv>=1.1,<2",
+    "faster-whisper>=1.2.1,<2",
+    "ctranslate2>=4.8.2,<5",
+    "kokoro-onnx>=0.4.9,<0.5",
+    "soundfile>=0.13,<0.14",
+    "numpy>=2.3,<3",
+    "onnxruntime>=1.24,<2",
+    "scipy>=1.16,<2",
+    "psutil>=7,<8",
+    "threadpoolctl>=3.6,<4",
+    "pyopencl==2026.1.4",
 ]
 
 [dependency-groups]

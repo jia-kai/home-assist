@@ -233,8 +233,8 @@ class LFMConfig:
     cache_dir: Path = DEFAULT_CACHE
     """Working-directory-relative compiled-model cache root."""
 
-    threads: int = 4
-    """CPU inference thread count."""
+    threads: int = 1
+    """One/two CPU workers; the GPU default uses a one-core host budget."""
 
     max_new_tokens: int = 128
     """Maximum output tokens; length-limited responses are rejected."""
@@ -256,7 +256,7 @@ class LFMConfig:
         if self.device not in ("CPU", "GPU"):
             raise ValueError("Device must be CPU or GPU")
         if (
-            self.threads < 1
+            self.threads not in (1, 2)
             or not 0 < self.max_new_tokens < self.max_context_tokens <= 32768
         ):
             raise ValueError("Invalid thread count or context/output budget")
@@ -269,7 +269,7 @@ class LFMConfig:
     def from_cache(
         cls,
         cache_dir: Path = DEFAULT_CACHE,
-        threads: int = 4,
+        threads: int | None = None,
         device: Literal["CPU", "GPU"] = "GPU",
     ) -> Self:
         """Resolve the prepared export without network access.
@@ -279,7 +279,7 @@ class LFMConfig:
                 Cache root used by `tools/prepare_llm.py`.
 
             threads:
-                Number of CPU inference threads.
+                One or two CPU workers; None selects one for GPU, two for CPU.
 
             device:
                 Explicit OpenVINO execution device, GPU by default, without fallback.
@@ -289,7 +289,10 @@ class LFMConfig:
         if manifest["model_id"] != "LiquidAI/LFM2.5-350M":
             raise ValueError("Unexpected model in LFM manifest")
         return cls(
-            Path(manifest["path"]), cache_dir=cache_dir, threads=threads, device=device
+            Path(manifest["path"]),
+            cache_dir=cache_dir,
+            threads=threads if threads is not None else (1 if device == "GPU" else 2),
+            device=device,
         )
 
 
@@ -362,7 +365,11 @@ class LFM2:
                         "INFERENCE_PRECISION_HINT": "f32",
                     }
                     if self.config.device == "CPU"
-                    else {}
+                    else {
+                        "INFERENCE_PRECISION_HINT": "f16",
+                        "GPU_QUEUE_THROTTLE": "LOW",
+                        "COMPILATION_NUM_THREADS": 1,
+                    }
                 ),
             )
             self._model, self._tokenizer = model, tokenizer

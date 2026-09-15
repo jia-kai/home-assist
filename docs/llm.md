@@ -2,6 +2,33 @@
 
 ## Models and setup
 
+### Selected bounded-CPU configuration
+
+The interactive CLI uses `--threads auto`: **GPU = one CPU core, CPU = two**.
+Explicit `--threads 1|2` overrides this. LFM GPU uses FP16 computation,
+`GPU_QUEUE_THROTTLE=LOW`, one stream and one compilation worker with the published
+INT8 weights. `LFMConfig.from_cache(threads=None)` resolves the same defaults;
+direct `LFMConfig` construction defaults to one thread. Library callers can use
+`hoast.runtime.configure_cpu_budget` to enforce the aggregate process budget.
+
+Nine current five-tool-registry cases, each repeated three times, passed 27/27:
+
+| Device/settings | CPU cores | Warm median |
+| --------------- | --------- | ----------- |
+| GPU FP16 / LOW  | 1         | 0.6207 s    |
+| GPU FP16 / LOW  | 2         | 0.6077 s    |
+| CPU FP32        | 2         | 1.0367 s    |
+| CPU FP32        | 1         | 1.9528 s    |
+
+One GPU host core is selected because its median is within about 2% of two.
+History follow-ups, independent sessions and post-cancellation generation passed.
+Compact prompt/schema formatting was rejected after reducing accuracy to 18/27;
+the original template and tool schema remain the reference. FP16 KV caching and
+prefix caching did not improve this workload. Raw IR profiling is not the timing
+of GenAI's rewritten execution graph. Reproducible local measurements are retained
+in `.cache/hoast/diagnostics/lfm-tuning/`. Four-thread comparisons later in this
+document are historical experiments outside the selected two-core budget.
+
 **LFM2.5 on the iGPU is the CLI default.** Preparation also defaults to LFM and
 GPU; `LFMConfig` and its `from_cache()` factory default to GPU. Select CPU
 explicitly with `--device CPU` or `device="CPU"`. FunctionGemma
@@ -26,7 +53,7 @@ and authenticate with a read token from that account:
 ```sh
 uv run hf auth login
 uv run python -m tools.prepare_llm --model functiongemma download --revision 39eccb091651513a5dfb56892d3714c1b5b8276c
-uv run python -m tools.prepare_llm --model functiongemma export --precision int8 --threads 4 --device CPU
+uv run python -m tools.prepare_llm --model functiongemma export --precision int8 --threads 2 --device CPU
 USE_TORCH=0 uv run python -m tools.prepare_llm --model functiongemma compile --device GPU
 ```
 
@@ -36,7 +63,7 @@ credential store. Export creates stateful OpenVINO IR with KV caching and prepar
 both SDPA and paged attention (PA) for the chosen device. INT8 is symmetric;
 experimental INT4 is symmetric, group size 128, ratio 1.0, with embedding/final
 layers at the exporter's INT8 backup precision. FP32 is also available. No
-calibration dataset is required. INT8/PA/four CPU threads is the measured default;
+calibration dataset is required. Historical measurements used INT8/PA/four CPU threads;
 INT4 substantially reduced exact-call accuracy.
 
 ### LFM2.5
@@ -204,7 +231,7 @@ uv run python -m hoast --config config.toml --model functiongemma --device CPU
 
 ### Local agent and tool contract
 
-The interactive CLI defaults to `--model lfm --device GPU --threads 4`, with
+The interactive CLI defaults to `--model lfm --device GPU --threads auto`, with
 `--cache .cache/hoast` and a required `--config` path. It sets a route-only system
 prompt and a 384-token output budget. `/reset` clears history; EOF exits. There is
 no positional `interactive` subcommand. The TOML requires `[weather]` containing

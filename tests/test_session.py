@@ -532,7 +532,14 @@ def test_device_load_without_fallback(
         attempts.append(target)
         settings = properties if properties is not None else kwargs
         assert ("INFERENCE_NUM_THREADS" in settings) == (device == "CPU")
-        assert ("INFERENCE_PRECISION_HINT" in settings) == (device == "CPU")
+        if device == "CPU":
+            assert settings["INFERENCE_PRECISION_HINT"] == "f32"
+        elif isinstance(runtime[0].model, LFM2):
+            assert settings["INFERENCE_PRECISION_HINT"] == "f16"
+            assert settings["GPU_QUEUE_THROTTLE"] == "LOW"
+            assert settings["COMPILATION_NUM_THREADS"] == 1
+        else:
+            assert "INFERENCE_PRECISION_HINT" not in settings
         if fail:
             raise failure
         return Pipeline()

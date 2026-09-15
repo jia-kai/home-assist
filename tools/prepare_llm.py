@@ -14,6 +14,7 @@ from typing import Any, Literal
 from hoast.lfm import LFM2, LFMConfig
 from hoast.llm import DEFAULT_CACHE, FunctionGemma, LLMConfig, ToolRegistry
 from hoast.logging import configure_logging, get_logger
+from hoast.runtime import configure_cpu_budget
 
 logger = get_logger(__name__)
 FUNCTIONGEMMA_ID = "google/functiongemma-270m-it"
@@ -158,7 +159,8 @@ def compile_model(
             Prepared OpenVINO model directory.
 
         threads:
-            Positive CPU inference thread count; not a GPU thread setting.
+            Positive CPU inference thread count; the CLI permits one or two.
+            This is not a GPU execution-thread count.
 
         device:
             Explicit OpenVINO CPU or GPU target.
@@ -201,7 +203,8 @@ def export_model(cache: Path, precision: str, threads: int, device: Device) -> P
             Stored weight format: fp32, symmetric int8, or symmetric int4.
 
         threads:
-            Positive CPU inference thread count for precompilation.
+            Positive CPU inference thread count for precompilation; the CLI permits
+            one or two.
 
         device:
             Explicit CPU or GPU compilation target.
@@ -265,26 +268,62 @@ def export_model(cache: Path, precision: str, threads: int, device: Device) -> P
 
 def main() -> None:
     """Run download, export or compile with durable metadata and failure logs."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["functiongemma", "lfm"], default="lfm")
-    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--model",
+        choices=["functiongemma", "lfm"],
+        default="lfm",
+        help="Model family to prepare",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=DEFAULT_CACHE,
+        help="Model and compilation cache root",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     get = commands.add_parser(
-        "download", help="Download checkpoint or public LFM INT8 IR"
+        "download",
+        help="Download checkpoint or public LFM INT8 IR",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    get.add_argument("--revision", default=None)
+    get.add_argument(
+        "--revision",
+        default=None,
+        help="Override the model's configured download revision",
+    )
     export = commands.add_parser(
-        "export", help="Export FunctionGemma IR and compile it"
+        "export",
+        help="Export FunctionGemma IR and compile it",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     compile_command = commands.add_parser(
-        "compile", help="Compile downloaded/exported IR"
+        "compile",
+        help="Compile downloaded/exported IR",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     for command in (export, compile_command):
         command.add_argument(
-            "--precision", choices=["fp32", "int8", "int4"], default="int8"
+            "--precision",
+            choices=["fp32", "int8", "int4"],
+            default="int8",
+            help="Weight precision; published LFM supports int8",
         )
-        command.add_argument("--threads", type=int, default=4)
-        command.add_argument("--device", choices=["CPU", "GPU"], default="GPU")
+        command.add_argument(
+            "--threads",
+            type=int,
+            choices=(1, 2),
+            default=2,
+            help="Preparation CPU worker/core budget",
+        )
+        command.add_argument(
+            "--device",
+            choices=["CPU", "GPU"],
+            default="GPU",
+            help="Inference device to compile for",
+        )
     args = parser.parse_args()
     cache = args.cache_dir.resolve()
     diagnostics = cache / "diagnostics"
@@ -296,18 +335,21 @@ def main() -> None:
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache / "torchinductor")
     os.environ["TORCH_HOME"] = str(cache / "torch")
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["OMP_NUM_THREADS"] = str(getattr(args, "threads", 4))
+    os.environ["OMP_NUM_THREADS"] = str(getattr(args, "threads", 2))
     logger.info("Preparation arguments: %s; Python: %s", vars(args), sys.version)
     try:
         if args.command == "download":
+            configure_cpu_budget(1)
             download(cache, args.model, args.revision)
         elif args.command == "export":
+            configure_cpu_budget(args.threads)
             if args.model != "functiongemma":
                 raise ValueError(
                     "LFM uses published INT8 IR; use download then compile"
                 )
             export_model(cache, args.precision, args.threads, args.device)
         else:
+            configure_cpu_budget(args.threads)
             if args.model == "lfm":
                 if args.precision != "int8":
                     raise ValueError("The public LFM export supports only INT8 weights")

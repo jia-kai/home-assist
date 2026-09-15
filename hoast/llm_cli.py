@@ -12,6 +12,7 @@ from .llm import DEFAULT_CACHE, FunctionGemma, LLMConfig, ToolRegistry
 from .llm import SYSTEM_PROMPT as FUNCTION_ACTIVATION
 from .logging import configure_logging, get_logger
 from .music import MusicClient
+from .runtime import configure_cpu_budget
 from .session import Session
 from .weather import WeatherClient
 
@@ -24,16 +25,60 @@ def main() -> None:
     EOF exits; /reset clears conversation history. Diagnostics go to stderr and
     a durable log; stdout carries conversational text for piping to a speech sink.
     """
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--env-file", type=Path, default=Path(".env"))
-    parser.add_argument("--model", choices=("functiongemma", "lfm"), default="lfm")
-    parser.add_argument("--device", choices=("CPU", "GPU"), default="GPU")
-    parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
-    parser.add_argument("--threads", type=int, default=4)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Assistant TOML configuration containing home weather and optional music settings",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=Path(".env"),
+        help="Optional dotenv file for service credentials",
+    )
+    parser.add_argument(
+        "--model",
+        choices=("functiongemma", "lfm"),
+        default="lfm",
+        help="Prepared local language model",
+    )
+    parser.add_argument(
+        "--device",
+        choices=("CPU", "GPU"),
+        default="GPU",
+        help="Explicit OpenVINO device; loading errors do not select another device",
+    )
+    parser.add_argument(
+        "--cache",
+        type=Path,
+        default=DEFAULT_CACHE,
+        help="Prepared-model and compiled-cache root",
+    )
+    parser.add_argument(
+        "--threads",
+        choices=("auto", "1", "2"),
+        default="auto",
+        help="CPU worker/core budget; auto uses one for GPU and two for CPU",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=384,
+        help="Maximum generated tokens per model call",
+    )
     args = parser.parse_args()
     configure_logging(log_file=args.cache / "diagnostics/agent.log")
     try:
+        threads = (
+            (1 if args.device == "GPU" else 2)
+            if args.threads == "auto"
+            else int(args.threads)
+        )
+        configure_cpu_budget(threads)
         config = load_config(args.config)
         registered = [WeatherClient(config.weather).tool()]
         if config.music is not None:
@@ -46,20 +91,16 @@ def main() -> None:
         model: FunctionGemma | LFM2
         if args.model == "functiongemma":
             settings = replace(
-                LLMConfig.from_cache(
-                    args.cache, threads=args.threads, device=args.device
-                ),
+                LLMConfig.from_cache(args.cache, threads=threads, device=args.device),
                 system_prompt=FUNCTION_ACTIVATION + ". " + SYSTEM_PROMPT,
-                max_new_tokens=384,
+                max_new_tokens=args.max_new_tokens,
             )
             model = FunctionGemma(settings, tools)
         else:
             settings_lfm = replace(
-                LFMConfig.from_cache(
-                    args.cache, threads=args.threads, device=args.device
-                ),
+                LFMConfig.from_cache(args.cache, threads=threads, device=args.device),
                 system_prompt=SYSTEM_PROMPT,
-                max_new_tokens=384,
+                max_new_tokens=args.max_new_tokens,
             )
             model = LFM2(settings_lfm, tools)
         with model:

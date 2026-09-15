@@ -1,0 +1,30 @@
+[project]
+name = "hoast-speech-export"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "kokoro==0.9.4",
+    "kokoro-onnx==0.6.1",
+    "misaki[zh]==0.9.4",
+    "jieba==0.42.1",
+    "pypinyin==0.55.0",
+    "pypinyin-dict==0.9.0",
+    "cn2an==0.5.24",
+    "proces==0.1.7",
+    "torch==2.14.0",
+    "transformers==5.17.0",
+    "openvino==2026.3.1",
+    "huggingface-hub==1.31.0",
+    "soundfile>=0.13,<0.14",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

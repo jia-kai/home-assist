@@ -4,6 +4,7 @@ import math
 import os
 import tomllib
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -70,6 +71,20 @@ class MusicConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class SwitchConfig:
+    """Local smart plug endpoint."""
+
+    ip: str
+    """Literal IP address of the smart plug."""
+
+    def __post_init__(self) -> None:
+        """Reject missing, nonstring, or malformed IP addresses."""
+        if not isinstance(self.ip, str):
+            raise TypeError("switch.ip must be an IP address string")
+        ip_address(self.ip)
+
+
+@dataclass(slots=True, frozen=True)
 class SystemConfig:
     """Validated system settings."""
 
@@ -78,6 +93,9 @@ class SystemConfig:
 
     music: MusicConfig | None = None
     """Optional music integration, enabled by an explicit [music] table."""
+
+    switch: SwitchConfig | None = None
+    """Optional smart plug endpoint, enabled by an explicit [switch] table."""
 
 
 def music_token(config: MusicConfig, env_file: Path = Path(".env")) -> str:
@@ -106,17 +124,19 @@ def music_token(config: MusicConfig, env_file: Path = Path(".env")) -> str:
 
 
 def load_config(path: Path) -> SystemConfig:
-    """Read TOML with required weather and optional music settings; reject unknowns.
+    """Read required weather and optional music/switch settings; reject unknowns.
 
     Args:
         path:
-            TOML file with weather latitude/longitude and optional music settings.
+            TOML file with weather coordinates and optional music/switch settings.
 
     """
     with path.open("rb") as source:
         data = tomllib.load(source)
-    if "weather" not in data or set(data) - {"weather", "music"}:
-        raise ValueError("System config requires [weather] and optional [music]")
+    if "weather" not in data or set(data) - {"weather", "music", "switch"}:
+        raise ValueError(
+            "System config requires [weather] and optional [music], [switch]"
+        )
     weather = data["weather"]
     if not isinstance(weather, dict) or set(weather) != {"latitude", "longitude"}:
         raise ValueError("[weather] requires exactly latitude and longitude")
@@ -130,4 +150,10 @@ def load_config(path: Path) -> SystemConfig:
         }:
             raise ValueError("[music] accepts only server_url, player_id, token_env")
         music = MusicConfig(**settings)
-    return SystemConfig(WeatherConfig(**weather), music)
+    switch = None
+    if "switch" in data:
+        settings = data["switch"]
+        if not isinstance(settings, dict) or set(settings) != {"ip"}:
+            raise ValueError("[switch] requires exactly ip")
+        switch = SwitchConfig(**settings)
+    return SystemConfig(WeatherConfig(**weather), music, switch)

@@ -5,21 +5,35 @@ LFM2.5-350M through OpenVINO on Intel GPU by default, with CPU execution availab
 
 ## Setup
 
-Run all commands from the project root. This is a source-tree development project;
-uv manages its environment without building or installing the project as a package.
-[uv](https://docs.astral.sh/uv/) installs Python 3.14 and the locked dependencies
-into `.venv`, including CPU-only PyTorch for model export.
+This is a source-tree development project. The bootstrap installs
+[uv](https://docs.astral.sh/uv/) into user-local storage if needed, installs Python
+3.14 and the locked dependencies into `.venv`, and prepares every model used by the
+default assistant: LFM2.5, Whisper-small, and English/Chinese Kokoro.
 
 ```sh
-uv sync --locked
-# Public LFM INT8 export; no Hugging Face login required.
-uv run python -m tools.prepare_llm --model lfm download
-USE_TORCH=0 uv run python -m tools.prepare_llm --model lfm compile
+./prepare.sh
+# Also prepare the optional gated FunctionGemma model, after obtaining HF access:
+./prepare.sh --with-functiongemma
 ```
 
-Artifacts and compilation caches live in `.cache/hoast/`, relative to the working
-directory. GPU execution requires a working Intel OpenCL driver. Alternative
-models and backend details are covered in [docs/llm.md](docs/llm.md).
+The script can be invoked from another directory and always prepares this checkout.
+It reuses verified downloads, prepares LFM's GPU/CPU caches, provisions Chinese's
+Python 3.12 environment, and runs the compact kernel/bilingual speech check. Model
+steps run serially with at most two CPU cores and a 4 GiB memory cap. Detailed logs
+are saved under `.cache/hoast/diagnostics/prepare/`.
+
+Prerequisites are Linux, Bash, a C++17 compiler, `systemd-run`/`systemctl` with a
+running user manager, `taskset`, and a working Intel OpenCL driver for UHD 630.
+The resource guard requires at least 7 GiB available memory before each model step.
+Network access is needed for missing dependencies/models; bootstrapping uv also
+needs curl or wget. System packages and configuration files are not modified.
+If uv was newly installed, add its directory (normally `$HOME/.local/bin`) to your
+shell's PATH before using the `uv` commands below. The bootstrap adjusts PATH for
+its own run without editing shell startup files.
+
+Other commands below run from the project root. Artifacts and compilation caches
+live in `.cache/hoast/`. Alternative models and backend details are covered in
+[docs/llm.md](docs/llm.md).
 
 Copy the example configuration, then set your home coordinates in decimal degrees:
 
@@ -45,6 +59,41 @@ uv run python -m hoast --config config.toml --device CPU
 Use `/reset` to clear history and EOF to exit. Conversational output goes to
 stdout; diagnostics go to stderr and `.cache/hoast/diagnostics/agent.log`
 (or the selected `--cache` root).
+
+`--help` describes options and displays defaults. The LFM CPU budget defaults to
+`--threads auto`: one core for GPU execution, two for CPU. Explicit `1` or `2`
+overrides it. GPU inference uses FP16 computation with INT8-stored weights.
+
+## Speech
+
+Local speech uses Kokoro with a CPU graph and zero-copy INT8-weight GPU decoder
+convolution for TTS, and faster-whisper small INT8 for STT. The TTS runtime targets
+Intel UHD 630; both engines default to two inference threads. Initialize and test from the
+project root:
+
+```sh
+uv run python -m tools.prepare_stt
+uv run python -m tools.prepare_tts
+uv run python -m hoast.tts "The weather is sunny." --output /tmp/speech.wav
+uv run python -m hoast.stt /tmp/speech.wav
+# Compact kernel correctness and in-memory TTS-to-STT check:
+uv run python -m tools.guarded_run --threads 2 --memory-gib 4 --timeout 240 -- .venv/bin/python -m tools.check_speech
+# Prepare automatic Mandarin and mixed English/Chinese speech:
+uv run python -m tools.guarded_run --threads 2 --memory-gib 4 --timeout 900 -- .venv/bin/python -m tools.prepare_tts --chinese
+uv run python -m hoast.tts "Hello world. 你好，欢迎回家。" --output /tmp/chinese.wav
+uv run python -m hoast.stt /tmp/chinese.wav --language zh
+```
+
+Han-containing utterances use the official Chinese Kokoro v1.1 bilingual voice.
+The Chinese model and phonemizer initialize on first use and are cached by the
+`TTS` instance; English-only requests do not initialize them. Speech CLIs cap the
+whole process to two CPU cores. Both language models share the same GPU context
+and compiled kernel cache. Add `--chinese` to the compact check to cover bilingual
+speech after its preparation.
+
+See [docs/speech.md](docs/speech.md) for voice/language options, reusable Python
+engines and local artifact paths. The linked study documents preserve the tuning
+journey, rejected approaches and measured results.
 
 ## Weather
 

@@ -9,3 +9,7 @@ server_url = "http://localhost:8095"
 player_id = "YOUR_PLAYER_ID"
 # Set the token in .env or the environment, never in this file.
 token_env = "MUSIC_ASSISTANT_TOKEN"
+
+# Optional: local Kasa smart plug for python -m hoast.switch.
+[switch]
+ip = "192.168.42.20"
