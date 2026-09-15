@@ -15,7 +15,7 @@ dependencies = [
     "transformers==5.17.0",
     "openvino==2026.3.1",
     "huggingface-hub==1.31.0",
-    "soundfile>=0.13,<0.14",
+    "soundfile>=0.13",
 ]
 
 [tool.uv]

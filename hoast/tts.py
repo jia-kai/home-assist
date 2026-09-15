@@ -1,4 +1,4 @@
-"""Kokoro speech synthesis with a CPU graph, zero-copy GPU convolution and a WAV CLI."""
+"""Kokoro speech synthesis with hybrid CPU/GPU inference and WAV or system audio output."""
 
 import argparse
 import json
@@ -22,6 +22,7 @@ from .chinese import phoneme_batches as chinese_batches
 from .chinese_g2p import DEFAULT_SPEECH_PYTHON, ChineseG2P
 from .logging import configure_logging, get_logger
 from .runtime import configure_cpu_budget
+from .tts_audio import AudioPlayback
 from .tts_gpu import SharedGPU, replace_convolutions
 from .tts_kernels import DEFAULT_KERNEL, fuse_cpu_activations
 
@@ -249,6 +250,12 @@ class TTS:
     _closed: bool
     """Whether all owned inference resources have been released."""
 
+    _output: AudioPlayback | None
+    """Bounded playback queue, absent until buffered playback starts."""
+
+    _output_buffer_seconds: float | None
+    """Queue capacity in seconds for the active playback worker."""
+
     _chinese: _ChineseResources | None
     """Chinese resources, absent until the first Han-containing utterance."""
 
@@ -274,6 +281,8 @@ class TTS:
         self._chinese_lock = threading.RLock()
         self._session = None
         self._closed = False
+        self._output = None
+        self._output_buffer_seconds = None
         start = time.perf_counter()
         self._gpu = SharedGPU()
         try:
@@ -412,18 +421,21 @@ class TTS:
             return samples
 
     def close(self) -> None:
-        """Release model sessions, the Chinese worker and GPU resources; safe to repeat."""
+        """Drain playback and release inference resources; safe to repeat."""
         with self._chinese_lock:
             if self._closed:
                 return
             self._closed = True
             chinese, self._chinese = self._chinese, None
             try:
-                if chinese is not None:
-                    try:
-                        chinese.phonemizer.close()
-                    finally:
-                        chinese.session.close()
+                try:
+                    self.wait_playback()
+                finally:
+                    if chinese is not None:
+                        try:
+                            chinese.phonemizer.close()
+                        finally:
+                            chinese.session.close()
             finally:
                 session, self._session = self._session, None
                 try:
@@ -478,6 +490,84 @@ class TTS:
         )
         return samples, rate
 
+    def play(
+        self, text: str, *, blocking: bool = True, buffer_seconds: float = 1.0
+    ) -> None:
+        """Synthesize on the caller's thread and submit ordered mono 24 kHz audio.
+
+        A playback-only worker feeds a low-latency device from a bounded PCM queue.
+        Submission blocks when the queue fills; playback starts without waiting
+        for it to fill. A full utterance is synthesized before submission and is
+        outside the queue's memory bound. Device buffering is additional and small.
+        Calls are serialized, including synthesis and submission. To serialize LLM
+        and TTS compute, call this method directly from the LLM's text consumer.
+        Audio-device failures propagate; failed playback is discarded, not retried.
+
+        Args:
+            text:
+                Nonempty text to synthesize and play through system audio.
+
+            blocking:
+                If True, drain all submitted audio before returning. If False,
+                return once samples are accepted; call wait_playback or close to
+                drain at the end of a turn.
+
+            buffer_seconds:
+                Positive finite queued audio capacity in seconds, at least one
+                24 kHz frame. Independent of device latency. Must stay unchanged
+                until the active stream is drained.
+
+        """
+        if not math.isfinite(buffer_seconds) or buffer_seconds < 1 / 24000:
+            raise ValueError(
+                "buffer_seconds must be finite and hold at least one frame"
+            )
+        with self._chinese_lock:
+            if (
+                self._output is not None
+                and buffer_seconds != self._output_buffer_seconds
+            ):
+                raise ValueError("Drain playback before changing buffer_seconds")
+            samples, rate = self.synthesize(text)
+            try:
+                if self._output is None:
+                    self._output = AudioPlayback(rate, buffer_seconds)
+                    self._output_buffer_seconds = buffer_seconds
+                self._output.submit(samples)
+                logger.debug(
+                    "tts.play status=submitted samples=%d rate=%d", samples.size, rate
+                )
+                if blocking:
+                    self.wait_playback()
+            except Exception:
+                logger.exception("tts.play status=failed blocking=%s", blocking)
+                output, self._output = self._output, None
+                self._output_buffer_seconds = None
+                if output is not None:
+                    try:
+                        output.close()
+                    except Exception:
+                        logger.exception("tts.play status=cleanup_failed")
+                raise
+
+    def wait_playback(self) -> None:
+        """Drain submitted audio and close the device; safe when no stream is active.
+
+        Blocks until pending samples finish playing. Device failures propagate;
+        the stream is closed even when draining fails.
+        """
+        with self._chinese_lock:
+            output, self._output = self._output, None
+            self._output_buffer_seconds = None
+            if output is None:
+                return
+            try:
+                output.close()
+                logger.info("tts.play status=completed")
+            except Exception:
+                logger.exception("tts.wait_playback status=failed")
+                raise
+
     def write_wav(self, text: str, output: Path) -> None:
         """Synthesize and write a mono 24 kHz PCM16 WAV, replacing an existing file.
 
@@ -495,17 +585,21 @@ class TTS:
 
 
 def main() -> None:
-    """Write text or piped stdin to a WAV file, retaining durable diagnostics."""
+    """Speak text or piped stdin to a WAV or system audio, retaining durable diagnostics."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("text", nargs="?", help="Text to speak; omit to read stdin")
-    parser.add_argument(
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument(
         "--output",
         type=Path,
-        required=True,
-        default=argparse.SUPPRESS,
         help="Destination mono 24 kHz PCM16 WAV; replaces an existing file",
+    )
+    destination.add_argument(
+        "--play",
+        action="store_true",
+        help="Play through the default system audio device and wait until finished",
     )
     parser.add_argument(
         "--model",
@@ -581,13 +675,21 @@ def main() -> None:
         )
         engine = TTS(config)
         try:
-            engine.write_wav(text, args.output)
+            if args.play:
+                engine.play(text)
+            else:
+                engine.write_wav(text, args.output)
         finally:
             engine.close()
-        sys.stdout.write("Saved speech audio.\n")
+        sys.stdout.write(
+            "Finished speaking.\n" if args.play else "Saved speech audio.\n"
+        )
     except Exception:
         logger.exception(
-            "tts.cli status=failed output=%s threads=%s", args.output, args.threads
+            "tts.cli status=failed output=%s play=%s threads=%s",
+            args.output,
+            args.play,
+            args.threads,
         )
         raise SystemExit(1) from None
 

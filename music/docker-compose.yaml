@@ -11,3 +11,4 @@ services:
       # Provide logging level as environment variable.
       # default=info, possible=(critical, error, warning, info, debug)
       - LOG_LEVEL=info
+    mem_limit: 4g
