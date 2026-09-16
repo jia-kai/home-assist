@@ -1,0 +1,31 @@
+[project]
+name = "hoast-speech-augmentation"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch==2.9.1",
+    "transformers==5.17.0",
+    "kokoro==0.9.4",
+    "kokoro-onnx==0.6.1",
+    "misaki[zh]==0.9.4",
+    "faster-whisper==1.2.1",
+    "ctranslate2==4.8.2",
+    "huggingface-hub==1.31.0",
+    "soundfile>=0.13",
+    "scipy>=1.16",
+    "opencc-python-reimplemented==0.1.7",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cuda" }

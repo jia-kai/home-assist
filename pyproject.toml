@@ -43,6 +43,8 @@ torch = { index = "pytorch-cpu" }
 
 [tool.pyright]
 include = ["hoast", "tools", "tests", "finetune"]
+# CUDA-only training is checked with finetune/env/pyrightconfig.json.
+exclude = ["finetune/env", "finetune/train.py", "finetune/speech_env", "finetune/speech_worker.py"]
 pythonVersion = "3.14"
 venvPath = "."
 venv = ".venv"

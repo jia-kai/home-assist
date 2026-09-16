@@ -18,6 +18,7 @@ from typing import Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from hoast.agent import validate_action_batch
+from hoast.input_text import NORMALIZATION_VERSION, canonicalize_text, content_signature
 from hoast.lfm import tool_declarations
 from hoast.llm import ToolCall
 from hoast.logging import configure_logging, get_logger
@@ -574,6 +575,170 @@ def build_dataset(
     )
 
 
+def dataset_coverage(
+    rows: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    """Count actual rows, target tools, language composition, and observed noise.
+
+    Args:
+        rows:
+            Split-owned examples after normalization, deduplication, or augmentation.
+
+    """
+    return {
+        split: {
+            "rows": len(items),
+            "tools": dict(
+                Counter(
+                    call["function"]["name"]
+                    for row in items
+                    for call in row["messages"][-1].get("tool_calls", [])
+                )
+            ),
+            "no_tool_rows": sum(
+                not row["messages"][-1].get("tool_calls") for row in items
+            ),
+            "asr_rows": sum(bool(row["asr_errors"]) for row in items),
+            "asr_error_kinds": dict(
+                Counter(error["kind"] for row in items for error in row["asr_errors"])
+            ),
+            "batch_shapes": dict(
+                Counter(
+                    "+".join(
+                        call["function"]["name"]
+                        for call in row["messages"][-1].get("tool_calls", [])
+                    )
+                    or "no_tool"
+                    for row in items
+                )
+            ),
+            "command_languages": dict(
+                Counter(row["command_language"] for row in items)
+            ),
+            "surface_languages": dict(
+                Counter(row["surface_language"] for row in items)
+            ),
+            "entity_compositions": dict(
+                Counter(
+                    json.dumps(row["entity_languages"], sort_keys=True)
+                    for row in items
+                    if row["entity_languages"]
+                )
+            ),
+        }
+        for split, items in rows.items()
+    }
+
+
+def canonical_dataset(dataset: Dataset) -> Dataset:
+    """Canonicalize all splits, copied music entities, and clean speech references.
+
+    Preserve original rows as source provenance, reject cross-split canonical
+    collisions and contradictory labels, and merge equivalent rows within a split.
+    Only user text and copied music labels change; schemas, typed arguments,
+    location query labels, and assistant protocol remain structured.
+
+    Args:
+        dataset:
+            Validated source dataset with original user surfaces and clean STT forms.
+
+    """
+    rows: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLITS}
+    ownership: dict[str, str] = {}
+    labels_by_input: dict[str, str] = {}
+    unique: dict[str, dict[str, Any]] = {}
+    for split, source_rows in dataset.rows.items():
+        for source in source_rows:
+            row = deepcopy(source)
+            text = canonicalize_text(source["messages"][-2]["content"])
+            clean = canonicalize_text(source["clean_user"])
+            if not text or not clean:
+                raise ValueError(
+                    "Canonical dataset input must contain words or numbers"
+                )
+            row["messages"][-2]["content"] = text
+            row["clean_user"] = clean
+            row["surface_language"] = surface_language(text)
+            assistant = row["messages"][-1]
+            for call in assistant.get("tool_calls", []):
+                function = call["function"]
+                if function["name"] == "volume_music":
+                    if (
+                        function["arguments"]["action"] == "set"
+                        and "level" not in function["arguments"]
+                    ):
+                        raise ValueError(
+                            "Set volume requires an explicit integer level"
+                        )
+                    function["arguments"].setdefault("level", 5)
+                if function["name"] == "play_music":
+                    for key in ("title", "artist"):
+                        if key in function["arguments"]:
+                            value = canonicalize_text(function["arguments"][key])
+                            if not value or value not in text:
+                                raise ValueError(
+                                    f"Canonical music entity is not grounded: {key}"
+                                )
+                            function["arguments"][key] = value
+            row["entity_languages"] = {
+                key: surface_language(value)
+                for call in assistant.get("tool_calls", [])
+                if call["function"]["name"] == "play_music"
+                for key, value in call["function"]["arguments"].items()
+                if isinstance(value, str) and value
+            }
+            label = digest(assistant)
+            for surface in (text, clean):
+                key = content_signature(surface)
+                previous = ownership.setdefault(key, split)
+                exact = digest([row["messages"][:-2], surface, row["tools"]])
+                if (
+                    previous != split
+                    or labels_by_input.setdefault(exact, label) != label
+                ):
+                    raise ValueError(f"Canonical split/label collision: {source['id']}")
+            row["id"] = digest([row["messages"], dataset.manifest["schema_sha256"]])[
+                :24
+            ]
+            provenance = {
+                "id": source["id"],
+                "user": source["messages"][-2]["content"],
+                "clean_user": source["clean_user"],
+                "family": source["family"],
+                "group": source["group"],
+                "assistant": source["messages"][-1],
+            }
+            if row["id"] in unique:
+                unique[row["id"]]["normalization"]["sources"].append(provenance)
+                continue
+            row["normalization"] = {
+                "version": NORMALIZATION_VERSION,
+                "split": split,
+                "sources": [provenance],
+            }
+            unique[row["id"]] = row
+            rows[split].append(row)
+    manifest = deepcopy(dataset.manifest)
+    manifest["source_coverage"] = manifest["coverage"]
+    manifest["source_families"] = manifest["families"]
+    manifest["families"] = {
+        family: {"split": split, "written_rows": count}
+        for split, items in rows.items()
+        for family, count in Counter(row["family"] for row in items).items()
+    }
+    manifest["normalization"] = {
+        "version": NORMALIZATION_VERSION,
+        "policy": "basic_punctuation",
+        "source_rows": {split: len(items) for split, items in dataset.rows.items()},
+        "canonical_rows": {split: len(items) for split, items in rows.items()},
+        "normalizer_sha256": hashlib.sha256(
+            (ROOT.parent / "hoast/input_text.py").read_bytes()
+        ).hexdigest(),
+    }
+    manifest["coverage"] = dataset_coverage(rows)
+    return Dataset(rows, manifest)
+
+
 def write_dataset(dataset: Dataset, output: Path) -> None:
     """Stage complete JSONL files, replace generated outputs, and publish the manifest last.
 
@@ -638,6 +803,7 @@ def main() -> None:
             max_per_family=args.max_per_family,
             max_rows=args.max_rows,
         )
+        dataset = canonical_dataset(dataset)
         write_dataset(dataset, args.output)
         for split, coverage in dataset.manifest["coverage"].items():
             logger.info(

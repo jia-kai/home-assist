@@ -222,12 +222,16 @@ uv run python -m hoast.music_cli --player YOUR_PLAYER_ID pause
 uv run python -m hoast.music_cli --player YOUR_PLAYER_ID resume
 uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume louder
 uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume quieter
+uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume raise 20
+uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume lower 10
+uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume set 0
 uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume YOUR_VOLUME_LEVEL
 uv run python -m hoast.music_cli --player YOUR_PLAYER_ID play --title "YOUR_SONG_TITLE" --artist "YOUR_ARTIST_NAME"
 ```
 
 Replace the `YOUR_…` placeholders before running these commands. Volume levels
-must be integers from 1 to 100.
+must be integers from 0 to 100. Raise/lower amounts are percentage-point changes;
+omitting a relative amount selects five points.
 
 ### Playback behavior
 
@@ -237,7 +241,7 @@ and preserves the retained stream.
 native resume, with the same state-dependent success or refusal as `resume` and
 no search or new stream. A nonblank title and/or recording artist requests a new
 mix; `--author` aliases `--artist`. Title/artist matching is exact after Unicode,
-case, and whitespace normalization. Provider duplicates and version-only variants
+case, punctuation, and whitespace normalization. Provider duplicates and version-only variants
 with the same normalized title and full artist set collapse to the first available
 ranked result; there is no version selector. Title-only requests choose the first
 available exact-title match in Music Assistant's search order, even when covers
@@ -287,9 +291,11 @@ and [Next button](https://github.com/music-assistant/frontend/blob/f838bc60c42c0
 ### Volume
 
 Volume works while idle or playing and changes only volume, without playback,
-queue, or source changes. `louder` and `quieter` adjust five percentage points,
-clamped to 1–100; quieter at an existing zero is a no-op. An absolute value must
-be an integer from 1–100. Invalid CLI arguments are rejected before client setup
+queue, or source changes. All values are integers in `[0, 100]`. `louder` and
+`quieter` add/subtract the supplied percentage points, defaulting to five when
+omitted, with results clamped to `[0, 100]`. `set` requires an explicit percentage;
+zero is valid. For example, raising 40 by 20 produces 60, not 48.
+Invalid CLI arguments are rejected before client setup
 or any mutation. Group/sync targets use the effective group's reading and volume
 command. `players` and `status` expose group-aware `volume_level` (null when
 unavailable); `status` resolves the effective target, while `players` lists each
@@ -325,7 +331,11 @@ are execution errors with exit code 1. An unconfirmed accepted command has
 The shared concise routing prompt is in `hoast/prompts.py`. The offline
 [fine-tuning toolkit](finetune/README.md) builds reproducible English, Chinese,
 code-switched, and STT-confusion examples using production schemas and the official
-LFM template. Generate the dataset with `uv run python -m finetune.generate`.
+LFM template. Generate the canonical dataset with `uv run python -m finetune.generate`.
+STT output and external user turns share basic-punctuation normalization in
+`hoast/input_text.py`. Structured prompts, schemas, tool results, and internal
+repair diagnostics retain their syntax. The fine-tuning guide also covers actual
+GPU TTS-to-STT augmentation with source-split and label audits.
 
 `hoast.agent.LocalAgent` accepts weather plus optional complete core music tools
 (`pause_music`, `resume_music`, `play_music`, `volume_music`). The `music_next`
@@ -334,11 +344,13 @@ Production music registration includes all six music tools. Each turn allows
 at most four calls, including at most one music action and one light action.
 Standalone “play” and “stop” deterministically resume and
 pause through `Session.request_tools`, bypassing model inference while retaining
-history. Matching ignores case, surrounding whitespace, and terminal `. ! ?`
-punctuation. Longer requests, including “play music”, still use model routing and
+history. Matching uses canonical user text, ignores case, and trims terminal
+sentence punctuation for shortcut recognition.
+Longer requests, including “play music”, still use model routing and
 can misroute. Without music configured, shortcuts say “Music isn't configured.”
 Standalone “louder” and “quieter” also bypass inference and adjust by five points;
-“quiter” is accepted as a spelling alias for “quieter”.
+“quiter” is accepted as a spelling alias for “quieter”. An explicit integer amount,
+such as “louder 20 percent”, overrides that default.
 “Next”, “next song”, “next track”, “switch song”, “skip song”, and “skip track”
 directly dispatch `music_next` with empty arguments.
 “What is playing”, “what's playing”, and “what song is playing” directly dispatch

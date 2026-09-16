@@ -11,6 +11,7 @@ import pytest
 from pydantic import JsonValue
 
 from hoast.agent import LocalAgent, WeatherAgent, render_music, render_weather
+from hoast.input_text import canonicalize_text
 from hoast.lights import LightArguments
 from hoast.llm import (
     FunctionGemma,
@@ -825,6 +826,7 @@ def test_multiple_music_actions_rejected_before_weather_dispatch(
     [
         ("play", "resume_music", "resumed"),
         (" PlAy!? ", "resume_music", "resumed"),
+        ("play,", "resume_music", "resumed"),
         ("stop", "pause_music", "paused"),
         ("STOP.", "pause_music", "paused"),
     ],
@@ -868,7 +870,10 @@ def test_shortcuts_skip_generation(
     assert len(state.histories) == generations
     assert state.dispatched[-1] == ToolCall(name, {})
     assert agent.session.history[: len(history)] == history
-    assert agent.session.history[-4] == {"role": "user", "content": query}
+    assert agent.session.history[-4] == {
+        "role": "user",
+        "content": canonicalize_text(query),
+    }
     assert agent.session.history[-3]["tool_calls"][0]["function"] == {
         "name": name,
         "arguments": {},
@@ -886,7 +891,6 @@ def test_shortcuts_skip_generation(
         "playback",
         "stopping",
         "please play",
-        "play,",
         "stop sign",
     ],
 )
@@ -936,9 +940,12 @@ def test_volume_word_shortcuts(
     assert list(agent.stream(query)) == ["Volume set to 35 percent."]
     assert not state.histories
     assert state.dispatched == [
-        ToolCall("volume_music", {"action": action, "level": 0})
+        ToolCall("volume_music", {"action": action, "level": 5})
     ]
-    assert agent.session.history[-4] == {"role": "user", "content": query}
+    assert agent.session.history[-4] == {
+        "role": "user",
+        "content": canonicalize_text(query),
+    }
 
 
 @pytest.mark.parametrize("query", ["PLAY!", "stop?", "louder", "quieter", "quiter"])
@@ -1109,12 +1116,12 @@ def test_weather_and_single_music_action(
         (ToolCall("volume_music", {"action": "set", "level": 1}), True),
         (ToolCall("volume_music", {"action": "set", "level": 100}), True),
         (ToolCall("volume_music", {"action": "set"}), False),
-        (ToolCall("volume_music", {"action": "set", "level": 0}), False),
+        (ToolCall("volume_music", {"action": "set", "level": 0}), True),
         (ToolCall("volume_music", {"action": "set", "level": 101}), False),
         (ToolCall("volume_music", {"action": "set", "level": True}), False),
         (ToolCall("volume_music", {"action": "set", "level": "35"}), False),
         (ToolCall("volume_music", {"action": "set", "level": 35.0}), False),
-        (ToolCall("volume_music", {"action": "louder", "level": 35}), False),
+        (ToolCall("volume_music", {"action": "louder", "level": 35}), True),
         (ToolCall("volume_music", {"action": "mute"}), False),
     ],
 )
@@ -1148,7 +1155,7 @@ def test_mixed_argument_validation(
             if call.name == "get_weather"
             else {"title": "", "artist": "", **call.arguments}
             if call.name == "play_music"
-            else {"level": 0, **call.arguments}
+            else {"level": 5, **call.arguments}
             if call.name == "volume_music"
             else {}
         )

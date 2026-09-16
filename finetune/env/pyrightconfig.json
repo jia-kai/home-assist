@@ -1,0 +1,8 @@
+{
+  "include": ["../train.py", "test_training.py"],
+  "extraPaths": ["../.."],
+  "pythonVersion": "3.14",
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "basic"
+}

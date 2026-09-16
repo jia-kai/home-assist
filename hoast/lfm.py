@@ -16,6 +16,7 @@ from typing import Any, Literal, Self
 
 from pydantic import JsonValue
 
+from .input_text import canonical_user_messages
 from .llm import (
     DEFAULT_CACHE,
     GeneratedCallError,
@@ -322,7 +323,7 @@ class LFM2:
     """Serializes model loading, inference, and resource release."""
 
     def load(self) -> Self:
-        """Load local artifacts once; failed loads leave the owner unloaded."""
+        """Load upstream or fine-tuned fast-tokenizer artifacts; failures leave unloaded."""
         # Native inference libraries remain lazy for standalone parser/tool use.
         import openvino_genai
         from transformers import PreTrainedTokenizerFast
@@ -333,23 +334,31 @@ class LFM2:
             path = self.config.model_path.resolve()
             if not (path / "openvino_model.xml").is_file():
                 raise FileNotFoundError(f"Prepare LFM first: {path}")
-            # Translate Transformers 5's generic-tokenizer metadata to the 4.x
-            # names while loading the serialized tokenizer and template unchanged.
             metadata = json.loads((path / "tokenizer_config.json").read_text())
-            if (
-                metadata.pop("tokenizer_class") != "TokenizersBackend"
-                or metadata.pop("backend") != "tokenizers"
-            ):
+            tokenizer_class = metadata.pop("tokenizer_class")
+            if tokenizer_class == "TokenizersBackend":
+                if metadata.pop("backend") != "tokenizers":
+                    raise ValueError("Unexpected LFM tokenizer backend metadata")
+                # Translate upstream Transformers 5 names for the 4.x runtime.
+                metadata["additional_special_tokens"] = metadata.pop(
+                    "extra_special_tokens"
+                )
+                metadata["extra_special_tokens"] = metadata.pop(
+                    "model_specific_special_tokens"
+                )
+                tokenizer = PreTrainedTokenizerFast(
+                    tokenizer_file=str(path / "tokenizer.json"),
+                    chat_template=(path / "chat_template.jinja").read_text(),
+                    **metadata,
+                )
+            elif tokenizer_class == "PreTrainedTokenizerFast":
+                if "backend" in metadata and metadata["backend"] != "tokenizers":
+                    raise ValueError("Unexpected LFM tokenizer backend metadata")
+                tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                    path, local_files_only=True
+                )
+            else:
                 raise ValueError("Unexpected LFM tokenizer backend metadata")
-            metadata["additional_special_tokens"] = metadata.pop("extra_special_tokens")
-            metadata["extra_special_tokens"] = metadata.pop(
-                "model_specific_special_tokens"
-            )
-            tokenizer = PreTrainedTokenizerFast(
-                tokenizer_file=str(path / "tokenizer.json"),
-                chat_template=(path / "chat_template.jinja").read_text(),
-                **metadata,
-            )
             cache = self.config.cache_dir.resolve() / "lfm/compiled"
             cache.mkdir(parents=True, exist_ok=True)
             model = openvino_genai.LLMPipeline(
@@ -425,14 +434,16 @@ class LFM2:
         messages: Sequence[Mapping[str, Any]],
         on_text: Callable[[str], None] | None = None,
     ) -> Generation:
-        """Generate from explicit user/assistant/tool history using the native template.
+        """Canonicalize user language and generate with the native structured template.
 
         Args:
             messages:
                 Nonempty Hugging Face-style history. System/developer roles are
                 rejected because the configured system prompt is inserted here.
                 Tool calls use function name/argument mappings; tool results may
-                contain JSON-compatible mappings or strings. No history is retained.
+                contain JSON-compatible mappings or strings. External user text is
+                canonicalized with basic punctuation retained; structured history is preserved. No history
+                is retained.
 
             on_text:
                 Optional incremental raw-text callback preserving native protocol.
@@ -460,7 +471,10 @@ class LFM2:
                     )
             started = time.perf_counter()
             prompt = self._tokenizer.apply_chat_template(
-                [{"role": "system", "content": self.config.system_prompt}, *messages],
+                [
+                    {"role": "system", "content": self.config.system_prompt},
+                    *canonical_user_messages(messages),
+                ],
                 tools=tool_declarations(self.tools),
                 tokenize=False,
                 add_generation_prompt=True,

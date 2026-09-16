@@ -60,26 +60,26 @@ class PlayMusicArguments(ToolArguments):
 
 
 class VolumeMusicArguments(ToolArguments):
-    """Strict volume request; zero is the omitted relative-level sentinel."""
+    """Explicit integer percentage setting or percentage-point adjustment."""
 
     action: Literal["set", "louder", "quieter"] = Field(
-        description="set for a numeric volume; louder/quieter for relative changes"
+        description="set for an absolute percentage; louder/quieter to add/subtract level percentage points"
     )
-    """Five-point adjustment direction or absolute setting."""
+    """Absolute setting or explicit relative adjustment direction."""
 
     level: int = Field(
-        default=0,
+        default=5,
         ge=0,
         le=100,
-        description="Volume 1–100 with action=set; omit for louder/quieter",
+        description="Integer 0–100: required absolute volume for set; louder/quieter change by this many percentage points, default 5",
     )
-    """Absolute percentage from 1–100 for set; zero for relative actions."""
+    """Integer in [0, 100]; relative requests default to five percentage points."""
 
     @model_validator(mode="after")
     def validate_level(self) -> Self:
-        """Validate absolute/relative levels and return the unchanged argument instance."""
-        if (self.action == "set") != (self.level != 0):
-            raise ValueError("Set requires level 1–100; louder/quieter omit level")
+        """Require an explicit absolute setting while permitting the relative default."""
+        if self.action == "set" and "level" not in self.model_fields_set:
+            raise ValueError("Set requires an explicit integer level from 0 to 100")
         return self
 
 
@@ -106,7 +106,7 @@ def declare_music_tools() -> list[Tool[Any]]:
         ),
         Tool(
             "volume_music",
-            "Set volume 1–100 using action=set; louder/quieter changes it by 5 points.",
+            "Set, raise, or lower volume with integer percentages 0–100. Set requires a level; louder/quieter default to 5 percentage points unless specified. Clamp relative results to 0–100.",
             VolumeMusicArguments,
             declaration_only,
         ),
@@ -434,14 +434,19 @@ def _parse[T: _Response](model: type[T], value: JsonValue) -> T:
 
 
 def _normalize(value: str) -> str:
-    """Normalize Unicode compatibility, case, and whitespace, retaining punctuation.
+    """Compare catalog labels by letters/numbers, ignoring punctuation, case and spacing.
 
     Args:
         value:
-            Title or artist text to compare exactly.
+            Title or artist text, not a numeric command. Spaced initials such as
+            G E M compare equally to the catalog spelling G.E.M.
 
     """
-    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKC", value)
+        if unicodedata.category(character)[0] in "LNM"
+    ).casefold()
 
 
 def _reject_constant(value: str) -> None:
@@ -914,24 +919,27 @@ class MusicClient:
         }
 
     def volume_music(
-        self, action: Literal["louder", "quieter", "set"], level: int = 0
+        self, action: Literal["louder", "quieter", "set"], level: int | None = None
     ) -> JsonValue:
         """Adjust idle or active volume without playback RPCs; observe once, never retry.
 
         Args:
             action:
-                Louder or quieter changes five points; set uses an absolute level.
+                Louder/quieter adds/subtracts the requested percentage points;
+                set uses an absolute percentage. Results clamp to [0, 100].
 
             level:
-                Set percentage 1–100; relative requests use the omitted default zero.
+                Integer percentage or percentage-point delta in [0, 100]. None
+                selects the relative default of five; set requires a value.
 
         """
+        arguments: dict[str, JsonValue] = {"action": action}
+        if level is not None:
+            arguments["level"] = level
         return self._run_tool(
             "volume_music",
-            {"action": action, "level": level},
-            lambda: self._volume_music(
-                VolumeMusicArguments(action=action, level=level)
-            ),
+            arguments,
+            lambda: self._volume_music(VolumeMusicArguments.model_validate(arguments)),
         )
 
     def _volume_music(self, args: VolumeMusicArguments) -> JsonValue:
@@ -944,7 +952,7 @@ class MusicClient:
 
         Args:
             args:
-                Validated absolute or five-point relative volume request.
+                Validated absolute percentage or explicit percentage-point change.
 
         """
         selected = self._select()
@@ -955,9 +963,9 @@ class MusicClient:
         target = args.level if args.action == "set" else current
         if current is not None and args.action != "set":
             target = (
-                min(100, current + 5)
+                min(100, current + args.level)
                 if args.action == "louder"
-                else min(current, max(1, current - 5))
+                else max(0, current - args.level)
             )
         base: dict[str, JsonValue] = {
             "player_id": before.player_id,
@@ -973,7 +981,7 @@ class MusicClient:
             return {
                 **base,
                 "status": "cannot_volume",
-                "reason": "Current volume is unavailable; specify a level from 1 to 100.",
+                "reason": "Current volume is unavailable; specify an absolute level from 0 to 100.",
             }
         checked = self._effective(selected.player_id)
         if (

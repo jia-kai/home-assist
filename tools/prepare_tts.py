@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import urllib.request
 from pathlib import Path
+from typing import Literal
 
 from hoast.chinese_g2p import DEFAULT_SPEECH_PYTHON
 from hoast.logging import configure_logging, get_logger
@@ -71,8 +72,10 @@ def download(name: str, output: Path) -> None:
     )
 
 
-def prepare(output: Path, threads: int) -> None:
-    """Download source artifacts, build CPU fusion and warm up hybrid inference.
+def prepare(
+    output: Path, threads: int, backend: Literal["hybrid", "cpu"] = "hybrid"
+) -> None:
+    """Download source artifacts, build CPU fusion and warm up the requested backend.
 
     Args:
         output:
@@ -81,12 +84,16 @@ def prepare(output: Path, threads: int) -> None:
         threads:
             One or two CPU inference threads.
 
+        backend:
+            Explicit hybrid decoder offload or fully CPU synthesis.
+
     """
     name = DEFAULT_MODEL.name
     config = TTSConfig(
         model_path=output / name,
         voices_path=output / DEFAULT_VOICES.name,
         threads=threads,
+        backend=backend,
     )
     download(name, config.model_path)
     download(DEFAULT_VOICES.name, config.voices_path)
@@ -176,6 +183,7 @@ def main() -> None:
         action="store_true",
         help="Also provision Chinese v1.1 artifacts and its supported G2P environment",
     )
+    parser.add_argument("--backend", choices=("hybrid", "cpu"), default="hybrid")
     parser.add_argument(
         "--chinese-model-dir",
         type=Path,
@@ -189,7 +197,7 @@ def main() -> None:
     configure_logging(log_file=Path(".cache/hoast/diagnostics/prepare-tts.log"))
     try:
         configure_cpu_budget(args.threads)
-        prepare(args.output, args.threads)
+        prepare(args.output, args.threads, args.backend)
         if args.chinese:
             _prepare_chinese(args.chinese_model_dir, args.chinese_voice, args.threads)
     except Exception:

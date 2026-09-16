@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from hoast.logging import configure_logging, get_logger
+from hoast.speech_text import english_phonemes, mixed_phonemes
 
 logger = get_logger(__name__)
 
@@ -38,14 +39,14 @@ def main() -> None:
             )
 
             def english(text: str) -> str:
-                """Return English phonemes for an insertion in a Chinese sentence.
+                """Return Kokoro-compatible English phonemes for a Chinese insertion.
 
                 Args:
                     text:
                         English span supplied by the official Chinese frontend.
 
                 """
-                return backend.phonemize([text], strip=True)[0]
+                return english_phonemes(backend.phonemize([text], strip=True)[0])
 
             phonemizer = importlib.import_module("misaki.zh").ZHG2P(
                 version="1.1", en_callable=english
@@ -64,7 +65,7 @@ def main() -> None:
                 raise TypeError("Invalid Chinese phonemizer request")
             try:
                 with contextlib.redirect_stdout(sys.stderr):
-                    phonemes, _ = phonemizer(text)
+                    phonemes = mixed_phonemes(text, lambda part: phonemizer(part)[0])
                 response = {"id": identifier, "phonemes": phonemes}
             except Exception as error:
                 logger.exception(

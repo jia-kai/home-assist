@@ -1,11 +1,13 @@
 """Home Assistant routing with grounded, compact spoken answers."""
 
+import re
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic import JsonValue
 
+from .input_text import SENTENCE_PUNCTUATION, canonicalize_text
 from .llm import GeneratedCallError, ToolCall
 from .logging import get_logger
 from .prompts import SYSTEM_PROMPT
@@ -336,8 +338,8 @@ class LocalAgent:
         errors propagate, and partially dispatched batches are never retried.
         Exhausted generated-call repairs yield a short clarification and preserve
         prior history so the next request can proceed. Standalone play/stop and
-        louder/quieter (also quiter), ignoring case and terminal .!? punctuation,
-        use explicit session calls without inference. Next/next song/next track and
+        louder/quieter optionally followed by an integer percentage use direct calls.
+        Bare relative-volume words use five percentage points. Next/next song/next track and
         switch song/skip song/skip track similarly dispatch music_next directly.
 
         Args:
@@ -352,12 +354,19 @@ class LocalAgent:
         if cancelled is not None and cancelled():
             self.session.reset()
             return
+        user_text = canonicalize_text(user_text)
+        shortcut_text = user_text.rstrip(SENTENCE_PUNCTUATION).rstrip().casefold()
+        names = {
+            schema["function"]["name"] for schema in self.session.model.tools.schemas()
+        }
         shortcut = {
             "play": ToolCall("resume_music", {}),
             "stop": ToolCall("pause_music", {}),
-            "louder": ToolCall("volume_music", {"action": "louder"}),
-            "quieter": ToolCall("volume_music", {"action": "quieter"}),
-            "quiter": ToolCall("volume_music", {"action": "quieter"}),
+            "louder": ToolCall("volume_music", {"action": "louder", "level": 5}),
+            "quieter": ToolCall("volume_music", {"action": "quieter", "level": 5}),
+            "quiter": ToolCall("volume_music", {"action": "quieter", "level": 5}),
+            "raise volume": ToolCall("volume_music", {"action": "louder", "level": 5}),
+            "lower volume": ToolCall("volume_music", {"action": "quieter", "level": 5}),
             "next": ToolCall("music_next", {}),
             "next song": ToolCall("music_next", {}),
             "next track": ToolCall("music_next", {}),
@@ -365,6 +374,7 @@ class LocalAgent:
             "skip song": ToolCall("music_next", {}),
             "skip track": ToolCall("music_next", {}),
             "what is playing": ToolCall("what_is_playing", {}),
+            "whats playing": ToolCall("what_is_playing", {}),
             "what's playing": ToolCall("what_is_playing", {}),
             "what song is playing": ToolCall("what_is_playing", {}),
             "lights on": ToolCall("set_light", {"on": True}),
@@ -375,10 +385,23 @@ class LocalAgent:
             "light off": ToolCall("set_light", {"on": False}),
             "turn off the light": ToolCall("set_light", {"on": False}),
             "turn off the lights": ToolCall("set_light", {"on": False}),
-        }.get(user_text.strip().rstrip(".!?").casefold())
-        if shortcut and shortcut.name not in {
-            schema["function"]["name"] for schema in self.session.model.tools.schemas()
-        }:
+        }.get(shortcut_text)
+        volume = re.fullmatch(
+            r"(louder|quieter|quiter)\s+(\d+)(?:\s+percent)?", shortcut_text
+        )
+        if volume:
+            level = int(volume[2])
+            if not 0 <= level <= 100:
+                yield "Please use an integer percentage from zero to one hundred."
+                return
+            shortcut = ToolCall(
+                "volume_music",
+                {
+                    "action": "louder" if volume[1] == "louder" else "quieter",
+                    "level": level,
+                },
+            )
+        if shortcut and shortcut.name not in names:
             logger.warning("Agent shortcut status=unconfigured tool=%s", shortcut.name)
             yield (
                 "The light isn't configured."

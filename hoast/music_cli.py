@@ -47,31 +47,52 @@ def _parser() -> argparse.ArgumentParser:
     play.add_argument("--title", default="", help="Song title")
     play.add_argument("--artist", "--author", default="", help="Recording artist")
     volume = commands.add_parser(
-        "volume", help="Louder, quieter, or a level from 1–100"
+        "volume", help="Set, raise, or lower by an integer percentage"
     )
-    volume.add_argument("value", type=_volume_value, help="louder, quieter, or 1–100")
+    volume.add_argument(
+        "value",
+        type=_volume_value,
+        help="set, raise/lower, louder/quieter, or an absolute integer 0–100",
+    )
+    volume.add_argument(
+        "level",
+        type=_volume_level,
+        nargs="?",
+        help="Integer percentage 0–100; relative default is 5",
+    )
     return parser
 
 
-def _volume_value(value: str) -> dict[str, JsonValue]:
-    """Parse relative volume words or an absolute level for registered dispatch.
+def _volume_level(value: str) -> int:
+    """Parse a required unsigned integer percentage for every volume action.
 
     Args:
         value:
-            CLI argument: louder, quieter, or an integer from 1 through 100.
+            CLI integer argument from zero through one hundred, inclusive.
 
     """
-    if value.casefold() in ("louder", "quieter"):
-        return {"action": value.casefold()}
-    try:
-        level = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            "Use louder, quieter, or an integer from 1–100"
-        ) from None
-    if not 1 <= level <= 100:
-        raise argparse.ArgumentTypeError("Volume must be from 1–100")
-    return {"action": "set", "level": level}
+    if not value.isdecimal():
+        raise argparse.ArgumentTypeError("Use an integer percentage from 0–100")
+    level = int(value)
+    if not 0 <= level <= 100:
+        raise argparse.ArgumentTypeError("Volume must be from 0–100")
+    return level
+
+
+def _volume_value(value: str) -> dict[str, JsonValue]:
+    """Parse a volume action or the shorthand absolute integer setting.
+
+    Args:
+        value:
+            Action spelling, or an unsigned integer percentage in [0, 100].
+
+    """
+    action = {"raise": "louder", "lower": "quieter"}.get(
+        value.casefold(), value.casefold()
+    )
+    if action in ("set", "louder", "quieter"):
+        return {"action": action}
+    return {"action": "set", "level": _volume_level(value)}
 
 
 def _redact(detail: str, token: str) -> str:
@@ -108,7 +129,15 @@ def main(argv: list[str] | None = None) -> int:
             Explicit arguments for embedding/tests, or None for process arguments.
 
     """
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.command == "volume":
+        if args.level is not None:
+            if "level" in args.value:
+                parser.error("Specify the volume value only once")
+            args.value["level"] = args.level
+        if args.value["action"] == "set" and "level" not in args.value:
+            parser.error("volume set requires an integer level from 0–100")
     configure_logging(log_file=_LOG_FILE)
     token = ""
     try:

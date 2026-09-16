@@ -13,6 +13,7 @@ import openvino as ov
 import pytest
 import soundfile as sf
 
+from hoast.speech_text import english_phonemes, mixed_phonemes, prepare_speech_text
 from hoast.stt import STT, STTConfig, _WindowedWhisper
 from hoast.tts import TTS, TTSConfig, phoneme_batches
 from tools.prepare_stt import REVISION
@@ -54,6 +55,41 @@ def test_configuration_validation() -> None:
     for context in (float("nan"), 3.0, 31.0):
         with pytest.raises(ValueError):
             STTConfig(encoder_min_seconds=context)
+
+
+def test_spoken_titles_and_explicit_phoneme_mapping() -> None:
+    """Avoid silent delimiters and represent rhotic vowels without dropping sounds."""
+    assert (
+        prepare_speech_text('"G.E.M."\'s recording of 《晴天》.')
+        == "G E M's recording of 晴天."
+    )
+    assert prepare_speech_text("Don't stop!") == "Don't stop!"
+    assert english_phonemes("wˈɛðɚ ɝ ❓") == "wˈɛðəɹ ɜɹ ❓"
+    assert mixed_phonemes("陈奕迅's recording", str.strip) == "陈奕迅 z recording"
+    assert mixed_phonemes("ordinary text", str.strip) == "ordinary text"
+
+
+def test_cpu_tts_does_not_allocate_gpu(tmp_path: Path) -> None:
+    """Exercise explicit CPU selection with embedded artifacts and mocked inference.
+
+    Args:
+        tmp_path:
+            Isolated model/voice paths; no installed models or accelerators are needed.
+
+    """
+    model, voices = tmp_path / "model.onnx", tmp_path / "voices.bin"
+    model.touch()
+    voices.touch()
+    with (
+        patch("hoast.tts.SharedGPU") as gpu,
+        patch("hoast.tts._OpenVINOSession") as session,
+        patch("hoast.tts.Kokoro.from_session") as kokoro,
+    ):
+        kokoro.return_value.get_voices.return_value = ["af_heart"]
+        engine = TTS(TTSConfig(model_path=model, voices_path=voices, backend="cpu"))
+        engine.close()
+        gpu.assert_not_called()
+        assert session.call_args.kwargs["gpu"] is None
 
 
 def test_windowed_encoder_only_passes_bounded_prefix() -> None:
@@ -223,6 +259,7 @@ def test_transcription_consumes_lazy_segments(tmp_path: Path) -> None:
         assert backend.call_args.kwargs["local_files_only"] is True
         backend.return_value.transcribe.return_value = (segments(), info)
         assert recognizer.transcribe(audio) == "Hello world."
+        assert recognizer.last_raw_text == "Hello world."
         assert (
             backend.return_value.transcribe.call_args.kwargs["without_timestamps"]
             is True

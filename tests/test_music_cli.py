@@ -61,6 +61,10 @@ def unexpected_request(self: MusicClient, command: str, **args: JsonValue) -> Js
         ("volume", ["35"], {"action": "set", "level": 35}),
         ("volume", ["1"], {"action": "set", "level": 1}),
         ("volume", ["100"], {"action": "set", "level": 100}),
+        ("volume", ["0"], {"action": "set", "level": 0}),
+        ("volume", ["set", "0"], {"action": "set", "level": 0}),
+        ("volume", ["raise", "20"], {"action": "louder", "level": 20}),
+        ("volume", ["lower", "100"], {"action": "quieter", "level": 100}),
         ("play", [], {"title": "", "artist": ""}),
         (
             "play",
@@ -124,7 +128,7 @@ def test_registered_dispatch(
     if command == "play":
         handler.assert_called_once_with(expected["title"], expected["artist"])
     elif command == "volume":
-        handler.assert_called_once_with(expected["action"], expected.get("level", 0))
+        handler.assert_called_once_with(expected["action"], expected.get("level", 5))
     else:
         handler.assert_called_once_with()
     output = capsys.readouterr()
@@ -499,7 +503,7 @@ def test_argument_errors(arguments: list[str]) -> None:
 
 
 @pytest.mark.parametrize(
-    "value", ["0", "101", "-1", "35.0", "nan", "True", "set", "loud", ""]
+    "value", ["101", "-1", "35.0", "nan", "True", "set", "loud", ""]
 )
 def test_invalid_volume_before_rpc(value: str) -> None:
     """Reject invalid volume syntax before client construction or RPC dispatch.

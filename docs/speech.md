@@ -1,7 +1,8 @@
 # Local speech
 
 `hoast.tts.TTS` runs Kokoro with **a CPU graph and zero-copy GPU decoder convolution**
-on the Intel UHD 630. It is the single maintained TTS backend. Decoder weights are
+on a compatible Intel GPU. `TTSConfig(backend="cpu")` selects fully CPU execution
+with the same models and frontends. Hybrid decoder weights are
 packed INT8; GPU tap sums use FP16 with FP32 accumulation. The remaining graph uses
 OpenVINO CPU, including the verified AVX2 Snake activation where prepared.
 
@@ -25,11 +26,13 @@ Omit `--chinese` for English-only preparation. TTS preparation verifies the publ
 FP32 Kokoro v1.0 ONNX and matching voices, builds the CPU activation library, and
 checks the hybrid runtime. The runtime quantizes decoder weights itself; an INT8
 ONNX export is not required. Preparation needs a C++17 compiler; inference needs
-the Intel OpenCL driver. PyOpenCL is part of the main Python 3.14 environment.
+the Intel OpenCL driver for hybrid execution. `tools.prepare_tts --backend cpu`
+prepares and validates CPU synthesis explicitly. PyOpenCL is part of the main
+Python 3.14 environment.
 
 Chinese preparation provisions the pinned `tools/speech_env` Python 3.12 environment
 and exports the official Chinese v1.1 model. Only its G2P worker uses Python 3.12;
-both neural models run through the same hybrid runtime in the main process.
+both neural models run through the configured CPU/hybrid runtime in the main process.
 
 Chinese exports are validated in a private staging directory before publication.
 The readiness manifest is published last and records artifact hashes, allowing
@@ -69,15 +72,30 @@ details go to `.cache/hoast/diagnostics/`; stdout stays concise.
 Han-containing utterances use Chinese voice `zf_001`, including embedded English
 spans. The Chinese model, vocabulary, style table and official Misaki G2P worker
 initialize on first use and remain cached. Both models share one GPU context and
-kernel cache. English-only requests never initialize Chinese resources. Unknown
+kernel cache in hybrid mode. English-only requests never initialize Chinese resources. Unknown
 phonemes fail rather than being discarded; long input is split at bounded phoneme
 boundaries. Chinese style lookup follows the official **N−1** convention.
+Silent title delimiters are removed before synthesis and dotted initialisms are
+spoken as letters. English insertions explicitly decompose rhotic vowels into
+supported Kokoro phonemes rather than discarding those sounds.
 
 STT accepts PyAV-supported audio files and resamples/downmixes to mono 16 kHz.
 English recognition is the default; use `--language zh` or `auto` as appropriate.
 The eight-second minimum encoder context avoids unnecessary short-input padding;
 uncertain decoding retries the full context. `--encoder-min-seconds 30` requests
-the full-padding reference. Silence retains an empty transcript.
+the full-padding reference. Silence retains an empty transcript. Returned STT text
+retains basic punctuation (including commas and apostrophes) through
+`hoast/input_text.py`, while title brackets and decorative double quotes are removed.
+`last_raw_text` retains the last
+completed raw decode for diagnostics. This same normalization applies to external
+LLM user turns. Signed/fractional digit literals are not rewritten into values;
+commands use unsigned integers and volume schemas constrain values to `[0, 100]`.
+
+For offline training-data augmentation, see
+[GPU TTS-to-STT augmentation](../finetune/README.md#tts-to-stt-augmentation).
+That isolated workflow runs native Kokoro on CUDA and batches independent
+Whisper utterances; its decoding settings are recorded separately from the edge
+CPU recognizer.
 
 ## Reuse loaded engines
 

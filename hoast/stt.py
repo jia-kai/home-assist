@@ -16,6 +16,7 @@ from faster_whisper.transcribe import Segment, TranscriptionInfo
 from numpy.typing import NDArray
 from scipy.signal import resample_poly
 
+from .input_text import canonicalize_text
 from .logging import configure_logging, get_logger
 from .runtime import configure_cpu_budget
 
@@ -87,6 +88,9 @@ class STT:
     model: _WindowedWhisper
     """Loaded small checkpoint with one INT8 CPU worker."""
 
+    last_raw_text: str | None
+    """Unnormalized text from the last successful decode, or None before transcription."""
+
     def __init__(self, config: STTConfig | None = None) -> None:
         """Load prepared artifacts without downloading missing resources.
 
@@ -103,6 +107,7 @@ class STT:
                     f"Missing STT artifact: {config.model_path / name}"
                 )
         self.config = config
+        self.last_raw_text = None
         start = time.perf_counter()
         self.model = _WindowedWhisper(
             str(config.model_path),
@@ -120,7 +125,7 @@ class STT:
         )
 
     def transcribe(self, audio: Path) -> str:
-        """Decode a file to text; return an empty string when VAD finds no speech.
+        """Decode to canonical text with basic punctuation; return empty for no speech.
 
         PyAV downmixes and resamples supported audio to 16 kHz mono. Silero VAD
         uses faster-whisper's single-thread CPU session. Segment iteration is
@@ -144,7 +149,7 @@ class STT:
         return self._transcribe(samples, str(audio))
 
     def transcribe_samples(self, samples: NDArray[np.float32], sample_rate: int) -> str:
-        """Transcribe in-memory mono audio, resampling to 16 kHz without WAV I/O.
+        """Return canonical text from mono audio, resampling to 16 kHz without WAV I/O.
 
         Float32 input at 16 kHz is passed through without copying. Other rates
         use polyphase resampling. A finite-value scan at this external audio
@@ -188,7 +193,7 @@ class STT:
         return self._transcribe(audio, "memory")
 
     def _transcribe(self, audio: NDArray[np.float32], label: str) -> str:
-        """Decode with a bounded encoder window, retrying uncertain results at 30 s.
+        """Decode and canonicalize text, retaining raw output for roundtrip auditing.
 
         The frame bound includes all original audio plus 0.5 seconds of padding;
         VAD can only shorten it. Inputs at least 29.5 seconds retain the full
@@ -226,7 +231,10 @@ class STT:
             self.model.encoder_frame_limit = 3000
             segments, info = self._decode(audio)
             completed = list(segments)
-        text = " ".join(segment.text.strip() for segment in completed).strip()
+        self.last_raw_text = " ".join(
+            segment.text.strip() for segment in completed
+        ).strip()
+        text = canonicalize_text(self.last_raw_text)
         elapsed = time.perf_counter() - start
         logger.info(
             "stt.transcribe status=ok audio=%s seconds=%.3f duration=%.3f "
@@ -239,7 +247,9 @@ class STT:
             len(text),
             self.model.encoder_frame_limit,
         )
-        logger.debug("stt.transcribe result=%r info=%r", text, info)
+        logger.debug(
+            "stt.transcribe raw=%r result=%r info=%r", self.last_raw_text, text, info
+        )
         return text
 
     def _decode(

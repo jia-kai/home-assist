@@ -179,6 +179,35 @@ def call(session: Session, value: str) -> str:
     return f"<|tool_call_start|>[record(value='{value}')]<|tool_call_end|>"
 
 
+def test_canonical_user_history_and_direct_inference(
+    runtime: tuple[Session, Pipeline, Tokenizer, list[str]],
+) -> None:
+    """Normalize both session turns and low-level user messages, preserving tool syntax.
+
+    Args:
+        runtime:
+            Both model families with production adapters and in-memory fake inference.
+
+    """
+    session, _, tokenizer, _ = runtime
+    list(session.stream("Play 《晴天》!"))
+    assert session.history[0] == {"role": "user", "content": "Play 晴天!"}
+    assert tokenizer.messages[1]["content"] == "Play 晴天!"
+    history = [
+        {"role": "user", "content": "Volume 35%!"},
+        {"role": "assistant", "content": "No."},
+        {"role": "tool", "content": {"value": "[x, y]"}},
+    ]
+    session.model.generate_messages(history)
+    assert tokenizer.messages[1]["content"] == "Volume 35!"
+    assert tokenizer.messages[2:] == history[1:]
+    assert history[0]["content"] == "Volume 35%!"
+    session.reset()
+    with pytest.raises(ValueError, match="empty"):
+        list(session.stream("!?"))
+    assert session.history == ()
+
+
 @pytest.mark.parametrize("failure", ["syntax", "argument", "name"])
 def test_backend_call_repair(
     runtime: tuple[Session, Pipeline, Tokenizer, list[str]],

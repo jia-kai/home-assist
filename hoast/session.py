@@ -11,6 +11,7 @@ from typing import Any
 
 from pydantic import JsonValue
 
+from .input_text import REPAIR_FEEDBACK_KEY, canonicalize_text
 from .lfm import LFM2
 from .llm import FunctionGemma, GeneratedCallError, Generation, ToolCall
 
@@ -87,7 +88,7 @@ class Session:
 
         Args:
             user_text:
-                Nonempty original user request retained in conversation history.
+                User request retained in canonical form with basic punctuation in history.
 
             calls:
                 Nonempty application-selected calls to registered tools.
@@ -97,6 +98,7 @@ class Session:
         try:
             if self._failed or self._pending or self._continue:
                 raise RuntimeError("Finish or reset the session before a new request")
+            user_text = canonicalize_text(user_text)
             if not user_text.strip() or not calls:
                 raise ValueError("Explicit routing requires a request and tool calls")
             pending = tuple(deepcopy(calls))
@@ -138,7 +140,8 @@ class Session:
 
         Args:
             user_text:
-                Nonempty new user turn, or None to continue after invoke_tools().
+                New user turn canonicalized before inference/history, or None to
+                continue after invoke_tools(). Punctuation-only turns are rejected.
                 A new user turn is forbidden while calls or continuation are pending.
 
             max_repair_attempts:
@@ -166,6 +169,7 @@ class Session:
             else:
                 if self._continue:
                     raise RuntimeError("Continue after tools before a new user turn")
+                user_text = canonicalize_text(user_text)
                 if not user_text.strip():
                     raise ValueError("User request must not be empty")
                 messages.append({"role": "user", "content": user_text})
@@ -219,7 +223,11 @@ class Session:
                             )
                             attempt_messages = [
                                 *messages,
-                                {"role": "user", "content": feedback},
+                                {
+                                    "role": "user",
+                                    "content": feedback,
+                                    REPAIR_FEEDBACK_KEY: True,
+                                },
                             ]
                             continue
                         events.put(result)

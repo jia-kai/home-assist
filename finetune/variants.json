@@ -64,9 +64,11 @@
       {"text": "北京", "value": "北京"},
       {"text": "Paris, France", "value": "Paris, France"}
     ],
-    "level": [1, 10, 25, 35, 50, 75, 100, {"text": "thirty-five", "value": 35}, {"text": "五十", "value": 50}],
+    "level": [0, 1, 10, 25, 35, 50, 75, 100, {"text": "thirty-five", "value": 35}, {"text": "五十", "value": 50}],
     "direction_en": ["louder", "quieter"],
-    "direction_zh": [{"text": "大一点", "value": "louder"}, {"text": "小一点", "value": "quieter"}],
+    "volume_verb_en": [{"text":"Raise","value":"louder"},{"text":"Lower","value":"quieter"}],
+    "volume_verb_zh": [{"text":"提高","value":"louder"},{"text":"降低","value":"quieter"}],
+    "direction_zh": [{"text": "大", "value": "louder"}, {"text": "小", "value": "quieter"}],
     "power_en": [{"text": "on", "value": true}, {"text": "off", "value": false}],
     "power_zh": [{"text": "打开", "value": true}, {"text": "关闭", "value": false}],
     "resume_zh_asr": [
@@ -93,8 +95,8 @@
       {"text":"关登","value":false,"clean":"关灯","error":"homophone"}
     ],
     "volume_zh_asr": [
-      {"text":"把音亮调大点","value":"louder","clean":"把音量调大点","error":"homophone"},
-      {"text":"把音亮调小点","value":"quieter","clean":"把音量调小点","error":"homophone"}
+      {"text":"把音亮调大","value":"louder","clean":"把音量调大","error":"homophone"},
+      {"text":"把音亮调小","value":"quieter","clean":"把音量调小","error":"homophone"}
     ],
     "direction_en_asr": [
       {"text":"loader","value":"louder","clean":"louder","error":"latin_asr"},

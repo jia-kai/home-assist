@@ -240,17 +240,18 @@ Optional `[music]` enables the Music Assistant integration; credentials are read
 from the environment or the dotenv file selected by `--env-file` (default `.env`).
 Booleans as coordinates, missing required fields, and unknown keys are rejected.
 
-`hoast.agent.LocalAgent` accepts exactly either `get_weather` alone or
-`get_weather`, `pause_music`, `resume_music`, `play_music`, and `volume_music`
-together: four music tools, five total.
+`hoast.agent.LocalAgent` accepts weather with an optional complete core music
+registry, optional music next/query extensions, and optional light control.
 `WeatherAgent` is a compatibility subclass with the same behavior and registry
 validation. Standalone `play` and `stop` route deterministically to `resume_music`
 and `pause_music` via `Session.request_tools`, preserving native history without
-model inference. Matching strips surrounding whitespace, then terminal `. ! ?`
-punctuation, and ignores case. Longer requests use the model. Without configured
+model inference. External user turns retain basic sentence punctuation and
+apostrophes while losing title brackets and decorative double quotes. Shortcut
+matching ignores case and terminal sentence punctuation. Longer requests use the model. Without configured
 music tools, these shortcuts yield “Music isn't configured.” Standalone “louder”
 and “quieter” also bypass inference for five-point volume changes; “quiter” is
-accepted as a spelling alias for “quieter”.
+accepted as a spelling alias for “quieter”. An explicit integer percentage amount
+overrides the relative default, for example “quieter 20 percent”.
 
 Other turns perform one model routing pass with up to two repair passes
 for generated syntax or argument errors, then dispatches at most four
@@ -270,14 +271,11 @@ feedback is logged, not spoken. Other errors propagate
 and reset history; closing an abandoned answer stream also resets history, even
 after tool dispatch and answer commitment. Already executed tools are not undone.
 
-The compact route-only system prompt prefers music for ambiguous controls:
-
-> You are Home Assistant. Call tools only. Ambiguous controls mean music.
-> Weather today: get_weather(period='today'). Current temperature: period='now'.
-> Keep city qualifiers. Pause/stop: pause_music. Play/resume/continue: resume_music,
-> unless a new title or artist is requested. Author means artist.
-> Volume 35: volume_music(action='set', level=35). Louder/quieter omit level.
-> Handle each request; never invent song names.
+The shared system prompt in `hoast/prompts.py` requires grounded arguments and
+clarification for unsupported or ambiguous actions. Volume values are integer
+percentages in `[0, 100]`: `volume_music(action='set', level=35)` sets an absolute
+level; `volume_music(action='louder', level=20)` adds twenty percentage points;
+`volume_music(action='quieter')` uses the five-point relative default.
 
 Tool descriptions are compact action guidance. The weather description is “Get
 weather, outside temperature, and rain forecast in Celsius.” Provider internals
@@ -327,12 +325,13 @@ control testing; it bypasses model routing and invokes the same handlers.
 
 ### Music volume contract
 
-`volume_music(action, level=0)` is the fourth music tool. `action` is required and
-must be `louder`, `quieter`, or `set`. `set` requires an integer `level` from 1–100;
-relative actions omit `level` (the default zero sentinel is accepted, nonzero is
-rejected). Strict validation rejects extra fields and type coercion before dispatch.
-Relative changes are five percentage points, clamped to 1–100, except quieter at
-an existing zero remains zero. An unchanged target sends no mutation.
+`volume_music` requires `action` to be `louder`, `quieter`, or `set`. Every supplied
+`level` must be an integer in `[0, 100]`; strings, booleans, fractions, and
+out-of-range values fail strict validation. Set requires an explicit level.
+Relative actions add/subtract the supplied percentage points, defaulting to five
+when omitted. Results clamp to `[0, 100]`; an explicit relative zero is a no-op.
+An unchanged target sends no mutation. Relative amounts are not multiplicative
+ratios: raising a current 40 by 20 requests 60.
 
 Volume control allows idle players and sends no playback, queue, or source-change
 commands. Effective routing resolves sync leaders and active groups. Group targets
@@ -360,9 +359,10 @@ missing current volume blocks relative changes but permits absolute settings.
   Post-dispatch uncertainty says “Volume change requested, but not confirmed.
   Please check the music app.”
 
-The direct CLI accepts `volume louder`, `volume quieter`, and `volume 35`;
-`stop` aliases `pause`. Invalid arguments, including zero or out-of-range absolute
-levels, fail during parsing with exit 2 before client setup or any mutation.
+The direct CLI accepts `volume louder`, `volume quieter`, `volume raise 20`,
+`volume lower 10`, `volume set 0`, and the absolute shorthand `volume 35`.
+`stop` aliases `pause`. Invalid or missing required values fail during parsing
+with exit 2 before client setup or any mutation.
 `cannot_volume` also exits 2 with the full JSON result; accepted or unchanged volume
 exits 0. Global options precede the subcommand, as shown in the README.
 

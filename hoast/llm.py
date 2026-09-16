@@ -14,6 +14,7 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, JsonValue
 
+from .input_text import canonical_user_messages
 from .logging import get_logger
 
 logger = get_logger(__name__)
@@ -764,11 +765,13 @@ class FunctionGemma:
         messages: Sequence[Mapping[str, Any]],
         on_text: Callable[[str], None] | None = None,
     ) -> Generation:
-        """Generate native history, optionally delivering incremental raw text.
+        """Canonicalize user language and generate native history with raw streaming.
 
         Args:
             messages:
-                Nonempty user/assistant/tool history; the developer prompt is inserted.
+                Nonempty user/assistant/tool history; user language is canonicalized
+                with basic punctuation retained and the developer prompt is inserted. Structured
+                tool data and internal repair feedback retain their syntax.
 
             on_text:
                 Optional decoded-token callback including protocol. Exceptions propagate.
@@ -785,7 +788,7 @@ class FunctionGemma:
             prompt = self._tokenizer.apply_chat_template(
                 [
                     {"role": "developer", "content": self.config.system_prompt},
-                    *messages,
+                    *canonical_user_messages(messages),
                 ],
                 tools=self.tools.schemas(),
                 tokenize=False,

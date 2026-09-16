@@ -176,9 +176,10 @@ def result_object(value: JsonValue) -> dict[str, JsonValue]:
         {"action": "set"},
         *(
             {"action": "set", "level": value}
-            for value in [0, -1, 101, True, 5.0, "5", None]
+            for value in [-1, 101, True, 5.0, "5", None]
         ),
-        {"action": "louder", "level": 5},
+        {"action": "louder", "level": -1},
+        {"action": "quieter", "level": 5.0},
         {"action": "quieter", "extra": 1},
     ],
 )
@@ -199,24 +200,33 @@ def test_volume_invalid_arguments(payload: dict[str, Any]) -> None:
 
 
 @pytest.mark.parametrize(
-    "action,current,target",
+    "action,current,amount,target",
     [
-        ("louder", 0, 5),
-        ("louder", 98, 100),
-        ("louder", 100, 100),
-        ("quieter", 0, 0),
-        ("quieter", 1, 1),
-        ("quieter", 3, 1),
-        ("quieter", 50, 45),
-        ("set", None, 1),
-        ("set", 20, 100),
-        ("set", 100, 100),
+        ("louder", 0, None, 5),
+        ("louder", 98, None, 100),
+        ("louder", 100, None, 100),
+        ("quieter", 0, None, 0),
+        ("quieter", 1, None, 0),
+        ("quieter", 3, None, 0),
+        ("quieter", 50, None, 45),
+        ("louder", 40, 20, 60),
+        ("quieter", 40, 20, 20),
+        ("louder", 40, 100, 100),
+        ("quieter", 40, 100, 0),
+        ("quieter", 40, 0, 40),
+        ("set", None, 0, 0),
+        ("set", None, 1, 1),
+        ("set", 20, 100, 100),
+        ("set", 100, 100, 100),
     ],
 )
 def test_volume_exact_trace(
-    action: Literal["louder", "quieter", "set"], current: int | None, target: int
+    action: Literal["louder", "quieter", "set"],
+    current: int | None,
+    amount: int | None,
+    target: int,
 ) -> None:
-    """Bound five-point changes and permit idle absolute settings without a reading.
+    """Bound percentage-point changes, preserve defaults, and permit an absolute zero.
 
     Args:
         action:
@@ -224,6 +234,9 @@ def test_volume_exact_trace(
 
         current:
             Initial logical percentage or missing reading.
+
+        amount:
+            Explicit percentage value, or None for the five-point relative default.
 
         target:
             Expected bounded target percentage.
@@ -269,9 +282,7 @@ def test_volume_exact_trace(
             ]
         )
     client = FixtureClient(replies)
-    result = result_object(
-        client.volume_music(action, target if action == "set" else 0)
-    )
+    result = result_object(client.volume_music(action, amount))
     assert result["status"] == (
         "volume_unchanged" if target == current else "volume_set"
     )

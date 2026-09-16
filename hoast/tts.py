@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import openvino as ov
@@ -23,6 +23,7 @@ from .chinese import phoneme_batches as chinese_batches
 from .chinese_g2p import DEFAULT_SPEECH_PYTHON, ChineseG2P
 from .logging import configure_logging, get_logger
 from .runtime import configure_cpu_budget
+from .speech_text import prepare_speech_text
 from .tts_audio import AudioPlayback
 from .tts_gpu import SharedGPU, replace_convolutions
 from .tts_kernels import DEFAULT_KERNEL, fuse_cpu_activations
@@ -42,13 +43,13 @@ class _ModelInput:
 
 
 class _OpenVINOSession:
-    """Hybrid OpenVINO adapter for Kokoro's narrow session interface."""
+    """CPU/OpenVINO adapter with optional hybrid decoder convolution."""
 
     _model_path: str
     """Local model filename required by Kokoro's artifact validation."""
 
     _compiled: ov.CompiledModel | None
-    """CPU graph with GPU decoder convolutions, absent after close."""
+    """CPU graph with optional GPU decoder convolutions, absent after close."""
 
     _request: ov.InferRequest | None
     """Reusable synchronous request, absent after close; callers serialize inference."""
@@ -65,9 +66,9 @@ class _OpenVINOSession:
         threads: int,
         activation_kernel: Path | None = DEFAULT_KERNEL,
         *,
-        gpu: SharedGPU,
+        gpu: SharedGPU | None,
     ) -> None:
-        """Compile a local CPU graph with verified decoder-only GPU convolution.
+        """Compile a local CPU graph, optionally offloading decoder convolution.
 
         Args:
             model_path:
@@ -80,13 +81,15 @@ class _OpenVINOSession:
                 Optional prepared AVX2 activation library; None disables fusion.
 
             gpu:
-                TTS-owned GPU executor, shared by English and lazy Chinese sessions.
+                TTS-owned GPU executor shared by language sessions; None keeps
+                all operations on CPU.
 
         """
         self._model_path = str(model_path)
         core = ov.Core()
         graph = core.read_model(model_path)
-        replace_convolutions(graph, gpu)
+        if gpu is not None:
+            replace_convolutions(graph, gpu)
         fuse_cpu_activations(core, graph, activation_kernel)
         self._compiled = core.compile_model(
             graph,
@@ -172,7 +175,7 @@ def phoneme_batches(phonemes: str) -> list[str]:
 
 @dataclass(slots=True, frozen=True)
 class TTSConfig:
-    """Local Kokoro artifacts and bounded CPU/GPU hybrid synthesis settings."""
+    """Local Kokoro artifacts and bounded CPU or hybrid synthesis settings."""
 
     model_path: Path = DEFAULT_MODEL
     """Kokoro ONNX or OpenVINO XML model; defaults to the v1.0 FP32 ONNX export."""
@@ -204,10 +207,15 @@ class TTSConfig:
     chinese_python: Path = DEFAULT_SPEECH_PYTHON
     """Prepared Python 3.12 worker interpreter for official Chinese phonemization."""
 
+    backend: Literal["hybrid", "cpu"] = "hybrid"
+    """Hybrid decoder offload or fully CPU inference; selection is explicit."""
+
     def __post_init__(self) -> None:
         """Reject invalid thread counts, labels, speeds and voice identifiers."""
         if self.threads not in (1, 2):
             raise ValueError("threads must be one or two")
+        if self.backend not in ("hybrid", "cpu"):
+            raise ValueError("backend must be hybrid or cpu")
         if not math.isfinite(self.speed) or not 0.5 <= self.speed <= 2.0:
             raise ValueError("speed must be finite and between 0.5 and 2.0")
         if not self.voice.strip() or not self.language.strip():
@@ -243,7 +251,7 @@ class TTS:
     """Kokoro frontend with bounded CPU inference; None for playback-only instances."""
 
     _gpu: SharedGPU | None
-    """GPU context shared by both language models; None for playback-only instances."""
+    """Shared GPU context; None for CPU synthesis and playback-only instances."""
 
     _session: _OpenVINOSession | None
     """English model session, absent during initialization or after close."""
@@ -266,7 +274,7 @@ class TTS:
     def __init__(
         self, config: TTSConfig | None = None, *, playback_only: bool = False
     ) -> None:
-        """Initialize shared playback and optionally load the English hybrid runtime.
+        """Initialize playback and optionally load the configured English runtime.
 
         Args:
             config:
@@ -295,7 +303,7 @@ class TTS:
             if not path.is_file():
                 raise FileNotFoundError(f"Missing TTS artifact: {path}")
         start = time.perf_counter()
-        self._gpu = SharedGPU()
+        self._gpu = SharedGPU() if config.backend == "hybrid" else None
         try:
             self._session = _OpenVINOSession(
                 config.model_path,
@@ -311,15 +319,17 @@ class TTS:
             self.close()
             raise
         logger.info(
-            "tts.load status=ok threads=%d seconds=%.3f model=%s runtime=hybrid",
+            "tts.load status=ok threads=%d seconds=%.3f model=%s runtime=%s",
             config.threads,
             time.perf_counter() - start,
             config.model_path,
+            config.backend,
         )
 
     def synthesize(self, text: str) -> tuple[NDArray[np.float32], int]:
-        """Synthesize text, routing Han-containing utterances to cached Chinese v1.1.
+        """Prepare spoken text and route Han-containing utterances to cached Chinese v1.1.
 
+        Silent title delimiters are removed and dotted initialisms are spelled out.
         Mixed text uses the Chinese model with English phoneme insertions to keep
         one voice throughout. English-only text retains the configured voice. Returned
         samples are mono float32 shaped (samples,), at 24 kHz. Playback-only and
@@ -339,15 +349,16 @@ class TTS:
                 )
             if not text.strip():
                 raise ValueError("text must be nonempty")
+            text = prepare_speech_text(text)
             if not contains_han(text):
                 return self._synthesize_english(text)
             return self._synthesize_chinese(text), 24000
 
     def _load_chinese(self) -> _ChineseResources:
-        """Load prepared Chinese resources once using the initialized synthesis GPU."""
+        """Load prepared Chinese resources once using the configured CPU/hybrid backend."""
         if self._chinese is not None:
             return self._chinese
-        assert self._gpu is not None
+        assert self._session is not None
         root = self.config.chinese_model_dir
         voice_path = root / "voices" / f"{self.config.chinese_voice}.npy"
         for path in (
