@@ -16,6 +16,7 @@ import openvino as ov
 import soundfile as sf
 from kokoro_onnx import Kokoro
 from numpy.typing import NDArray
+from scipy.signal import resample_poly
 
 from .chinese import contains_han
 from .chinese import phoneme_batches as chinese_batches
@@ -233,16 +234,16 @@ class _ChineseResources:
 
 
 class TTS:
-    """Reusable synthesizer owning one shared GPU executor and serialized model sessions."""
+    """Shared speech/raw playback queue with optional bilingual synthesis resources."""
 
     config: TTSConfig
     """Validated synthesis settings."""
 
-    model: Kokoro
-    """Kokoro frontend with an explicitly bounded CPU inference session."""
+    model: Kokoro | None
+    """Kokoro frontend with bounded CPU inference; None for playback-only instances."""
 
-    _gpu: SharedGPU
-    """One GPU context and kernel cache shared by both language models."""
+    _gpu: SharedGPU | None
+    """GPU context shared by both language models; None for playback-only instances."""
 
     _session: _OpenVINOSession | None
     """English model session, absent during initialization or after close."""
@@ -262,27 +263,37 @@ class TTS:
     _chinese_lock: threading.RLock
     """Serializes synthesis, lazy initialization and resource release."""
 
-    def __init__(self, config: TTSConfig | None = None) -> None:
-        """Load local English artifacts and initialize the UHD 630 hybrid runtime.
+    def __init__(
+        self, config: TTSConfig | None = None, *, playback_only: bool = False
+    ) -> None:
+        """Initialize shared playback and optionally load the English hybrid runtime.
 
         Args:
             config:
                 Prepared artifact paths, thread budget and voice settings;
                 None uses defaults.
 
+            playback_only:
+                If True, skip model/artifact/GPU access and support raw playback only.
+
         """
         config = TTSConfig() if config is None else config
         logger.debug("tts.load settings=%r", config)
-        for path in (config.model_path, config.voices_path):
-            if not path.is_file():
-                raise FileNotFoundError(f"Missing TTS artifact: {path}")
         self.config = config
+        self.model = None
+        self._gpu = None
         self._chinese = None
         self._chinese_lock = threading.RLock()
         self._session = None
         self._closed = False
         self._output = None
         self._output_buffer_seconds = None
+        if playback_only:
+            logger.info("tts.load status=ok mode=playback_only")
+            return
+        for path in (config.model_path, config.voices_path):
+            if not path.is_file():
+                raise FileNotFoundError(f"Missing TTS artifact: {path}")
         start = time.perf_counter()
         self._gpu = SharedGPU()
         try:
@@ -311,7 +322,8 @@ class TTS:
 
         Mixed text uses the Chinese model with English phoneme insertions to keep
         one voice throughout. English-only text retains the configured voice. Returned
-        samples are mono float32 shaped (samples,), at 24 kHz.
+        samples are mono float32 shaped (samples,), at 24 kHz. Playback-only and
+        closed instances reject synthesis.
 
         Args:
             text:
@@ -321,6 +333,10 @@ class TTS:
         with self._chinese_lock:
             if self._closed:
                 raise RuntimeError("TTS is closed")
+            if self.model is None:
+                raise RuntimeError(
+                    "TTS is playback-only; synthesis models are not loaded"
+                )
             if not text.strip():
                 raise ValueError("text must be nonempty")
             if not contains_han(text):
@@ -328,9 +344,10 @@ class TTS:
             return self._synthesize_chinese(text), 24000
 
     def _load_chinese(self) -> _ChineseResources:
-        """Load prepared Chinese resources once without network access."""
+        """Load prepared Chinese resources once using the initialized synthesis GPU."""
         if self._chinese is not None:
             return self._chinese
+        assert self._gpu is not None
         root = self.config.chinese_model_dir
         voice_path = root / "voices" / f"{self.config.chinese_voice}.npy"
         for path in (
@@ -421,7 +438,7 @@ class TTS:
             return samples
 
     def close(self) -> None:
-        """Drain playback and release inference resources; safe to repeat."""
+        """Drain playback and release any loaded inference resources; safe to repeat."""
         with self._chinese_lock:
             if self._closed:
                 return
@@ -442,7 +459,8 @@ class TTS:
                     if session is not None:
                         session.close()
                 finally:
-                    self._gpu.close()
+                    if self._gpu is not None:
+                        self._gpu.close()
 
     def _synthesize_english(self, text: str) -> tuple[NDArray[np.float32], int]:
         """Return mono float32 samples shaped (samples,) and sample rate in Hz.
@@ -457,6 +475,7 @@ class TTS:
         """
         if not text.strip():
             raise ValueError("text must be nonempty")
+        assert self.model is not None
         start = time.perf_counter()
         phonemes = self.model.tokenizer.phonemize(text, self.config.language)
         batches = phoneme_batches(phonemes)
@@ -502,6 +521,7 @@ class TTS:
         Calls are serialized, including synthesis and submission. To serialize LLM
         and TTS compute, call this method directly from the LLM's text consumer.
         Audio-device failures propagate; failed playback is discarded, not retried.
+        Submission uses the same play_samples path and queue as raw audio.
 
         Args:
             text:
@@ -518,29 +538,108 @@ class TTS:
                 until the active stream is drained.
 
         """
+        with self._chinese_lock:
+            self._validate_playback(buffer_seconds)
+            samples, rate = self.synthesize(text)
+            self.play_samples(
+                samples, rate, blocking=blocking, buffer_seconds=buffer_seconds
+            )
+
+    def _validate_playback(self, buffer_seconds: float) -> None:
+        """Reject closed playback or incompatible queue capacity before doing work.
+
+        Args:
+            buffer_seconds:
+                Requested queue capacity, finite and at least one 24 kHz frame.
+
+        """
+        if self._closed:
+            raise RuntimeError("TTS is closed")
         if not math.isfinite(buffer_seconds) or buffer_seconds < 1 / 24000:
             raise ValueError(
                 "buffer_seconds must be finite and hold at least one frame"
             )
+        if self._output is not None and buffer_seconds != self._output_buffer_seconds:
+            raise ValueError("Drain playback before changing buffer_seconds")
+
+    def play_samples(
+        self,
+        samples: NDArray[np.float32],
+        sample_rate: int,
+        *,
+        blocking: bool = True,
+        buffer_seconds: float = 1.0,
+        cancelled: threading.Event | None = None,
+    ) -> None:
+        """Submit raw audio to the same ordered 24 kHz queue used by synthesized speech.
+
+        Validate finite input at this external PCM boundary (an O(samples) scan).
+        Resample a whole submission once before chunking, avoiding resampling seams.
+        Queue capacity bounds pending playback, not the caller/resampled waveform.
+        Cancellation skips new submission between 100 ms blocks and drains accepted
+        audio when blocking. No failed audio is retried. Calls are serialized.
+
+        Args:
+            samples:
+                Nonempty mono float32 waveform shaped (samples,), conventionally in
+                [-1, 1]. No gain normalization is applied; input remains unmodified.
+
+            sample_rate:
+                Positive integer source rate in Hz; 24000 bypasses resampling.
+
+            blocking:
+                Drain and close the shared queue before returning when True. False
+                can still wait for capacity; call wait_playback to drain later.
+
+            buffer_seconds:
+                Finite positive 24 kHz queue capacity; must match any active queue.
+
+            cancelled:
+                Optional abort signal checked before resampling and each 100 ms
+                submission. Already submitted audio retains its order and is drained.
+
+        """
+        if samples.dtype != np.float32 or samples.ndim != 1 or not samples.size:
+            raise ValueError("samples must be a nonempty mono float32 array")
+        if type(sample_rate) is not int or sample_rate <= 0:
+            raise ValueError("sample_rate must be a positive integer")
+        if not np.isfinite(samples).all():
+            raise ValueError("samples must contain only finite values")
         with self._chinese_lock:
-            if (
-                self._output is not None
-                and buffer_seconds != self._output_buffer_seconds
-            ):
-                raise ValueError("Drain playback before changing buffer_seconds")
-            samples, rate = self.synthesize(text)
+            self._validate_playback(buffer_seconds)
+            if cancelled is not None and cancelled.is_set():
+                logger.debug("tts.play_samples status=cancelled_before_submission")
+                return
+            if sample_rate != 24000:
+                divisor = math.gcd(sample_rate, 24000)
+                samples = np.asarray(
+                    resample_poly(samples, 24000 // divisor, sample_rate // divisor),
+                    dtype=np.float32,
+                )
             try:
                 if self._output is None:
-                    self._output = AudioPlayback(rate, buffer_seconds)
+                    self._output = AudioPlayback(24000, buffer_seconds)
                     self._output_buffer_seconds = buffer_seconds
-                self._output.submit(samples)
+                submitted = 0
+                if cancelled is None:
+                    self._output.submit(samples)
+                    submitted = samples.size
+                else:
+                    for offset in range(0, samples.size, 2400):
+                        if cancelled.is_set():
+                            break
+                        block = samples[offset : offset + 2400]
+                        self._output.submit(block)
+                        submitted += block.size
                 logger.debug(
-                    "tts.play status=submitted samples=%d rate=%d", samples.size, rate
+                    "tts.play_samples status=submitted samples=%d source_rate=%d rate=24000",
+                    submitted,
+                    sample_rate,
                 )
                 if blocking:
                     self.wait_playback()
             except Exception:
-                logger.exception("tts.play status=failed blocking=%s", blocking)
+                logger.exception("tts.play_samples status=failed blocking=%s", blocking)
                 output, self._output = self._output, None
                 self._output_buffer_seconds = None
                 if output is not None:

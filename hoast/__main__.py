@@ -1,4 +1,4 @@
-"""Run the interactive assistant from the project root with python -m hoast."""
+"""Run the configured voice assistant; use --text for the stdin/stdout interface."""
 
 from .llm_cli import main
 

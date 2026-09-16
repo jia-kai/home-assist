@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "banks": {
+    "lead_en": ["", "please ", "could you ", "would you "],
+    "end_en": ["", ".", ", please", "!"],
+    "lead_zh": ["", "请", "麻烦", "帮我"],
+    "end_zh": ["", "。", "吧", "，谢谢"],
+    "resume_en": ["play some music", "Play some music", "play music", "start the music", "resume the music", "continue playing music"],
+    "resume_zh": ["放歌", "播放音乐", "放点音乐", "继续播放音乐", "恢复音乐播放"],
+    "lively_en": ["drop a beat", "give this room a soundtrack", "let's get some tunes going", "fire up the music", "put some tunes on", "bring on the music", "get the music rolling"],
+    "lively_zh": ["唱歌", "放歌", "来首歌助助兴", "音乐走起", "整点歌听听", "给生活配个BGM", "BGM安排上", "放首歌热闹一下", "开唱吧", "来点音乐放松一下"],
+    "resume_mixed": ["来点 music", "Let's 放歌", "DJ，放歌", "帮我 play some music", "Music 安排上"],
+    "pause_en": ["pause the music", "stop the music", "pause playback", "stop playback"],
+    "pause_zh": ["暂停音乐", "停止播放音乐", "把音乐暂停", "别再放歌了"],
+    "pause_mixed": ["Pause 一下音乐", "把 music 暂停", "Stop 播放音乐"],
+    "next_en": ["next song", "switch song", "skip this track", "play the next song"],
+    "next_zh": ["下一首", "切歌", "换首歌", "跳过这首歌"],
+    "next_mixed": ["Next song，换一首", "Skip 这首歌", "切到 next track"],
+    "query_en": ["what is playing", "what song is this", "who is singing", "which artist is playing"],
+    "query_zh": ["现在在放什么歌", "这首歌叫什么", "现在是谁在唱", "正在播放什么"],
+    "query_mixed": ["现在 what song is playing", "这首歌的 artist 是谁", "现在播放的 title 是什么"],
+    "query_lead_en": ["", "tell me ", "can you tell me ", "could you tell me ", "I'd like to know ", "do you know "],
+    "query_end_en": ["?", ", please?", " please?"],
+    "query_lead_zh": ["", "请告诉我", "我想知道", "帮我看看", "你知道", "能告诉我"],
+    "query_end_zh": ["？", "，谢谢。", "呢？"],
+    "negative_lead_en": ["don't ", "do not ", "please don't ", "please do not "],
+    "negative_action_en": ["start playing music", "skip to the next track", "turn on the light", "turn off the light", "change the music volume"],
+    "negative_lead_zh": ["不要", "请不要", "别", "先别"],
+    "negative_action_zh": ["开始播放音乐", "切到下一首歌", "开灯", "关灯", "改变音乐音量"],
+    "negative_mixed": ["不要 start music", "Don't 开灯", "Please don't 切歌", "别 change 音量"],
+    "titles": [
+      {"text": "\"Love Story\"", "value": "Love Story"},
+      {"text": "\"Yellow\"", "value": "Yellow"},
+      {"text": "\"Don't Stop Me Now\"", "value": "Don't Stop Me Now"},
+      {"text": "\"Play\"", "value": "Play"},
+      {"text": "《晴天》", "value": "晴天"},
+      {"text": "《夜曲》", "value": "夜曲"},
+      {"text": "《唱歌》", "value": "唱歌"},
+      {"text": "《放歌》", "value": "放歌"},
+      {"text": "《夜色 in Blue》", "value": "夜色 in Blue"}
+    ],
+    "artists": ["Taylor Swift", "Coldplay", "Queen", "Adele", "周杰伦", "陈奕迅", "邓紫棋", {"text": "\"G.E.M.\"", "value": "G.E.M."}],
+    "period_en": [
+      {"text": "right now", "value": "now"},
+      {"text": "today", "value": "today"},
+      {"text": "tomorrow", "value": "tomorrow"},
+      {"text": "next week", "value": "next_week"}
+    ],
+    "period_zh": [
+      {"text": "现在", "value": "now"},
+      {"text": "今天", "value": "today"},
+      {"text": "明天", "value": "tomorrow"},
+      {"text": "下周", "value": "next_week"}
+    ],
+    "place_en": [
+      {"text": "at home", "value": ""},
+      {"text": "in Toronto, Canada", "value": "Toronto, Canada"},
+      {"text": "in Paris, France", "value": "Paris, France"},
+      {"text": "in 北京", "value": "北京"}
+    ],
+    "place_zh": [
+      {"text": "家里", "value": ""},
+      {"text": "多伦多，加拿大", "value": "多伦多，加拿大"},
+      {"text": "北京", "value": "北京"},
+      {"text": "Paris, France", "value": "Paris, France"}
+    ],
+    "level": [1, 10, 25, 35, 50, 75, 100, {"text": "thirty-five", "value": 35}, {"text": "五十", "value": 50}],
+    "direction_en": ["louder", "quieter"],
+    "direction_zh": [{"text": "大一点", "value": "louder"}, {"text": "小一点", "value": "quieter"}],
+    "power_en": [{"text": "on", "value": true}, {"text": "off", "value": false}],
+    "power_zh": [{"text": "打开", "value": true}, {"text": "关闭", "value": false}],
+    "resume_zh_asr": [
+      {"text":"放首哥听听","value":"","clean":"放首歌听听","error":"homophone"},
+      {"text":"播方一点音乐","value":"","clean":"播放一点音乐","error":"near_homophone"},
+      {"text":"来点音越","value":"","clean":"来点音乐","error":"homophone"}
+    ],
+    "pause_zh_asr": [
+      {"text":"暂亭一下音乐","value":"","clean":"暂停一下音乐","error":"homophone"},
+      {"text":"婷止播放音乐","value":"","clean":"停止播放音乐","error":"homophone"}
+    ],
+    "next_zh_asr": [
+      {"text":"切到下一守","value":"","clean":"切到下一首","error":"homophone"},
+      {"text":"换一首哥","value":"","clean":"换一首歌","error":"homophone"}
+    ],
+    "query_zh_asr": [
+      {"text":"现在放的是什么哥","value":"","clean":"现在放的是什么歌","error":"homophone"},
+      {"text":"这首哥是谁唱的","value":"","clean":"这首歌是谁唱的","error":"homophone"}
+    ],
+    "play_verb_zh_asr": [{"text":"播方","value":"","clean":"播放","error":"near_homophone"}],
+    "sing_verb_zh_asr": [{"text":"演长","value":"","clean":"演唱","error":"near_homophone"}],
+    "light_zh_asr": [
+      {"text":"开登","value":true,"clean":"开灯","error":"homophone"},
+      {"text":"关登","value":false,"clean":"关灯","error":"homophone"}
+    ],
+    "volume_zh_asr": [
+      {"text":"把音亮调大点","value":"louder","clean":"把音量调大点","error":"homophone"},
+      {"text":"把音亮调小点","value":"quieter","clean":"把音量调小点","error":"homophone"}
+    ],
+    "direction_en_asr": [
+      {"text":"loader","value":"louder","clean":"louder","error":"latin_asr"},
+      {"text":"quiter","value":"quieter","clean":"quieter","error":"latin_asr"}
+    ],
+    "weather_zh_asr": [
+      {"text":"查一下明天的天汽","value":"tomorrow","clean":"查一下明天的天气","error":"homophone"},
+      {"text":"查一下名天的天气","value":"tomorrow","clean":"查一下明天的天气","error":"homophone"}
+    ],
+    "resume_validation_asr": [{"text":"我想听点音越。","value":"","clean":"我想听点音乐。","error":"homophone"}],
+    "resume_test_asr": [{"text":"让房间响起音越吧。","value":"","clean":"让房间响起音乐吧。","error":"homophone"}]
+  }
+}

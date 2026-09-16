@@ -4,6 +4,7 @@ import json
 import logging
 import math
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from typing import Literal
 from urllib.parse import urlencode
@@ -13,7 +14,7 @@ from zoneinfo import ZoneInfo
 from pydantic import Field, JsonValue, field_validator
 
 from hoast.config import WeatherConfig
-from hoast.llm import Tool, ToolArguments
+from hoast.llm import Tool, ToolArguments, declaration_only
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,16 @@ class WeatherArguments(ToolArguments):
             return value
         normalized = "_".join(value.strip().casefold().replace("-", " ").split())
         return normalized if normalized in {"today", "tomorrow", "next_week"} else "now"
+
+
+def declare_weather_tool() -> Tool[WeatherArguments]:
+    """Return the production weather schema without requiring home coordinates or a client."""
+    return Tool(
+        "get_weather",
+        "Get weather, outside temperature, and rain forecast in Celsius.",
+        WeatherArguments,
+        declaration_only,
+    )
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -291,15 +302,8 @@ class WeatherClient:
         self.clock = clock
 
     def tool(self) -> Tool[WeatherArguments]:
-        """Return the strict get_weather tool; failures propagate to its caller."""
-        return Tool(
-            name="get_weather",
-            description=(
-                "Get weather, outside temperature, and rain forecast in Celsius."
-            ),
-            arguments=WeatherArguments,
-            handler=self.get_weather,
-        )
+        """Bind the shared weather declaration to this client's validated handler."""
+        return replace(declare_weather_tool(), handler=self.get_weather)
 
     def _request(self, endpoint: str, params: dict[str, str]) -> dict[str, JsonValue]:
         """Fetch bounded JSON without retries or redirects; propagate HTTP errors.

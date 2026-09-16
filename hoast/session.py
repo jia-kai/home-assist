@@ -133,6 +133,8 @@ class Session:
         Repair-enabled routing buffers prose until validation succeeds. Diagnostic
         prompts remain transient; only the original request and valid reply commit.
         Inference limits and tool execution failures are not repaired.
+        Successful raw model output and selected calls are recorded at debug level
+        before dispatch so semantic routing mistakes can be diagnosed.
 
         Args:
             user_text:
@@ -235,6 +237,14 @@ class Session:
                 if isinstance(event, BaseException):
                     raise event
                 if isinstance(event, Generation):
+                    logger.debug(
+                        "tool routing status=generated raw=%r calls=%r input_tokens=%d output_tokens=%d seconds=%.3f",
+                        event.raw,
+                        event.calls,
+                        event.input_tokens,
+                        event.output_tokens,
+                        event.elapsed_seconds,
+                    )
                     if not event.text.startswith(emitted):
                         raise RuntimeError(
                             "Streamed text disagrees with parsed response"

@@ -85,6 +85,51 @@ class SwitchConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class SatelliteConfig:
+    """Native ESPHome microphone endpoint and bounded command capture settings."""
+
+    host: str
+    """Required satellite IP address or hostname, without a URL scheme or port."""
+
+    port: int = 6053
+    """Native API TCP port, between 1 and 65535."""
+
+    capture_seconds: float = 6.0
+    """Maximum command capture duration in seconds, between 0.1 and 30."""
+
+    language: str = "en"
+    """Whisper language code, or auto for language detection."""
+
+    key_env: str | None = None
+    """Optional environment/dotenv variable containing the Noise encryption key."""
+
+    def __post_init__(self) -> None:
+        """Reject malformed endpoints, capture bounds, language, and secret names."""
+        if (
+            not isinstance(self.host, str)
+            or not self.host
+            or any(character.isspace() or character in "/@" for character in self.host)
+        ):
+            raise ValueError("satellite.host must be a hostname or IP address")
+        if ":" in self.host:
+            ip_address(self.host)
+        if type(self.port) is not int or not 1 <= self.port <= 65535:
+            raise ValueError("satellite.port must be an integer between 1 and 65535")
+        if (
+            type(self.capture_seconds) not in (int, float)
+            or not math.isfinite(self.capture_seconds)
+            or not 0.1 <= self.capture_seconds <= 30
+        ):
+            raise ValueError("satellite.capture_seconds must be between 0.1 and 30")
+        if not isinstance(self.language, str) or not self.language.isalpha():
+            raise ValueError("satellite.language must be a language code or auto")
+        if self.key_env is not None and (
+            not isinstance(self.key_env, str) or not self.key_env.isidentifier()
+        ):
+            raise ValueError("satellite.key_env must be an environment variable name")
+
+
+@dataclass(slots=True, frozen=True)
 class SystemConfig:
     """Validated system settings."""
 
@@ -96,6 +141,32 @@ class SystemConfig:
 
     switch: SwitchConfig | None = None
     """Optional smart plug endpoint, enabled by an explicit [switch] table."""
+
+    satellite: SatelliteConfig | None = None
+    """Voice endpoint, required for voice mode and optional for text/tool CLIs."""
+
+
+def satellite_key(config: SatelliteConfig, env_file: Path = Path(".env")) -> str | None:
+    """Read an explicitly configured satellite key; absent key_env means plaintext.
+
+    Args:
+        config:
+            Satellite settings selecting an optional secret variable name.
+
+        env_file:
+            Dotenv file used only when the variable is absent from the environment.
+
+    """
+    if config.key_env is None:
+        return None
+    key = (
+        os.environ[config.key_env]
+        if config.key_env in os.environ
+        else dotenv_values(env_file, interpolate=False).get(config.key_env)
+    )
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError(f"Set {config.key_env} in the environment or {env_file}")
+    return key.strip()
 
 
 def music_token(config: MusicConfig, env_file: Path = Path(".env")) -> str:
@@ -124,18 +195,18 @@ def music_token(config: MusicConfig, env_file: Path = Path(".env")) -> str:
 
 
 def load_config(path: Path) -> SystemConfig:
-    """Read required weather and optional music/switch settings; reject unknowns.
+    """Read required weather and optional music, switch, and satellite settings.
 
     Args:
         path:
-            TOML file with weather coordinates and optional music/switch settings.
+            TOML file with weather coordinates and optional integration tables.
 
     """
     with path.open("rb") as source:
         data = tomllib.load(source)
-    if "weather" not in data or set(data) - {"weather", "music", "switch"}:
+    if "weather" not in data or set(data) - {"weather", "music", "switch", "satellite"}:
         raise ValueError(
-            "System config requires [weather] and optional [music], [switch]"
+            "System config requires [weather] and optional [music], [switch], [satellite]"
         )
     weather = data["weather"]
     if not isinstance(weather, dict) or set(weather) != {"latitude", "longitude"}:
@@ -156,4 +227,17 @@ def load_config(path: Path) -> SystemConfig:
         if not isinstance(settings, dict) or set(settings) != {"ip"}:
             raise ValueError("[switch] requires exactly ip")
         switch = SwitchConfig(**settings)
-    return SystemConfig(WeatherConfig(**weather), music, switch)
+    satellite = None
+    if "satellite" in data:
+        settings = data["satellite"]
+        if (
+            not isinstance(settings, dict)
+            or "host" not in settings
+            or set(settings)
+            - {"host", "port", "capture_seconds", "language", "key_env"}
+        ):
+            raise ValueError(
+                "[satellite] requires host; accepts port, capture_seconds, language, key_env"
+            )
+        satellite = SatelliteConfig(**settings)
+    return SystemConfig(WeatherConfig(**weather), music, switch, satellite)

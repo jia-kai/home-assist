@@ -10,6 +10,15 @@ player_id = "YOUR_PLAYER_ID"
 # Set the token in .env or the environment, never in this file.
 token_env = "MUSIC_ASSISTANT_TOKEN"
 
-# Optional: local Kasa smart plug for python -m hoast.switch.
+# Optional: local Kasa relay controlling the agent's light and hoast.switch CLI.
 [switch]
 ip = "192.168.42.20"
+
+# Required for python -m hoast voice mode; --text does not need this table.
+[satellite]
+host = "127.0.0.1"
+port = 6053
+capture_seconds = 6.0 # Hard maximum; 600 ms trailing silence ends capture earlier.
+language = "auto"
+# For an encrypted ESPHome device, set this variable in .env or the environment.
+# key_env = "ESPHOME_API_KEY"

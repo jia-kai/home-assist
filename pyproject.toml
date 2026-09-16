@@ -24,6 +24,7 @@ dependencies = [
     "threadpoolctl>=3.6",
     "pyopencl==2026.1.4",
     "sounddevice>=0.5",
+    "aioesphomeapi==45.3.1",
 ]
 
 [dependency-groups]
@@ -41,7 +42,7 @@ explicit = true
 torch = { index = "pytorch-cpu" }
 
 [tool.pyright]
-include = ["hoast", "tools", "tests"]
+include = ["hoast", "tools", "tests", "finetune"]
 pythonVersion = "3.14"
 venvPath = "."
 venv = ".venv"

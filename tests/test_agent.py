@@ -1,5 +1,6 @@
 """Offline grounded rendering and transactional weather/music agent integration."""
 
+import logging
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ import pytest
 from pydantic import JsonValue
 
 from hoast.agent import LocalAgent, WeatherAgent, render_music, render_weather
+from hoast.lights import LightArguments
 from hoast.llm import (
     FunctionGemma,
     GeneratedCallError,
@@ -144,7 +146,7 @@ def agent_runtime(
 def mixed_runtime(
     agent_runtime: tuple[WeatherAgent, Routing], tmp_path: Path
 ) -> tuple[LocalAgent, Routing]:
-    """Retain controlled inference with five real strict tool contracts and Session.
+    """Retain controlled inference with weather, six music tool contracts and Session.
 
     Args:
         agent_runtime:
@@ -191,6 +193,8 @@ def mixed_runtime(
             tool("resume_music", MusicArguments),
             tool("play_music", PlayMusicArguments),
             tool("volume_music", VolumeMusicArguments),
+            tool("music_next", MusicArguments),
+            tool("what_is_playing", MusicArguments),
         ]
     )
     return LocalAgent(Session(FunctionGemma(LLMConfig(tmp_path), tools))), state
@@ -1245,10 +1249,19 @@ def test_music_native_followups(mixed_runtime: tuple[LocalAgent, Routing]) -> No
 
 @pytest.mark.parametrize("music_mask", range(16))
 @pytest.mark.parametrize("agent_type", [LocalAgent, WeatherAgent])
+@pytest.mark.parametrize("query_tool", [False, True])
+@pytest.mark.parametrize(
+    "next_tool,light", [(False, False), (True, False), (False, True), (True, True)]
+)
 def test_optional_music_registry_is_complete(
-    tmp_path: Path, music_mask: int, agent_type: type[LocalAgent]
+    tmp_path: Path,
+    music_mask: int,
+    agent_type: type[LocalAgent],
+    next_tool: bool,
+    light: bool,
+    query_tool: bool,
 ) -> None:
-    """Accept weather alone or all four music tools for both construction names.
+    """Accept compatible core registries plus optional next/light without accepting partial music.
 
     Args:
         tmp_path:
@@ -1259,6 +1272,15 @@ def test_optional_music_registry_is_complete(
 
         agent_type:
             Primary agent class or retained weather construction subclass.
+
+        next_tool:
+            Whether to include the next tool, which requires the four core music tools.
+
+        light:
+            Whether the independent optional light tool is registered.
+
+        query_tool:
+            Whether the read-only playback query extension is registered.
 
     """
     tools: list[Tool[Any]] = [
@@ -1274,12 +1296,142 @@ def test_optional_music_registry_is_complete(
     ):
         if music_mask & (1 << index):
             tools.append(Tool(name, "Fixture music", arguments, lambda args: None))
+    if next_tool:
+        tools.append(
+            Tool("music_next", "Fixture next", MusicArguments, lambda args: None)
+        )
+    if light:
+        tools.append(
+            Tool("set_light", "Fixture light", LightArguments, lambda args: None)
+        )
+    if query_tool:
+        tools.append(
+            Tool(
+                "what_is_playing",
+                "Fixture playback query",
+                MusicArguments,
+                lambda args: None,
+            )
+        )
     session = Session(FunctionGemma(LLMConfig(tmp_path), ToolRegistry(tools)))
-    if music_mask in (0, 15):
+    if music_mask == 15 or (music_mask == 0 and not next_tool and not query_tool):
         assert isinstance(agent_type(session), LocalAgent)
     else:
         with pytest.raises(ValueError, match="optional complete music tool set"):
             agent_type(session)
+
+
+@pytest.mark.parametrize("query", ["next", "Next song.", "switch song", "skip track!"])
+def test_music_next_shortcut(
+    query: str, mixed_runtime: tuple[LocalAgent, Routing]
+) -> None:
+    """Next/switch-song requests dispatch one next tool without unreliable model routing.
+
+    Args:
+        query:
+            A supported next-song phrase with optional terminal punctuation.
+
+        mixed_runtime:
+            Real registry and session backed by controlled tool outcomes.
+
+    """
+    agent, state = mixed_runtime
+    state.failure = AssertionError("Next shortcut must not invoke inference")
+    state.results = [{"status": "skipped", "confirmation": "requested"}]
+    assert list(agent.stream(query)) == ["Next song requested."]
+    assert state.dispatched == [ToolCall("music_next", {})]
+    assert state.histories == []
+    assert agent.session.history[-1]["content"] == "Next song requested."
+
+
+def test_music_next_counts_as_music_action(
+    mixed_runtime: tuple[LocalAgent, Routing],
+) -> None:
+    """A next request cannot share a mutation batch with another music action.
+
+    Args:
+        mixed_runtime:
+            Real registry/session with controlled model-proposed calls.
+
+    """
+    agent, state = mixed_runtime
+    state.calls = (ToolCall("music_next", {}), ToolCall("pause_music", {}))
+    with pytest.raises(RuntimeError, match="one music action"):
+        list(agent.stream("Please skip and pause the music"))
+    assert state.dispatched == []
+
+
+def test_what_is_playing_shortcut(mixed_runtime: tuple[LocalAgent, Routing]) -> None:
+    """A direct playback query dispatches its read-only tool and retains grounded history.
+
+    Args:
+        mixed_runtime:
+            Real registry/session with a controlled now-playing observation.
+
+    """
+    agent, state = mixed_runtime
+    state.failure = AssertionError("Query shortcut must not invoke inference")
+    state.results = [
+        {
+            "status": "playing",
+            "now_playing": {"title": "Actual Song", "artist": "Actual Artist"},
+        }
+    ]
+    assert list(agent.stream("What is playing?")) == [
+        "Now playing Actual Song by Actual Artist."
+    ]
+    assert state.dispatched == [ToolCall("what_is_playing", {})]
+    assert state.histories == []
+
+
+def test_model_route_is_logged_before_tool_execution(
+    mixed_runtime: tuple[LocalAgent, Routing], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Expose a semantically wrong but schema-valid model call in durable diagnostics.
+
+    Args:
+        mixed_runtime:
+            Real agent/session with a controlled valid query-only model decision.
+
+        caplog:
+            Captured session/agent debug records for route attribution.
+
+    """
+    agent, state = mixed_runtime
+    caplog.set_level(logging.DEBUG)
+    state.calls = (ToolCall("what_is_playing", {}),)
+    state.results = [{"status": "nothing_playing", "observed_state": "idle"}]
+    assert list(agent.stream("Play some music")) == ["Nothing is playing right now."]
+    assert "Agent routing mode=llm tools=['what_is_playing']" in caplog.text
+    assert "tool routing status=generated raw=" in caplog.text
+    assert state.text in caplog.text
+    assert len(state.histories) == 1
+
+
+@pytest.mark.parametrize(
+    "status,confirmation,expected",
+    [
+        ("skipped", "observed", "Skipped to the next song."),
+        ("skipped", "requested", "Next song requested."),
+        ("stopped", "observed", "Music stopped."),
+        ("already_stopped", "observed", "Music is already stopped."),
+    ],
+)
+def test_player_button_outcomes(status: str, confirmation: str, expected: str) -> None:
+    """Render transport outcomes without confusing an acknowledged request with a change.
+
+    Args:
+        status:
+            MA-derived transport result.
+
+        confirmation:
+            Observed state versus command acknowledgement.
+
+        expected:
+            Brief grounded response without invented track metadata.
+
+    """
+    assert render_music({"status": status, "confirmation": confirmation}) == expected
 
 
 @pytest.mark.parametrize("query", ["", " \t\n"])

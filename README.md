@@ -54,9 +54,44 @@ Unknown configuration keys are rejected.
 uv run python -m hoast --config config.toml
 # Use CPU instead of the default Intel GPU:
 uv run python -m hoast --config config.toml --device CPU
+# Explicit keyboard/text mode:
+uv run python -m hoast --config config.toml --text
 ```
 
-Use `/reset` to clear history and EOF to exit. Conversational output goes to
+Voice mode connects to `[satellite].host` in `config.toml`, receives command audio,
+runs STT and the tool-based agent, then plays its bounded reply through system
+audio. Startup warms English and Chinese TTS, feeds both generated clips to STT,
+then warms LLM inference without dispatching tools. Listening starts after warm-up.
+The satellite stays busy until playback drains. A gap of **more than 30 seconds**
+between the previous recognized capture's end and the next capture's first audio
+starts a fresh LLM session. Capture ends adaptively after **600 ms of detected
+silence following speech**. `satellite.capture_seconds` is the hard maximum
+(six seconds by default), not a mandatory wait. Initial silence waits for speech
+or the maximum; short pauses are tolerated. Silero uses 32 ms frames, so endpoint
+notification has frame/packet granularity while retained trailing silence is 600 ms.
+
+To hear exactly what the controller captured, run:
+
+```sh
+uv run python -m hoast --config config.toml --debug-audio
+```
+
+Debug mode plays a high start tone, the captured command, and a lower end tone
+through system audio before STT. It deliberately adds the replay duration to each
+turn; the satellite stays busy until all processing/playback finishes.
+Replay and synthesized replies share the TTS playback API and queue. Linux playback
+uses an available PipeWire/PulseAudio adapter to mix with the satellite's audio.
+
+The system prompt gets only music **on/off** state (or explicit unavailability)
+before every request. It does not include background title, artist, volume, source,
+or player metadata. Explicit user requests and tool answers retain their own context.
+With `[switch]` configured, the agent can turn its light relay on or off. Observed
+music starts/resumes with available track metadata produce
+“Now playing {title} by {artist}”; the mix seed is not used as the current track.
+TTS input is limited to 400 characters at sentence/word boundaries after consuming
+the complete agent response; the text console retains the full grounded answer.
+
+In text mode, use `/reset` to clear history and EOF to exit. Conversational output goes to
 stdout; diagnostics go to stderr and `.cache/hoast/diagnostics/agent.log`
 (or the selected `--cache` root).
 
@@ -94,6 +129,11 @@ speech after its preparation.
 See [docs/speech.md](docs/speech.md) for voice/language options, reusable Python
 engines and local artifact paths. The linked study documents preserve the tuning
 journey, rejected approaches and measured results.
+
+For local-microphone wake-word development and the reSpeaker ESPHome interface,
+see [Network microphone development](docs/voice-satellite.md). The simulator uses
+OHF Linux Voice Assistant with microWakeWord; `python -m hoast.voice` receives
+native wake/audio events and emits transcripts for the agent.
 
 ## Weather
 
@@ -210,20 +250,39 @@ start playback; candidates stay in diagnostic results and logs.
 - **New play replaces the resolved active queue** with an Endless Mix seeded by
   the match. “Infinite” playback means provider-backed recommendations and dynamic
   refill, not a guarantee of unlimited music. The seed may not play first.
-- **Pause/resume control only the existing native stream**, including a supported
-  Spotify Connect source. They issue no search, queue replacement, queue-resume,
-  or source-selection requests. An idle retained external AudioSource, such as
-  Spotify Connect, resumes with native `players/cmd/play` after a read-only check
-  that its source URI is not an MA queue. Idle players without such a source still
-  refuse fallback; resume those in the source app or request new music. A conversational
-  “play music” or “continue music” is intended to route to resume; a new title or
-  artist requests a new mix. Player and source must support native pause/unpause.
-- Group/sync routing is resolved by the client. State checks are not atomic with
-  Music Assistant's command handling: the server can still fall back if state changes
-  during dispatch. Detected source drift is reported without retries or restoration.
+- **Play/resume and pause use MA's player controls**: `players/cmd/play` and
+  `players/cmd/pause`. MA handles idle-queue restoration, source capabilities,
+  protocol fallbacks, and group/sync routing. The selected player ID is sent to
+  MA; effective group state is read for observations. Play can restore an idle
+  queue or source even when local source/capability metadata is absent. Pause can
+  become a stop when MA cannot pause the output; observed stops are reported as
+  stopped. Empty queues and unsupported sources can still be rejected by MA.
+- **What is playing?** uses the read-only `what_is_playing()` tool. Its observed
+  result renders “Now playing {title} by {artist}” when both labels are available;
+  paused/idle playback and missing metadata are described without inventing names.
+  Play/resume automatically call this same lookup, reuse fresh post-command
+  observations, and include its result as `playback` for text rendering. Explicit
+  new mixes also read back the player after the queue operation. Requested-only
+  starts retain acknowledgement wording until playback is observed.
+- **Next song / switch song** uses the `music_next` tool, sending
+  `players/cmd/next` once. MA chooses the appropriate external source, queue, or
+  native next action. A changed observed media identity confirms advancement;
+  delayed/unchanged/missing metadata yields “Next song requested.” Next is never
+  retried. The direct CLI equivalent is `python -m hoast.music_cli next`.
+  The read-only query is `python -m hoast.music_cli now-playing`.
+- Explicit play/pause intents use directional commands, so asking to play an
+  already-playing player does not pause it. The frontend button uses a toggle
+  (and a Stop action for stop-only sources/radio); voice pause delegates the
+  server's pause behavior. State checks are not atomic with dispatch.
   `confirmation: "requested"` means acknowledged, while `"observed"`
   means the expected state was seen in an immediate snapshot; neither proves
   audible playback or future recommendation supply.
+
+Verified against official MA 2.10.3
+[player commands](https://github.com/music-assistant/server/blob/3e21f8293fbcd8710dc2d3c8afc2c94418187cf9/music_assistant/controllers/players/controller.py)
+and the current official frontend's
+[Play button](https://github.com/music-assistant/frontend/blob/f838bc60c42c0b04077179d658e1d70130b53193/src/layouts/default/PlayerOSD/PlayerControlBtn/PlayBtn.vue)
+and [Next button](https://github.com/music-assistant/frontend/blob/f838bc60c42c0b04077179d658e1d70130b53193/src/layouts/default/PlayerOSD/PlayerControlBtn/NextBtn.vue).
 
 ### Volume
 
@@ -255,23 +314,45 @@ the resolved token redacted. Commands are never retried.
 | 1    | Configuration, credential, tool validation, transport, or execution error. |
 | 2    | CLI syntax error, or an actionable result below.                           |
 
-Actionable JSON statuses are `player_required`, `cannot_resume`, `not_playing`,
-`not_found`, `ambiguous`, and `cannot_volume`. These retain their full result on
-stdout, even when the exit code is 2. A refusal reporting
-`confirmation: "requested"` can follow a command that was sent before source drift
-was detected.
+Selection/search/volume refusals include `player_required`, `not_found`, `ambiguous`,
+and `cannot_volume`. They retain their result on stdout even with exit code 2.
+MA player-command errors, including empty-queue and unsupported-source failures,
+are execution errors with exit code 1. An unconfirmed accepted command has
+`confirmation: "requested"`; it is not retried.
 
 ## Local agent and model API
 
-`hoast.agent.LocalAgent` accepts weather alone or all five tools: `get_weather`
-and the four music tools above. Each turn allows at most four calls, including at
-most one music action. Standalone “play” and “stop” deterministically resume and
+The shared concise routing prompt is in `hoast/prompts.py`. The offline
+[fine-tuning toolkit](finetune/README.md) builds reproducible English, Chinese,
+code-switched, and STT-confusion examples using production schemas and the official
+LFM template. Generate the dataset with `uv run python -m finetune.generate`.
+
+`hoast.agent.LocalAgent` accepts weather plus optional complete core music tools
+(`pause_music`, `resume_music`, `play_music`, `volume_music`). The `music_next`
+and `what_is_playing` extensions require that music group; `set_light` is independently optional.
+Production music registration includes all six music tools. Each turn allows
+at most four calls, including at most one music action and one light action.
+Standalone “play” and “stop” deterministically resume and
 pause through `Session.request_tools`, bypassing model inference while retaining
 history. Matching ignores case, surrounding whitespace, and terminal `. ! ?`
 punctuation. Longer requests, including “play music”, still use model routing and
 can misroute. Without music configured, shortcuts say “Music isn't configured.”
 Standalone “louder” and “quieter” also bypass inference and adjust by five points;
 “quiter” is accepted as a spelling alias for “quieter”.
+“Next”, “next song”, “next track”, “switch song”, “skip song”, and “skip track”
+directly dispatch `music_next` with empty arguments.
+“What is playing”, “what's playing”, and “what song is playing” directly dispatch
+`what_is_playing`; the query is read-only and does not count as a music mutation.
+
+Tool schemas live in `declare_music_tools()` (`hoast/music.py`),
+`declare_weather_tool()` (`hoast/weather.py`), and `declare_light_tool()`
+(`hoast/lights.py`). Runtime clients bind these declarations to their handlers;
+`finetune/tooling.py` aggregates the full non-executable catalog for dataset work.
+`hoast/llm_cli.py:main` assembles enabled tools from configuration and
+passes them into `ToolRegistry` (`hoast/llm.py`), whose `schemas()` supplies the
+LLM-facing tool list and whose dispatch validates and invokes handlers.
+`LocalAgent.__post_init__` validates renderer-compatible registry composition;
+its allowed-name sets do not register tools or control MA playback semantics.
 
 Ambiguous control requests default to music. A model response without a tool call
 prompts a clarification without changing playback. The agent stores grounded

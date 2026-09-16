@@ -27,14 +27,14 @@ _LOG_FILE = Path(".cache/hoast/diagnostics/music-cli.log")
 
 
 def _parser() -> argparse.ArgumentParser:
-    """Build the CLI with global options preceding the required subcommand."""
+    """Build music selection, player transport/next, and volume subcommands."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, help="System TOML (requires [weather])")
     parser.add_argument("--player", help="Override the configured player ID")
     parser.add_argument("--server", help="Override the Music Assistant HTTP(S) origin")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("players", "status", "resume"):
+    for command in ("players", "status", "resume", "next", "now-playing"):
         commands.add_parser(command)
     commands.add_parser("pause", aliases=["stop"])
     play_description = (
@@ -135,7 +135,14 @@ def main(argv: list[str] | None = None) -> int:
                 arguments = args.value
             command = "pause" if args.command == "stop" else args.command
             results = ToolRegistry(client.tools()).dispatch(
-                [ToolCall(f"{command}_music", arguments)]
+                [
+                    ToolCall(
+                        {"next": "music_next", "now-playing": "what_is_playing"}.get(
+                            command, f"{command}_music"
+                        ),
+                        arguments,
+                    )
+                ]
             )
             assert len(results) == 1
             result = results[0]

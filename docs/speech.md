@@ -101,6 +101,24 @@ resampling without WAV encoding. TTS serializes synthesis and closure; `close()`
 releases compiled models, the Chinese worker and GPU caches and rejects later
 synthesis on that instance. Keep an instance alive to amortize initialization.
 
+`tts.play_samples(samples, sample_rate, blocking=False)` accepts raw mono float32
+PCM and submits it to the **same ordered queue** as `tts.play(text, blocking=False)`.
+Source rates such as 16 kHz are polyphase-resampled to 24 kHz once per complete
+submission before queuing; 24 kHz input bypasses conversion. Raw input must be
+nonempty and finite. Call `tts.wait_playback()` to drain the queue and close its
+device; subsequent submissions can open a new queue. Queue capacity must remain
+consistent until drained. An optional `cancelled=threading.Event()` stops new raw
+submission between 100 ms blocks and blocking calls drain accepted audio.
+
+For raw playback without synthesis models, use `TTS(playback_only=True)`. It skips
+artifact and GPU initialization, supports `play_samples`/`wait_playback`/`close`,
+and rejects synthesis. `close()` rejects later raw playback as well as synthesis.
+
+On Linux, playback prefers an output-capable ALSA `pipewire` adapter, then `pulse`,
+so desktop audio is mixed with other applications instead of competing for direct
+ALSA hardware. If neither adapter is advertised, PortAudio's system default is
+used. An open failure is logged and propagated without retrying another route.
+
 `hoast/tts_gpu.py` selects exactly 67 substantial decoder convolutions from the
 69-convolution decoder in each full prepared model. Frontend and tiny filters stay
 on CPU. The single `hoast/kernels/conv_window.cl` kernel uses SIMD16 and adaptive

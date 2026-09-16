@@ -1,6 +1,7 @@
 """Bounded PCM buffering with a playback-only worker and low device latency."""
 
 import math
+import sys
 import threading
 from collections import deque
 
@@ -11,6 +12,31 @@ from numpy.typing import NDArray
 from .logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def system_output_device() -> int | None:
+    """Prefer Linux desktop mixing over direct ALSA default/dmix hardware access.
+
+    Choose an output-capable ALSA pipewire adapter, then pulse, when advertised.
+    Else use PortAudio's system default, including on non-Linux platforms. An
+    advertised adapter that fails to open raises; no retry changes the route.
+    """
+    if sys.platform != "linux":
+        return None
+    devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+    logger.debug("audio.output devices=%r hostapis=%r", devices, hostapis)
+    for name in ("pipewire", "pulse"):
+        for index, info in enumerate(devices):
+            if (
+                info["name"] == name
+                and info["max_output_channels"] > 0
+                and hostapis[info["hostapi"]]["name"] == "ALSA"
+            ):
+                logger.info("audio.output adapter=%s device=%d", name, index)
+                return index
+    logger.debug("audio.output adapter=portaudio_default")
+    return None
 
 
 class AudioPlayback:
@@ -128,7 +154,11 @@ class AudioPlayback:
                 if not self._queue:
                     return
             with sd.OutputStream(
-                samplerate=self._rate, channels=1, dtype="float32", latency="low"
+                samplerate=self._rate,
+                channels=1,
+                dtype="float32",
+                latency="low",
+                device=system_output_device(),
             ) as stream:
                 logger.info("tts.audio status=opened device_latency=%s", stream.latency)
                 while True:

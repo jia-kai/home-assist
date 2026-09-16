@@ -113,6 +113,17 @@ class ToolArguments(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
 
+def declaration_only(args: ToolArguments) -> JsonValue:
+    """Reject execution of metadata-only tools used by offline dataset generation.
+
+    Args:
+        args:
+            Validated arguments that must never reach a device or service handler.
+
+    """
+    raise RuntimeError("Tool declarations cannot execute; bind a runtime handler first")
+
+
 @dataclass(slots=True, frozen=True)
 class ToolCall:
     """An intercepted function call; execution always revalidates arguments."""

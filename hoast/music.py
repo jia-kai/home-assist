@@ -1,20 +1,20 @@
-"""Music Assistant 2.10.3 HTTP RPC and conservative existing-stream controls.
+"""Music Assistant 2.10.3 HTTP RPC and player-level transport controls.
 
-Pause/unpause never request media, source selection, or queue resume. They require
-a retained pause-capable source and player; idle external audio sources may also
-resume. They recheck before dispatch and observe once afterward. These snapshots
-are not atomic: stock MA can redirect
-commands or rebuild playback if state changes during dispatch. Source drift is
-reported without retries or restoration. An acknowledgement is not proof of audio.
+Play, pause and next delegate queue/source/group handling to Music Assistant, as
+its player controls do. Play may restore an idle queue or retained source; pause
+may stop playback when MA cannot pause the output. Explicit directional commands
+avoid reversing a user's play/pause intent. Commands are sent once and observations
+are not atomic with dispatch; an acknowledgement is not proof of changed playback.
 Explicit new music replaces a queue with a dynamic Endless Mix; its seed need not
 play first and recommendation providers determine how long it can continue.
-Blank play_music arguments use native resume without requesting a new stream.
+Blank play_music arguments use MA's player Play behavior without choosing new music.
 """
 
 import json
 import logging
 import unicodedata
 from collections.abc import Callable
+from dataclasses import replace
 from http.client import HTTPException
 from traceback import TracebackException
 from typing import Any, Literal, Self
@@ -32,7 +32,7 @@ from pydantic import (
 )
 
 from hoast.config import MusicConfig
-from hoast.llm import Tool, ToolArguments
+from hoast.llm import Tool, ToolArguments, declaration_only
 
 _MAX_BYTES = 4 * 1024 * 1024
 _SEARCH_LIMIT = 25
@@ -44,7 +44,7 @@ class MusicAssistantError(RuntimeError):
 
 
 class MusicArguments(ToolArguments):
-    """No arguments for existing-stream pause and resume."""
+    """No arguments for player transport controls and current-playback queries."""
 
 
 class PlayMusicArguments(ToolArguments):
@@ -56,7 +56,7 @@ class PlayMusicArguments(ToolArguments):
     artist: str = Field(
         default="", max_length=300, description="Recording artist, if known"
     )
-    """Exact recording artist constraint; blank with a blank title means native resume."""
+    """Exact recording artist constraint; blank with a blank title selects MA player Play."""
 
 
 class VolumeMusicArguments(ToolArguments):
@@ -83,6 +83,48 @@ class VolumeMusicArguments(ToolArguments):
         return self
 
 
+def declare_music_tools() -> list[Tool[Any]]:
+    """Return the production music schemas with non-executable placeholder handlers."""
+    return [
+        Tool(
+            "pause_music",
+            "Pause music using Music Assistant's player controls.",
+            MusicArguments,
+            declaration_only,
+        ),
+        Tool(
+            "resume_music",
+            "Play or resume music, including an idle Music Assistant queue.",
+            MusicArguments,
+            declaration_only,
+        ),
+        Tool(
+            "play_music",
+            "No title or artist resumes existing playback; new explicit title/artist starts an endless mix.",
+            PlayMusicArguments,
+            declaration_only,
+        ),
+        Tool(
+            "volume_music",
+            "Set volume 1–100 using action=set; louder/quieter changes it by 5 points.",
+            VolumeMusicArguments,
+            declaration_only,
+        ),
+        Tool(
+            "music_next",
+            "Skip to the next song. Use for next song, next track, or switch song.",
+            MusicArguments,
+            declaration_only,
+        ),
+        Tool(
+            "what_is_playing",
+            "Report the currently playing song and artist from Music Assistant.",
+            MusicArguments,
+            declaration_only,
+        ),
+    ]
+
+
 class _Response(BaseModel):
     """Validate only the response fields consumed by this client."""
 
@@ -100,8 +142,27 @@ class _Source(_Response):
     """Whether the source advertises pause and unpause support."""
 
 
+class _CurrentMedia(_Response):
+    """Optional player media labels from the observed native playback snapshot."""
+
+    title: str | None = None
+    """Reported loaded title; absent does not imply an unknown track name."""
+
+    artist: str | None = None
+    """Reported artist display label, if available."""
+
+    source_id: str | None = None
+    """Optional source identity used to reject stale labels from another source."""
+
+    uri: str | None = None
+    """Optional media URI used to compare observed track identity, not shown to users."""
+
+    queue_item_id: str | None = None
+    """Optional queue item identity distinguishing repeated tracks at different positions."""
+
+
 class _Player(_Response):
-    """Small player state projection; unrelated media metadata is ignored."""
+    """Small player state projection with optional currently loaded media labels."""
 
     player_id: str = Field(min_length=1)
     """Registered player identifier."""
@@ -146,7 +207,10 @@ class _Player(_Response):
     """Active group player whose source the member hears."""
 
     active_output_protocol: str | None = None
-    """Active native/protocol output; changes invalidate a pre-dispatch snapshot."""
+    """Active native/protocol output; volume checks use it to detect route changes."""
+
+    current_media: _CurrentMedia | None = None
+    """Optional loaded-media labels; meaningful for announcements only when playing."""
 
     @property
     def grouped(self) -> bool:
@@ -190,6 +254,33 @@ class _QueueSource(_Response):
     """Container source URI, if reported by MA."""
 
 
+class _ArtistName(_Response):
+    """Structured current-track artist label."""
+
+    name: str
+    """Provider artist name in queue metadata."""
+
+
+class _QueueMedia(_Response):
+    """Structured current item; queue display labels are not parsed as track titles."""
+
+    media_type: str | None = None
+    """Expected track for a song announcement; other media types are not announced."""
+
+    name: str | None = None
+    """Actual current media title, if supplied."""
+
+    artists: list[_ArtistName] = Field(default_factory=list)
+    """Ordered artists; announcements mention only the first."""
+
+
+class _QueueItem(_Response):
+    """Current queue item metadata projection."""
+
+    media_item: _QueueMedia | None = None
+    """Structured media metadata, when available."""
+
+
 class _Queue(_Response):
     """Queue identity and observable dynamic-playback state."""
 
@@ -207,6 +298,33 @@ class _Queue(_Response):
 
     sources: list[_QueueSource] = Field(default_factory=list)
     """Small source-container list used to confirm the requested Endless Mix seed."""
+
+    active: bool = False
+    """Whether this queue is currently active on its player."""
+
+    current_item: _QueueItem | None = None
+    """Observed current track, which need not equal the requested mix seed."""
+
+
+def _playing_labels(title: str | None, artist: str | None) -> dict[str, JsonValue]:
+    """Return a normalized announcement field only when both labels are available.
+
+    Args:
+        title:
+            Observed current media title, never the requested seed as a fallback.
+
+        artist:
+            First structured artist or the player's single artist display label.
+
+    """
+    if title is None or artist is None or not title.strip() or not artist.strip():
+        return {}
+    return {
+        "now_playing": {
+            "title": " ".join(title.split()),
+            "artist": " ".join(artist.split()),
+        }
+    }
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -576,33 +694,18 @@ class MusicClient:
         return result
 
     def tools(self) -> list[Tool[Any]]:
-        """Expose four compact music tools with strict argument models."""
-        return [
-            Tool(
-                "pause_music",
-                "Pause the existing music stream.",
-                MusicArguments,
-                lambda args: self.pause_music(),
-            ),
-            Tool(
-                "resume_music",
-                "Unpause the existing music stream.",
-                MusicArguments,
-                lambda args: self.resume_music(),
-            ),
-            Tool(
-                "play_music",
-                "No title or artist resumes existing playback; new explicit title/artist starts an endless mix.",
-                PlayMusicArguments,
-                lambda args: self.play_music(args.title, args.artist),
-            ),
-            Tool(
-                "volume_music",
-                "Set volume 1–100 using action=set; louder/quieter changes it by 5 points.",
-                VolumeMusicArguments,
-                lambda args: self.volume_music(args.action, args.level),
-            ),
-        ]
+        """Bind production music declarations to this client's service handlers."""
+        handlers: dict[str, Callable[[Any], JsonValue]] = {
+            "pause_music": lambda args: self.pause_music(),
+            "resume_music": lambda args: self.resume_music(),
+            "play_music": lambda args: self.play_music(args.title, args.artist),
+            "volume_music": lambda args: self.volume_music(args.action, args.level),
+            "music_next": lambda args: self.music_next(),
+            "what_is_playing": lambda args: self.what_is_playing(),
+        }
+        declarations = declare_music_tools()
+        assert set(handlers) == {tool.name for tool in declarations}
+        return [replace(tool, handler=handlers[tool.name]) for tool in declarations]
 
     def _players(self) -> list[_Player]:
         """Read registered nonprotocol players, including disabled/unavailable ones."""
@@ -694,13 +797,121 @@ class MusicClient:
         )
         return result
 
+    def prompt_context(self) -> dict[str, JsonValue]:
+        """Read only on/off playback state for the next agent system prompt.
+
+        Playing maps to on; paused and idle map to off. Player selection failures
+        remain explicit. No title, artist, volume, source, or player details enter
+        this background context; what_is_playing handles explicit metadata queries.
+        """
+        selected = self._select()
+        if isinstance(selected, dict):
+            _LOGGER.debug(
+                "music.prompt_context selection=%s", self._redact(json.dumps(selected))
+            )
+            return {"status": "player_required"}
+        player = self._effective(selected.player_id)
+        result: dict[str, JsonValue] = {
+            "status": "observed",
+            "state": "on" if player.playback_state == "playing" else "off",
+        }
+        _LOGGER.debug(
+            "music.prompt_context result=%s", self._redact(json.dumps(result))
+        )
+        return result
+
     def pause_music(self) -> JsonValue:
-        """Pause only a playing, native-pause-capable existing source; never stop it."""
+        """Request MA player pause, including its source routing and stop fallback."""
         return self._run_tool("pause_music", {}, lambda: self._control(resume=False))
 
     def resume_music(self) -> JsonValue:
-        """Resume retained paused playback or an idle external AudioSource session."""
+        """Request MA player Play and include the canonical what_is_playing readback."""
         return self._run_tool("resume_music", {}, lambda: self._control(resume=True))
+
+    def music_next(self) -> JsonValue:
+        """Request the next song once; confirm only an observed media identity change."""
+        return self._run_tool("music_next", {}, self._next)
+
+    def what_is_playing(self, *, _player: _Player | None = None) -> JsonValue:
+        """Return the canonical observed now-playing result without changing playback.
+
+        The registered tool takes no arguments. Transport commands reuse their
+        fresh post-command player observation through the internal-only keyword
+        to avoid another identical RPC; ordinary callers query the selected player.
+
+        Args:
+            _player:
+                Optional already-validated fresh player observation for internal
+                transport integration. None performs live player selection/readback.
+
+        """
+        return self._run_tool("what_is_playing", {}, lambda: self._playing(_player))
+
+    def _playing(self, player: _Player | None) -> JsonValue:
+        """Describe observed playback with bounded-renderer metadata, never a mix seed.
+
+        Args:
+            player:
+                Fresh validated effective player, or None to query it.
+
+        """
+        if player is None:
+            selected = self._select()
+            if isinstance(selected, dict):
+                return selected
+            player = self._effective(selected.player_id)
+        playing: dict[str, JsonValue] = {}
+        media = player.current_media
+        if (
+            player.playback_state == "playing"
+            and media is not None
+            and media.source_id in (None, player.active_source)
+        ):
+            playing = _playing_labels(media.title, media.artist)
+        return {
+            "status": "playing"
+            if player.playback_state == "playing"
+            else "nothing_playing",
+            "player_id": player.player_id,
+            "source": player.active_source,
+            "observed_state": player.playback_state,
+            "confirmation": "observed",
+            **playing,
+        }
+
+    def _next(self) -> JsonValue:
+        """Delegate next to the selected MA player, preserving source/group ownership.
+
+        Next can be delayed or do nothing at queue end. Unchanged/missing identity
+        is reported as requested, never retried or treated as proven advancement.
+        """
+        selected = self._select()
+        if isinstance(selected, dict):
+            return selected
+        before = self._effective(selected.player_id)
+        self._request("players/cmd/next", player_id=selected.player_id)
+        after = self._effective(selected.player_id)
+        old, new = before.current_media, after.current_media
+        changed = False
+        if old is not None and new is not None:
+            if old.queue_item_id and new.queue_item_id:
+                changed = old.queue_item_id != new.queue_item_id
+            elif old.uri and new.uri:
+                changed = old.uri != new.uri
+        observed = (
+            changed
+            and after.playback_state == "playing"
+            and after.player_id == before.player_id
+            and after.active_source == before.active_source
+        )
+        return {
+            "status": "skipped",
+            "player_id": after.player_id,
+            "source": after.active_source,
+            "observed_state": after.playback_state,
+            "confirmation": "observed" if observed else "requested",
+            "playback": self.what_is_playing(_player=after),
+        }
 
     def volume_music(
         self, action: Literal["louder", "quieter", "set"], level: int = 0
@@ -800,119 +1011,60 @@ class MusicClient:
         }
 
     def _control(self, *, resume: bool) -> JsonValue:
-        """Check source/state around one native command; report acknowledgement separately.
+        """Send a directional MA player command once and report the immediate observation.
+
+        MA owns idle-queue restoration, protocol/source capabilities, and group
+        redirection. Source restoration is a normal play outcome. If the effective
+        player changes, report only a request acknowledgement without retrying.
 
         Args:
             resume:
-                True to resume, False to pause. Idle external AudioSource sessions
-                may resume if their source does not identify an MA queue. Queue
-                lookups are read-only; no media or queue mutation is requested.
+                True requests play/resume, False requests pause. MA may stop an
+                output that cannot pause; observed idle is then reported as stopped.
 
         """
         selected = self._select()
         if isinstance(selected, dict):
             return selected
         before = self._effective(selected.player_id)
-        failure = "cannot_resume" if resume else "not_playing"
         base: dict[str, JsonValue] = {
             "player_id": before.player_id,
             "source": before.active_source,
         }
-        if not before.active_source:
-            return {
-                **base,
-                "status": failure,
-                "reason": "No retained source; explicitly request new music.",
-            }
-        idle_external = (
-            resume
-            and before.playback_state == "idle"
-            and "://audio_source/" in before.active_source
-        )
-        if before.playback_state == "idle" and not idle_external:
-            return {
-                **base,
-                "status": failure,
-                "reason": "Idle native resume requires a retained external audio source; use the source app or explicitly request new music.",
-            }
         if before.playback_state == ("playing" if resume else "paused"):
             return {
                 **base,
                 "status": "already_playing" if resume else "already_paused",
                 "confirmation": "observed",
+                **(
+                    {"playback": self.what_is_playing(_player=before)} if resume else {}
+                ),
             }
-        if "pause" not in before.supported_features or not any(
-            source.id == before.active_source and source.can_play_pause
-            for source in before.source_list
-        ):
-            return {
-                **base,
-                "status": failure,
-                "reason": "Native pause/unpause is not supported by this player and source; use the source app.",
-            }
-        protocol_id = before.active_output_protocol
-        if protocol_id and protocol_id != "native":
-            output = _parse(
-                _Player, self._request("players/get", player_id=protocol_id)
-            )
-            if output.player_id != protocol_id:
-                raise MusicAssistantError(
-                    "Music Assistant returned a different output player"
-                )
-            if (
-                not output.available
-                or not output.enabled
-                or "pause" not in output.supported_features
-            ):
-                return {
-                    **base,
-                    "status": failure,
-                    "reason": "The active output does not support native pause/unpause; use the source app.",
-                }
-        if idle_external:
-            # MA's PLAY redirects idle queue sources to queue resume, whereas an
-            # external AudioSource URI reaches the provider's existing PLAY hook.
-            queue = self._request("player_queues/get", queue_id=before.active_source)
-            if queue is not None:
-                _parse(_Queue, queue)
-                return {
-                    **base,
-                    "status": failure,
-                    "reason": "Retained source resolves to an idle MA queue; resume it in the music app.",
-                }
-        checked = self._effective(selected.player_id)
-        if checked != before:
-            return {
-                **base,
-                "status": failure,
-                "reason": "Player, source, capability, or state changed before dispatch; no command sent.",
-            }
+        if not resume and before.playback_state == "idle":
+            return {**base, "status": "already_stopped", "confirmation": "observed"}
         self._request(
             "players/cmd/play" if resume else "players/cmd/pause",
-            player_id=before.player_id,
+            player_id=selected.player_id,
         )
         after = self._effective(selected.player_id)
-        if (after.player_id, after.active_source, after.active_output_protocol) != (
-            before.player_id,
-            before.active_source,
-            before.active_output_protocol,
-        ):
-            return {
-                **base,
-                "status": failure,
-                "confirmation": "requested",
-                "reason": "Player, source, or output changed during dispatch; no retry or restoration attempted.",
-                "observed_player_id": after.player_id,
-                "observed_source": after.active_source,
-            }
-        target = "playing" if resume else "paused"
+        target = (
+            "playing"
+            if resume
+            else ("idle" if after.playback_state == "idle" else "paused")
+        )
+        observed = (
+            after.player_id == before.player_id and after.playback_state == target
+        )
         return {
             **base,
-            "status": "resumed" if resume else "paused",
-            "confirmation": "observed"
-            if after.playback_state == target
-            else "requested",
+            "status": "resumed"
+            if resume
+            else ("stopped" if target == "idle" else "paused"),
+            "source": after.active_source,
+            "confirmation": "observed" if observed else "requested",
             "observed_state": after.playback_state,
+            "observed_player_id": after.player_id,
+            **({"playback": self.what_is_playing(_player=after)} if resume else {}),
         }
 
     def _candidates(
@@ -1036,17 +1188,18 @@ class MusicClient:
         same title. Explicit artist constraints remain strict; different matching
         collaborator sets require clarification. Artist-only
         homonyms can collapse because names alone do not establish artist identity.
-        One immediate queue observation distinguishes requested from
-        observed dynamic playback; it cannot prove audible playback or endless supply.
+        Queue state distinguishes requested from observed dynamic playback; the
+        what_is_playing result from a fresh player readback supplies rendering.
+        These observations cannot prove audible playback or endless supply.
 
         Args:
             title:
                 Song title, matched exactly after Unicode/case/whitespace normalization.
-                Blank with a blank artist delegates to native resume without search.
+                Blank with a blank artist delegates to MA player Play without search.
 
             artist:
                 Recording artist, matched exactly against a track's artists. Blank
-                with a blank title resumes the retained source without replacement.
+                with a blank title lets MA restore its existing playback selection.
 
         """
         return self._run_tool(
@@ -1121,6 +1274,14 @@ class MusicClient:
             raise MusicAssistantError(
                 "Music Assistant returned a different queue after dispatch"
             )
+        confirmed = (
+            observed.available
+            and observed.is_dynamic
+            and observed.state == "playing"
+            and any(source.uri == media for source in observed.sources)
+        )
+        playback = self.what_is_playing(_player=self._effective(selected.player_id))
+        confirmed = confirmed and _object(playback)["status"] == "playing"
         return {
             "status": "started",
             "player_id": player.player_id,
@@ -1128,14 +1289,8 @@ class MusicClient:
             "seed": seed,
             "mode": "endless_mix",
             "seed_first": False,
-            "confirmation": "observed"
-            if (
-                observed.available
-                and observed.is_dynamic
-                and observed.state == "playing"
-                and any(source.uri == media for source in observed.sources)
-            )
-            else "requested",
+            "confirmation": "observed" if confirmed else "requested",
             "observed_state": observed.state,
             "is_dynamic": observed.is_dynamic,
+            "playback": playback,
         }

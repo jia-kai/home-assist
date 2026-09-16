@@ -7,6 +7,7 @@ from email.message import Message
 from http.client import IncompleteRead
 from io import BytesIO
 from typing import Any, Literal
+from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
@@ -14,6 +15,7 @@ import pytest
 from pydantic import JsonValue, ValidationError
 
 from hoast import music
+from hoast.agent import render_music
 from hoast.config import MusicConfig
 from hoast.music import (
     MusicArguments,
@@ -474,6 +476,8 @@ def test_tools_strict_and_blank_queries() -> None:
         "resume_music",
         "play_music",
         "volume_music",
+        "music_next",
+        "what_is_playing",
     ]
     for tool in tools:
         assert tool.schema()["function"]["parameters"]["additionalProperties"] is False
@@ -503,7 +507,7 @@ def test_tools_strict_and_blank_queries() -> None:
     [
         ("paused", "resumed"),
         ("playing", "already_playing"),
-        ("idle", "cannot_resume"),
+        ("idle", "resumed"),
     ],
 )
 @pytest.mark.parametrize("via_tool", [False, True])
@@ -514,14 +518,14 @@ def test_blank_play_only_resumes_existing_stream(
     via_tool: bool,
     blank: str,
 ) -> None:
-    """Default and whitespace play requests share native resume's conservative trace.
+    """Default and whitespace play delegate paused and idle playback to MA's Play command.
 
     Args:
         state:
             Retained native playback state before the request.
 
         expected:
-            Observed resume, idempotent, or conservative refusal outcome.
+            Observed resume or already-playing outcome.
 
         via_tool:
             Whether to invoke the registered tool instead of the direct CLI method.
@@ -535,10 +539,9 @@ def test_blank_play_only_resumes_existing_stream(
         ("players/all", [before]),
         ("players/get", before),
     ]
-    if state == "paused":
+    if state != "playing":
         replies.extend(
             [
-                ("players/get", before),
                 ("players/cmd/play", None),
                 ("players/get", player()),
             ]
@@ -564,7 +567,7 @@ def test_blank_play_only_resumes_existing_stream(
 def test_idle_external_source_resumes_native_session(
     via_blank_play: bool, after_state: str
 ) -> None:
-    """Resume retained Spotify context without searching, replacing, or resuming queues.
+    """Delegate an idle external source to MA without client-side queue/source selection.
 
     Args:
         via_blank_play:
@@ -580,8 +583,6 @@ def test_idle_external_source_resumes_native_session(
         [
             ("players/all", [before]),
             ("players/get", before),
-            ("player_queues/get", None),
-            ("players/get", before),
             ("players/cmd/play", None),
             ("players/get", player(state=after_state, source=source)),
         ]
@@ -594,46 +595,57 @@ def test_idle_external_source_resumes_native_session(
     assert result["confirmation"] == (
         "observed" if after_state == "playing" else "requested"
     )
-    assert client.requests[2] == ("player_queues/get", {"queue_id": source})
-    assert client.requests[4] == ("players/cmd/play", {"player_id": "speaker"})
+    assert client.requests[2] == ("players/cmd/play", {"player_id": "speaker"})
     assert not client.replies
 
 
-def test_idle_external_source_queue_redirect_is_refused() -> None:
-    """Reject an external-looking source ID that MA would redirect to queue resume."""
-    source = "spotify_connect://audio_source/speaker"
-    before = player(state="idle", source=source)
+def test_idle_ma_queue_is_resumed_by_server() -> None:
+    """An inactive retained MA queue is sent the same player Play command as the UI."""
+    before = player(
+        state="idle", source="speaker", supported_features=[], source_list=[]
+    )
     client = FixtureClient(
         [
             ("players/all", [before]),
             ("players/get", before),
-            ("player_queues/get", queue(queue_id=source)),
+            ("players/cmd/play", None),
+            ("players/get", player(source="speaker")),
         ]
     )
     result = result_object(client.resume_music())
-    assert result["status"] == "cannot_resume"
-    assert "queue" in str(result["reason"])
+    assert result["status"] == "resumed"
+    assert result["confirmation"] == "observed"
+    assert client.requests[2] == ("players/cmd/play", {"player_id": "speaker"})
     assert not client.replies
 
 
 @pytest.mark.parametrize("source", [None, "", "spotify_connect://audio_source/speaker"])
-def test_idle_resume_needs_retained_controllable_source(source: str | None) -> None:
-    """Missing or non-controllable sources fail without issuing a native play command.
+def test_idle_resume_delegates_missing_source_metadata(source: str | None) -> None:
+    """MA can restore source/queue state even when the player's source metadata is absent.
 
     Args:
         source:
-            Missing source or retained source lacking pause/resume capability.
+            Missing source or retained external source without advertised capabilities.
 
     """
     before = player(state="idle", source=source, source_list=[])
-    client = FixtureClient([("players/all", [before]), ("players/get", before)])
-    assert result_object(client.resume_music())["status"] == "cannot_resume"
+    client = FixtureClient(
+        [
+            ("players/all", [before]),
+            ("players/get", before),
+            ("players/cmd/play", None),
+            ("players/get", player(source="speaker")),
+        ]
+    )
+    result = result_object(client.resume_music())
+    assert result["status"] == "resumed" and result["confirmation"] == "observed"
+    assert result["source"] == "speaker"
     assert not client.replies
 
 
 @pytest.mark.parametrize("resume", [False, True])
 @pytest.mark.parametrize("source", ["spotify", "speaker"])
-def test_native_controls_only_existing_stream(resume: bool, source: str) -> None:
+def test_player_controls_delegate_stream_handling(resume: bool, source: str) -> None:
     """Both external and MA sources use only one native control and read-only RPCs.
 
     Args:
@@ -651,7 +663,6 @@ def test_native_controls_only_existing_stream(resume: bool, source: str) -> None
         [
             ("players/all", [before]),
             ("players/get", before),
-            ("players/get", before),
             (command, None),
             ("players/get", after),
         ]
@@ -660,7 +671,7 @@ def test_native_controls_only_existing_stream(resume: bool, source: str) -> None
     assert result["status"] == ("resumed" if resume else "paused")
     assert result["confirmation"] == "observed"
     assert result["source"] == source
-    assert client.requests[3] == (command, {"player_id": "speaker"})
+    assert client.requests[2] == (command, {"player_id": "speaker"})
     assert {name for name, _ in client.requests} == {
         "players/all",
         "players/get",
@@ -674,12 +685,11 @@ def test_native_controls_only_existing_stream(resume: bool, source: str) -> None
     [
         (True, "playing", "already_playing"),
         (False, "paused", "already_paused"),
-        (True, "idle", "cannot_resume"),
-        (False, "idle", "not_playing"),
+        (False, "idle", "already_stopped"),
     ],
 )
 def test_native_noops(resume: bool, state: str, expected: str) -> None:
-    """Idempotent and idle controls never dispatch mutations, even with retained source.
+    """Already-satisfied play/pause requests do not toggle playback in the wrong direction.
 
     Args:
         resume:
@@ -711,10 +721,10 @@ def test_native_noops(resume: bool, state: str, expected: str) -> None:
     ],
 )
 @pytest.mark.parametrize("resume", [False, True])
-def test_unsupported_native_control(
+def test_capability_handling_is_delegated_to_ma(
     override: dict[str, JsonValue], resume: bool
 ) -> None:
-    """Unknown source or missing native pause capability never reaches stop/rebuild fallbacks.
+    """Source/protocol capability metadata does not block MA's supported player routing.
 
     Args:
         override:
@@ -725,48 +735,53 @@ def test_unsupported_native_control(
 
     """
     before = {**player(state="paused" if resume else "playing"), **override}
-    client = FixtureClient([("players/all", [before]), ("players/get", before)])
+    command = "players/cmd/play" if resume else "players/cmd/pause"
+    client = FixtureClient(
+        [
+            ("players/all", [before]),
+            ("players/get", before),
+            (command, None),
+            ("players/get", player(state="playing" if resume else "paused")),
+        ]
+    )
     result = result_object(client.resume_music() if resume else client.pause_music())
-    assert result["status"] == ("cannot_resume" if resume else "not_playing")
+    assert result["status"] == ("resumed" if resume else "paused")
+    assert result["confirmation"] == "observed"
     assert not client.replies
 
 
-@pytest.mark.parametrize("after_dispatch", [False, True])
-def test_source_drift_never_retries_or_restores(after_dispatch: bool) -> None:
-    """Detect source drift before or after dispatch without replacing either source.
-
-    Args:
-        after_dispatch:
-            Whether the source changes before dispatch or during acknowledgement.
-
-    """
-    before = player(state="paused")
-    changed = player(state="paused", source="airplay")
-    replies: list[tuple[str, JsonValue]] = [
-        ("players/all", [before]),
-        ("players/get", before),
-    ]
-    if after_dispatch:
-        replies.extend([("players/get", before), ("players/cmd/play", None)])
-    replies.append(("players/get", changed))
-    client = FixtureClient(replies)
+def test_source_restoration_is_a_valid_play_outcome() -> None:
+    """MA may restore a queue/source and output protocol while starting playback."""
+    before = player(state="idle", source=None)
+    changed = player(
+        state="playing", source="speaker", active_output_protocol="airplay"
+    )
+    client = FixtureClient(
+        [
+            ("players/all", [before]),
+            ("players/get", before),
+            ("players/cmd/play", None),
+            ("players/get", changed),
+        ]
+    )
     result = result_object(client.resume_music())
-    assert result["status"] == "cannot_resume"
-    assert "changed" in str(result["reason"])
+    assert result["status"] == "resumed" and result["confirmation"] == "observed"
     assert not client.replies
 
 
-def test_state_drift_to_idle_prevents_queue_resume_fallback() -> None:
-    """A paused-to-idle transition observed before dispatch must not call native play."""
+def test_idle_readback_is_requested_not_failure() -> None:
+    """An acknowledged Play with delayed state change remains requested, without retry."""
     before = player(state="paused")
     client = FixtureClient(
         [
             ("players/all", [before]),
             ("players/get", before),
+            ("players/cmd/play", None),
             ("players/get", player(state="idle")),
         ]
     )
-    assert result_object(client.resume_music())["status"] == "cannot_resume"
+    result = result_object(client.resume_music())
+    assert result["status"] == "resumed" and result["confirmation"] == "requested"
     assert not client.replies
 
 
@@ -776,7 +791,6 @@ def test_acknowledgement_does_not_claim_observed_pause() -> None:
     client = FixtureClient(
         [
             ("players/all", [before]),
-            ("players/get", before),
             ("players/get", before),
             ("players/cmd/pause", None),
             ("players/get", before),
@@ -788,27 +802,27 @@ def test_acknowledgement_does_not_claim_observed_pause() -> None:
     assert result["observed_state"] == "playing"
 
 
-def test_active_protocol_must_support_native_pause() -> None:
-    """A parent advertising pause cannot authorize an unsupported active output."""
-    before = player(state="paused", active_output_protocol="airplay-output")
+def test_pause_fallback_to_stop_is_reported_truthfully() -> None:
+    """MA's pause command may stop an output without pause support."""
+    before = player(
+        state="playing", active_output_protocol="airplay-output", supported_features=[]
+    )
     client = FixtureClient(
         [
             ("players/all", [before]),
             ("players/get", before),
-            (
-                "players/get",
-                player("airplay-output", type="protocol", supported_features=[]),
-            ),
+            ("players/cmd/pause", None),
+            ("players/get", player(state="idle")),
         ]
     )
-    result = result_object(client.resume_music())
-    assert result["status"] == "cannot_resume"
-    assert "active output" in str(result["reason"])
+    result = result_object(client.pause_music())
+    assert result["status"] == "stopped" and result["confirmation"] == "observed"
+    assert render_music(result) == "Music stopped."
     assert not client.replies
 
 
 def test_group_leader_native_control() -> None:
-    """Resolve sync leader then active group on each snapshot and dispatch to that group."""
+    """Observe the effective group but pass the selected player ID to MA for routing."""
     child = player(synced_to="leader")
     leader = player("leader", active_group="group")
     group = player("group", type="group")
@@ -821,13 +835,12 @@ def test_group_leader_native_control() -> None:
         [
             ("players/all", [child]),
             *snapshot,
-            *snapshot,
             ("players/cmd/pause", None),
             *snapshot,
         ]
     )
     assert result_object(client.pause_music())["player_id"] == "group"
-    assert ("players/cmd/pause", {"player_id": "group"}) in client.requests
+    assert ("players/cmd/pause", {"player_id": "speaker"}) in client.requests
     assert not client.replies
 
 
@@ -844,6 +857,219 @@ def test_group_cycle_and_unavailable_leader() -> None:
         with pytest.raises(MusicAssistantError):
             client.pause_music()
         assert not client.replies
+
+
+@pytest.mark.parametrize(
+    "old,new,expected",
+    [
+        (
+            {"queue_item_id": "one", "uri": "same"},
+            {"queue_item_id": "two", "uri": "same"},
+            "observed",
+        ),
+        ({"uri": "track:one"}, {"uri": "track:two"}, "observed"),
+        ({"uri": "track:one"}, {"uri": "track:one"}, "requested"),
+        ({}, {"uri": "track:two"}, "requested"),
+    ],
+)
+def test_music_next_observes_identity(
+    old: dict[str, JsonValue], new: dict[str, JsonValue], expected: str
+) -> None:
+    """Next sends one player command and confirms only comparable changed media identity.
+
+    Args:
+        old:
+            Current media identity before the command.
+
+        new:
+            Current media identity in the immediate readback.
+
+        expected:
+            Whether advancement is observed or only requested.
+
+    """
+    before = player(current_media={**old, "title": "Before", "artist": "Artist"})
+    after = player(current_media={**new, "title": "Next Song", "artist": "Artist"})
+    client = FixtureClient(
+        [
+            ("players/all", [before]),
+            ("players/get", before),
+            ("players/cmd/next", None),
+            ("players/get", after),
+        ]
+    )
+    result = result_object(client.music_next())
+    assert result["status"] == "skipped" and result["confirmation"] == expected
+    assert render_music(result) == (
+        "Now playing Next Song by Artist."
+        if expected == "observed"
+        else "Next song requested."
+    )
+    assert client.requests[2] == ("players/cmd/next", {"player_id": "speaker"})
+    assert not client.replies
+
+
+def test_music_next_uses_selected_member_for_server_routing() -> None:
+    """The player-level Next endpoint receives the selected member, not a queue ID."""
+    child = player(synced_to="leader")
+    leader = player("leader", current_media={"uri": "track:one"})
+    after = player("leader", current_media={"uri": "track:two"})
+    client = FixtureClient(
+        [
+            ("players/all", [child]),
+            ("players/get", child),
+            ("players/get", leader),
+            ("players/cmd/next", None),
+            ("players/get", child),
+            ("players/get", after),
+        ]
+    )
+    assert result_object(client.music_next())["confirmation"] == "observed"
+    assert client.requests[3] == ("players/cmd/next", {"player_id": "speaker"})
+    assert not client.replies
+
+
+@pytest.mark.parametrize(
+    "state,metadata,expected",
+    [
+        (
+            "playing",
+            {"title": "Actual Song", "artist": "Actual Artist"},
+            "Now playing Actual Song by Actual Artist.",
+        ),
+        (
+            "playing",
+            {"title": "Actual Song"},
+            "Music is playing, but track details are unavailable.",
+        ),
+        ("paused", {"title": "Cached Song", "artist": "Artist"}, "Music is paused."),
+        (
+            "idle",
+            {"title": "Cached Song", "artist": "Artist"},
+            "Nothing is playing right now.",
+        ),
+    ],
+)
+def test_what_is_playing_is_read_only(
+    state: str, metadata: dict[str, JsonValue], expected: str
+) -> None:
+    """The query renders observed playback, without presenting cached paused/idle media as playing.
+
+    Args:
+        state:
+            Current effective playback state.
+
+        metadata:
+            Current or cached media labels supplied by MA.
+
+        expected:
+            Brief spoken query result.
+
+    """
+    current = player(state=state, current_media=metadata)
+    client = FixtureClient([("players/all", [current]), ("players/get", current)])
+    tool = next(tool for tool in client.tools() if tool.name == "what_is_playing")
+    result = tool.handler(MusicArguments())
+    assert render_music(result) == expected
+    assert not client.replies
+    assert [command for command, _ in client.requests] == ["players/all", "players/get"]
+    with pytest.raises(ValidationError):
+        tool.arguments.model_validate({"_player": {"fake": True}})
+
+
+@pytest.mark.parametrize("new_request", [False, True])
+def test_start_implicitly_uses_query_result(new_request: bool) -> None:
+    """Play/resume invoke the shared query and its returned text metadata is authoritative.
+
+    Args:
+        new_request:
+            Whether to start a new explicit mix instead of restoring existing playback.
+
+    """
+    before = player(state="paused")
+    after = player(current_media={"title": "Snapshot title", "artist": "Artist"})
+    replies: list[tuple[str, JsonValue]] = [("players/all", [before])]
+    if new_request:
+        replies.extend(
+            [
+                ("music/search", {"tracks": [track()]}),
+                ("players/get", before),
+                ("player_queues/get_active_queue", queue()),
+                ("player_queues/play_media", None),
+                (
+                    "player_queues/get",
+                    queue(
+                        state="playing",
+                        is_dynamic=True,
+                        sources=[
+                            {"uri": "radio_playlist://playlist/spotify://track/1"}
+                        ],
+                    ),
+                ),
+            ]
+        )
+    else:
+        replies.extend([("players/get", before), ("players/cmd/play", None)])
+    replies.append(("players/get", after))
+    client = FixtureClient(replies)
+    query_result: JsonValue = {
+        "status": "playing",
+        "now_playing": {"title": "Query result title", "artist": "Query artist"},
+    }
+    with patch.object(client, "what_is_playing", return_value=query_result) as query:
+        result = (
+            client.play_music("Song", "Artist")
+            if new_request
+            else client.resume_music()
+        )
+    query.assert_called_once()
+    assert query.call_args.kwargs["_player"].current_media.title == "Snapshot title"
+    assert render_music(result) == "Now playing Query result title by Query artist."
+    assert not client.replies
+
+
+@pytest.mark.parametrize(
+    "command,error",
+    [
+        ("play", "QueueEmpty"),
+        ("pause", "Source cannot pause"),
+        ("next", "Source cannot next"),
+    ],
+)
+def test_player_command_failures_never_retry_or_change_route(
+    command: str, error: str
+) -> None:
+    """MA failures propagate without client-side queue or source fallbacks.
+
+    Args:
+        command:
+            Player endpoint operation to reject.
+
+        error:
+            Representative server-side queue/capability refusal.
+
+    """
+    before = player(state="idle" if command == "play" else "playing")
+    client = MusicClient(MusicConfig(player_id="speaker"), "offline-token")
+    action = {
+        "play": client.resume_music,
+        "pause": client.pause_music,
+        "next": client.music_next,
+    }[command]
+    with (
+        patch.object(
+            client,
+            "_request",
+            side_effect=[[before], before, MusicAssistantError(error)],
+        ) as request,
+        pytest.raises(MusicAssistantError, match=error),
+    ):
+        action()
+    assert [call.args[0] for call in request.call_args_list] == [
+        "players/all",
+        "players/get",
+        f"players/cmd/{command}",
+    ]
 
 
 def test_player_selection_never_chooses_arbitrarily() -> None:
@@ -970,6 +1196,7 @@ def test_title_only_uses_first_available_exact_match(
             ("player_queues/get_active_queue", queue()),
             ("player_queues/play_media", None),
             ("player_queues/get", queue()),
+            ("players/get", player()),
         ]
     )
     result = result_object(client.play_music("黑色毛衣", artist))
@@ -1012,6 +1239,7 @@ def test_versions_use_first_available_ranked_match() -> None:
             ("player_queues/get_active_queue", queue()),
             ("player_queues/play_media", None),
             ("player_queues/get", queue()),
+            ("players/get", player()),
         ]
     )
     result = result_object(client.play_music("Never Gonna Give You Up", "Rick Astley"))
@@ -1115,6 +1343,7 @@ def test_explicit_dynamic_mix_and_provider_duplicates(
                     "sources": [{"uri": "radio_playlist://playlist/spotify://track/1"}],
                 },
             ),
+            ("players/get", player(state="playing" if observed else "idle")),
         ]
     )
     client = FixtureClient(replies)
@@ -1133,6 +1362,140 @@ def test_explicit_dynamic_mix_and_provider_duplicates(
     assert not any(
         "autoplay" in command or "resume" in command for command, _ in client.requests
     )
+    assert not client.replies
+
+
+@pytest.mark.parametrize(
+    "active,state", [(True, "playing"), (False, "playing"), (True, "idle")]
+)
+def test_now_playing_uses_current_track_not_seed(active: bool, state: str) -> None:
+    """Announce structured current metadata only for an active observed playing mix.
+
+    Args:
+        active:
+            Whether the queue is active on its player.
+
+        state:
+            Post-dispatch playback observation.
+
+    """
+    selected = player()
+    observed = queue(
+        state=state,
+        active=active,
+        is_dynamic=True,
+        sources=[{"uri": "radio_playlist://playlist/spotify://track/1"}],
+        current_item={
+            "media_item": track(
+                name="Actual Track",
+                artist="First Artist",
+                artists=[{"name": "First Artist"}, {"name": "Second Artist"}],
+            )
+        },
+    )
+    client = FixtureClient(
+        [
+            ("players/all", [selected]),
+            ("music/search", {"tracks": [track()]}),
+            ("players/get", selected),
+            ("player_queues/get_active_queue", queue()),
+            ("player_queues/play_media", None),
+            ("player_queues/get", observed),
+            (
+                "players/get",
+                player(
+                    state="playing" if active and state == "playing" else "idle",
+                    current_media={"title": "Actual Track", "artist": "First Artist"},
+                ),
+            ),
+        ]
+    )
+    result = result_object(client.play_music("Song", "Artist"))
+    if active and state == "playing":
+        assert result_object(result["playback"])["now_playing"] == {
+            "title": "Actual Track",
+            "artist": "First Artist",
+        }
+        assert render_music(result) == "Now playing Actual Track by First Artist."
+    else:
+        assert "now_playing" not in result
+        assert not render_music(result).startswith("Now playing")
+    assert not client.replies
+
+
+@pytest.mark.parametrize(
+    "state,source,title",
+    [
+        ("playing", "spotify", "After"),
+        ("paused", "spotify", "After"),
+        ("playing", "other", "After"),
+        ("playing", "spotify", ""),
+    ],
+)
+def test_resume_metadata_is_observed_after_dispatch(
+    state: str, source: str, title: str
+) -> None:
+    """Metadata refreshes permit native control but stale/missing labels cannot announce.
+
+    Args:
+        state:
+            Native player state after the play command.
+
+        source:
+            Source identity attached to the observed media labels.
+
+        title:
+            Observed media title; blank data must not be invented.
+
+    """
+    before = player(
+        state="paused", current_media={"title": "Before", "artist": "Artist"}
+    )
+    after = player(
+        state=state,
+        current_media={"title": title, "artist": "Artist", "source_id": source},
+    )
+    client = FixtureClient(
+        [
+            ("players/all", [before]),
+            ("players/get", before),
+            ("players/cmd/play", None),
+            ("players/get", after),
+        ]
+    )
+    result = result_object(client.resume_music())
+    assert result["status"] == "resumed"
+    if state == "playing" and source == "spotify" and title:
+        assert render_music(result) == "Now playing After by Artist."
+    else:
+        assert "now_playing" not in result
+    assert not client.replies
+
+
+@pytest.mark.parametrize("state", ["playing", "paused", "idle"])
+def test_prompt_context_uses_effective_observation(state: str) -> None:
+    """Music context resolves the group but exposes only its binary playback state.
+
+    Args:
+        state:
+            Native effective-group state mapped to on or off without media metadata.
+
+    """
+    member = player(active_group="group")
+    group = player(
+        player_id="group",
+        state=state,
+        type="group",
+        current_media={"title": "Current", "artist": "Artist"},
+        group_volume=35,
+    )
+    client = FixtureClient(
+        [("players/all", [member]), ("players/get", member), ("players/get", group)]
+    )
+    assert client.prompt_context() == {
+        "status": "observed",
+        "state": "on" if state == "playing" else "off",
+    }
     assert not client.replies
 
 
@@ -1158,6 +1521,7 @@ def test_artist_only_dynamic_mix() -> None:
             ("player_queues/get_active_queue", queue()),
             ("player_queues/play_media", None),
             ("player_queues/get", queue()),
+            ("players/get", current),
         ]
     )
     assert result_object(client.play_music(artist="Artist"))["status"] == "started"
@@ -1186,6 +1550,7 @@ def test_prior_dynamic_mix_does_not_confirm_new_seed() -> None:
                     ],
                 ),
             ),
+            ("players/get", player()),
         ]
     )
     assert result_object(client.play_music("Song"))["confirmation"] == "requested"
@@ -1476,7 +1841,7 @@ def test_player_boundary_errors_are_sanitized(payload: Any) -> None:
 
 
 def test_tool_and_direct_outcomes_are_logged(caplog: pytest.LogCaptureFixture) -> None:
-    """Public and registered calls log names, arguments, status, and refusal diagnostics.
+    """Public and registered calls log names, arguments, and observed playback outcomes.
 
     Args:
         caplog:
@@ -1488,22 +1853,23 @@ def test_tool_and_direct_outcomes_are_logged(caplog: pytest.LogCaptureFixture) -
         [
             ("players/all", [player(state="idle")]),
             ("players/get", player(state="idle")),
+            ("players/cmd/play", None),
+            ("players/get", player()),
         ]
     )
     tool = client.tools()[2]
-    assert (
-        result_object(tool.handler(PlayMusicArguments()))["status"] == "cannot_resume"
-    )
+    assert result_object(tool.handler(PlayMusicArguments()))["status"] == "resumed"
     messages = [record.getMessage() for record in caplog.records]
     assert any(
         'play_music args={"title": "", "artist": ""}' in text for text in messages
     )
-    assert any("resume_music status=cannot_resume" in text for text in messages)
-    assert any("play_music status=cannot_resume" in text for text in messages)
     assert any(
-        record.levelno == logging.WARNING and "Idle native resume" in record.message
-        for record in caplog.records
+        "resume_music status=resumed confirmation=observed" in text for text in messages
     )
+    assert any(
+        "play_music status=resumed confirmation=observed" in text for text in messages
+    )
+    assert not any("Idle native resume" in text for text in messages)
     caplog.clear()
     client = FixtureClient(
         [

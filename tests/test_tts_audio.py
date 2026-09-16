@@ -42,6 +42,7 @@ def test_start_backpressure_and_drain(monkeypatch: pytest.MonkeyPatch) -> None:
     factory = MagicMock()
     factory.return_value.__enter__.return_value = stream
     monkeypatch.setattr("hoast.tts_audio.sd.OutputStream", factory)
+    monkeypatch.setattr("hoast.tts_audio.system_output_device", lambda: None)
     playback = AudioPlayback(1000, 0.04)
     audio = np.arange(100, dtype=np.float32)
     playback.submit(audio[:20])
@@ -66,7 +67,7 @@ def test_start_backpressure_and_drain(monkeypatch: pytest.MonkeyPatch) -> None:
     assert submitted.is_set()
     np.testing.assert_array_equal(np.concatenate(received), np.arange(100))
     factory.assert_called_once_with(
-        samplerate=1000, channels=1, dtype="float32", latency="low"
+        samplerate=1000, channels=1, dtype="float32", latency="low", device=None
     )
     factory.return_value.__exit__.assert_called_once()
     assert not playback._worker.is_alive()
@@ -85,6 +86,7 @@ def test_worker_failure_wakes_producer(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     factory = MagicMock(side_effect=RuntimeError("Device unavailable"))
     monkeypatch.setattr("hoast.tts_audio.sd.OutputStream", factory)
+    monkeypatch.setattr("hoast.tts_audio.system_output_device", lambda: None)
     playback = AudioPlayback(1000, 0.02)
     with pytest.raises(RuntimeError, match="Audio playback failed") as failure:
         playback.submit(np.zeros(100, dtype=np.float32))

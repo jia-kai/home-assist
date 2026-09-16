@@ -1,6 +1,6 @@
 """Home Assistant routing with grounded, compact spoken answers."""
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -8,18 +8,40 @@ from pydantic import JsonValue
 
 from .llm import GeneratedCallError, ToolCall
 from .logging import get_logger
+from .prompts import SYSTEM_PROMPT
 from .session import Session
 
-SYSTEM_PROMPT = (
-    "You are Home Assistant. Call tools only. Ambiguous controls mean music. "
-    "Weather today: get_weather(period='today'). Current temperature: period='now'. "
-    "Keep city qualifiers. "
-    "Pause/stop: pause_music. Play/resume/continue: resume_music, unless a new "
-    "title or artist is requested. Author means artist. "
-    "Volume 35: volume_music(action='set', level=35). Louder/quieter omit level. "
-    "Handle each request; never invent song names."
-)
+__all__ = [
+    "SYSTEM_PROMPT",
+    "LocalAgent",
+    "WeatherAgent",
+    "render_light",
+    "render_music",
+    "render_weather",
+    "validate_action_batch",
+]
+
 logger = get_logger(__name__)
+
+
+def validate_action_batch(calls: Sequence[ToolCall]) -> None:
+    """Check application batch limits without executing tools or performing inference.
+
+    Args:
+        calls:
+            Schema-validated proposed calls; at most four, one music mutation and
+            one light action. Read-only playback queries are not music mutations.
+
+    """
+    if len(calls) > 4:
+        raise RuntimeError("Local agent accepts at most four calls per turn")
+    if (
+        sum(call.name.endswith("_music") or call.name == "music_next" for call in calls)
+        > 1
+    ):
+        raise RuntimeError("Request one music action at a time")
+    if sum(call.name == "set_light" for call in calls) > 1:
+        raise RuntimeError("Request one light action at a time")
 
 
 def _temperature(low: float | None, high: float | None) -> str:
@@ -163,6 +185,36 @@ def render_music(result: JsonValue) -> str:
         raise TypeError("Music result must be an object")
     data: dict[str, Any] = result
     status = data["status"]
+    if status == "playing":
+        playing = data.get("now_playing")
+        if playing is None:
+            return "Music is playing, but track details are unavailable."
+        title = _voice_label(playing["title"], "your selection")
+        artist = _voice_label(playing["artist"], "that artist")
+        return f"Now playing {title} by {artist}."
+    if status == "nothing_playing":
+        return (
+            "Music is paused."
+            if data["observed_state"] == "paused"
+            else "Nothing is playing right now."
+        )
+    playback = data.get("playback")
+    if (
+        status in ("started", "resumed", "already_playing", "skipped")
+        and data.get("confirmation") == "observed"
+        and isinstance(playback, dict)
+        and playback.get("status") == "playing"
+    ):
+        return render_music(playback)
+    if (
+        status in ("started", "resumed", "skipped")
+        and data.get("confirmation") == "observed"
+    ):
+        playing = data.get("now_playing")
+        if playing is not None:
+            title = _voice_label(playing["title"], "your selection")
+            artist = _voice_label(playing["artist"], "that artist")
+            return f"Now playing {title} by {artist}."
     if status == "player_required":
         return "Please configure a music player."
     if status == "cannot_volume":
@@ -188,6 +240,20 @@ def render_music(result: JsonValue) -> str:
         return "Music is already playing."
     if status == "already_paused":
         return "Music is already paused."
+    if status == "already_stopped":
+        return "Music is already stopped."
+    if status == "stopped":
+        return (
+            "Music stopped."
+            if data["confirmation"] == "observed"
+            else "Stop requested."
+        )
+    if status == "skipped":
+        return (
+            "Skipped to the next song."
+            if data["confirmation"] == "observed"
+            else "Next song requested."
+        )
     if status in ("paused", "resumed"):
         if data["confirmation"] == "observed":
             return "Music paused." if status == "paused" else "Music resumed."
@@ -206,6 +272,23 @@ def render_music(result: JsonValue) -> str:
     raise ValueError(f"Unexpected music result status: {status}")
 
 
+def render_light(result: JsonValue) -> str:
+    """Confirm observed power only; describe failed control without claiming success.
+
+    Args:
+        result:
+            Strict light-tool outcome containing status and requested boolean on.
+
+    """
+    if not isinstance(result, dict) or type(result.get("on")) is not bool:
+        raise TypeError("Light result requires an object with boolean on")
+    if result["status"] == "failed":
+        return "I couldn't change the light. Please check the switch."
+    if result["status"] != "confirmed":
+        raise ValueError("Unexpected light result status")
+    return "Light on." if result["on"] else "Light off."
+
+
 @dataclass(slots=True)
 class LocalAgent:
     """Route each request locally; render verified results in ordinary speech text.
@@ -218,14 +301,19 @@ class LocalAgent:
     """
 
     session: Session
-    """Conversation with weather and optional music tools and routing instructions."""
+    """Conversation with weather, optional music/light tools and routing instructions."""
 
     def __post_init__(self) -> None:
-        """Require a weather registry with either all music tools or none of them."""
+        """Validate renderer-compatible weather/core music and optional next/query/light.
+
+        The guard checks an existing registry; it does not register tools. Custom
+        registries may supply the four core music tools without next/query tools.
+        These extensions require that core group; unrelated tool names are rejected.
+        """
         names = {
             schema["function"]["name"] for schema in self.session.model.tools.schemas()
         }
-        if names not in (
+        if names - {"set_light", "music_next", "what_is_playing"} not in (
             {"get_weather"},
             {
                 "get_weather",
@@ -234,12 +322,14 @@ class LocalAgent:
                 "play_music",
                 "volume_music",
             },
-        ):
+        ) or (names & {"music_next", "what_is_playing"} and "play_music" not in names):
             raise ValueError(
-                "LocalAgent requires weather and an optional complete music tool set"
+                "LocalAgent requires weather, an optional complete music tool set, optional next/query tools with music, and optional set_light"
             )
 
-    def stream(self, user_text: str) -> Generator[str]:
+    def stream(
+        self, user_text: str, *, cancelled: Callable[[], bool] | None = None
+    ) -> Generator[str]:
         """Yield grounded answers after routing with at most two call repairs.
 
         Model routing prose is withheld. Errors and abandonment reset the session;
@@ -247,30 +337,59 @@ class LocalAgent:
         Exhausted generated-call repairs yield a short clarification and preserve
         prior history so the next request can proceed. Standalone play/stop and
         louder/quieter (also quiter), ignoring case and terminal .!? punctuation,
-        use explicit session calls without inference.
+        use explicit session calls without inference. Next/next song/next track and
+        switch song/skip song/skip track similarly dispatch music_next directly.
 
         Args:
             user_text:
-                Nonempty weather/music request or conversational follow-up.
+                Nonempty weather/music/light request or conversational follow-up.
+
+            cancelled:
+                Optional thread-safe cancellation predicate checked before inference,
+                before the tool batch, and after dispatch. Dispatched effects persist.
 
         """
+        if cancelled is not None and cancelled():
+            self.session.reset()
+            return
         shortcut = {
             "play": ToolCall("resume_music", {}),
             "stop": ToolCall("pause_music", {}),
             "louder": ToolCall("volume_music", {"action": "louder"}),
             "quieter": ToolCall("volume_music", {"action": "quieter"}),
             "quiter": ToolCall("volume_music", {"action": "quieter"}),
+            "next": ToolCall("music_next", {}),
+            "next song": ToolCall("music_next", {}),
+            "next track": ToolCall("music_next", {}),
+            "switch song": ToolCall("music_next", {}),
+            "skip song": ToolCall("music_next", {}),
+            "skip track": ToolCall("music_next", {}),
+            "what is playing": ToolCall("what_is_playing", {}),
+            "what's playing": ToolCall("what_is_playing", {}),
+            "what song is playing": ToolCall("what_is_playing", {}),
+            "lights on": ToolCall("set_light", {"on": True}),
+            "light on": ToolCall("set_light", {"on": True}),
+            "turn on the light": ToolCall("set_light", {"on": True}),
+            "turn on the lights": ToolCall("set_light", {"on": True}),
+            "lights off": ToolCall("set_light", {"on": False}),
+            "light off": ToolCall("set_light", {"on": False}),
+            "turn off the light": ToolCall("set_light", {"on": False}),
+            "turn off the lights": ToolCall("set_light", {"on": False}),
         }.get(user_text.strip().rstrip(".!?").casefold())
         if shortcut and shortcut.name not in {
             schema["function"]["name"] for schema in self.session.model.tools.schemas()
         }:
-            logger.warning("Music shortcut status=unconfigured tool=%s", shortcut.name)
-            yield "Music isn't configured."
+            logger.warning("Agent shortcut status=unconfigured tool=%s", shortcut.name)
+            yield (
+                "The light isn't configured."
+                if shortcut.name == "set_light"
+                else "Music isn't configured."
+            )
             return
         try:
             if shortcut:
                 logger.info(
-                    "Music shortcut tool=%s args=%r", shortcut.name, shortcut.arguments
+                    "Agent shortcut tool=%s args=%r", shortcut.name, shortcut.arguments
                 )
                 self.session.request_tools(user_text, [shortcut])
             else:
@@ -283,6 +402,9 @@ class LocalAgent:
             self.session.reset()
             raise
         try:
+            if cancelled is not None and cancelled():
+                self.session.reset()
+                return
             if not self.session.pending_calls:
                 # Discard ungrounded model prose from both speech and future context.
                 logger.warning(
@@ -300,11 +422,13 @@ class LocalAgent:
                     else "Please rephrase your request."
                 )
                 return
-            if len(self.session.pending_calls) > 4:
-                raise RuntimeError("Local agent accepts at most four calls per turn")
             calls = self.session.pending_calls
-            if sum(call.name != "get_weather" for call in calls) > 1:
-                raise RuntimeError("Request one music action at a time")
+            logger.info(
+                "Agent routing mode=%s tools=%s",
+                "shortcut" if shortcut else "llm",
+                [call.name for call in calls],
+            )
+            validate_action_batch(calls)
             answers: list[str] = []
 
             def compact_result(call: ToolCall, result: JsonValue) -> str:
@@ -318,15 +442,19 @@ class LocalAgent:
                         Full isolated handler result, already logged by its client.
 
                 """
-                answer = (
-                    render_weather(result)
+                renderer = (
+                    render_weather
                     if call.name == "get_weather"
-                    else render_music(result)
+                    else (render_light if call.name == "set_light" else render_music)
                 )
+                answer = renderer(result)
                 answers.append(answer)
                 return answer
 
             self.session.invoke_tools(compact_result)
+            if cancelled is not None and cancelled():
+                self.session.reset()
+                return
             self.session.complete(" ".join(answers))
             for index, answer in enumerate(answers):
                 yield (" " if index else "") + answer

@@ -54,6 +54,8 @@ def unexpected_request(self: MusicClient, command: str, **args: JsonValue) -> Js
         ("pause", [], {}),
         ("stop", [], {}),
         ("resume", [], {}),
+        ("next", [], {}),
+        ("now-playing", [], {}),
         ("volume", ["louder"], {"action": "louder"}),
         ("volume", ["QUIETER"], {"action": "quieter"}),
         ("volume", ["35"], {"action": "set", "level": 35}),
@@ -93,7 +95,9 @@ def test_registered_dispatch(
     """
     calls_seen: list[ToolCall] = []
     dispatch = ToolRegistry.dispatch
-    tool_name = f"{'pause' if command == 'stop' else command}_music"
+    tool_name = {"next": "music_next", "now-playing": "what_is_playing"}.get(
+        command, f"{'pause' if command == 'stop' else command}_music"
+    )
 
     def spy(registry: ToolRegistry, calls: Sequence[ToolCall]) -> list[JsonValue]:
         """Record calls while retaining actual validation and execution.
@@ -170,6 +174,9 @@ def test_read_only(
         ("already_paused", 0),
         ("paused", 0),
         ("resumed", 0),
+        ("stopped", 0),
+        ("already_stopped", 0),
+        ("skipped", 0),
         ("volume_set", 0),
         ("volume_unchanged", 0),
         ("cannot_volume", 2),
@@ -273,7 +280,7 @@ def test_weather_only_config(tmp_path: Path) -> None:
     [
         ("paused", "resumed", 0, "spotify"),
         ("playing", "already_playing", 0, "spotify"),
-        ("idle", "cannot_resume", 2, "spotify"),
+        ("idle", "resumed", 0, "spotify"),
         ("idle", "resumed", 0, "spotify_connect://audio_source/speaker"),
     ],
 )
@@ -285,7 +292,7 @@ def test_blank_play_resumes(
     source: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Match native resume's result and RPCs without search or queue changes.
+    """Blank play uses MA player Play for paused and idle states without selecting music.
 
     Args:
         arguments:
@@ -322,22 +329,14 @@ def test_blank_play_resumes(
     for invocation in (["resume"], arguments):
         responses: list[JsonValue] = [[player], player]
         expected_commands = ["players/all", "players/get"]
-        if state == "idle" and status == "resumed":
-            responses.append(None)
-            expected_commands.append("player_queues/get")
         if status == "resumed":
-            responses.extend([player, None, {**player, "playback_state": "playing"}])
-            expected_commands.extend(["players/get", "players/cmd/play", "players/get"])
+            responses.extend([None, {**player, "playback_state": "playing"}])
+            expected_commands.extend(["players/cmd/play", "players/get"])
         with patch.object(MusicClient, "_request", side_effect=responses) as request:
             assert main(invocation) == code
         assert [call.args[0] for call in request.call_args_list] == expected_commands
         assert all(
-            call.kwargs
-            == (
-                {"queue_id": source}
-                if call.args[0] == "player_queues/get"
-                else {"player_id": "speaker"}
-            )
+            call.kwargs == {"player_id": "speaker"}
             for call in request.call_args_list[1:]
         )
         output = capsys.readouterr()
