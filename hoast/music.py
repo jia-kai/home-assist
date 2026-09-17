@@ -712,6 +712,36 @@ class MusicClient:
         assert set(handlers) == {tool.name for tool in declarations}
         return [replace(tool, handler=handlers[tool.name]) for tool in declarations]
 
+    def require_airplay_2_ptp(self) -> None:
+        """Require the selected Music Assistant player to use AirPlay 2 PTP timing.
+
+        The setting is persisted on the selected player rather than inferred from
+        transient playback state, which may be idle during application startup.
+
+        Raises:
+            MusicAssistantError: If no configured player is eligible or its configured
+                streaming mode is not AirPlay 2 PTP.
+
+        """
+        selected = self._select()
+        if isinstance(selected, dict):
+            raise MusicAssistantError("Configure one available music player for AirPlay 2 PTP")
+        mode = self._request(
+            "config/players/get_value",
+            player_id=selected.player_id,
+            key="streaming_mode",
+        )
+        if mode != "ap2_ptp":
+            _LOGGER.error(
+                "music.airplay_ptp status=invalid player_id=%s configured_mode=%r",
+                selected.player_id,
+                mode,
+            )
+            raise MusicAssistantError(
+                "Configured music player must use AirPlay 2 PTP timing"
+            )
+        _LOGGER.info("music.airplay_ptp status=ok player_id=%s", selected.player_id)
+
     def _players(self) -> list[_Player]:
         """Read registered nonprotocol players, including disabled/unavailable ones."""
         return [

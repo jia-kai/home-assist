@@ -156,6 +156,53 @@ class FixtureClient(MusicClient):
         return response
 
 
+def test_airplay_2_ptp_requirement_reads_persisted_player_mode() -> None:
+    """Accept only the explicit AirPlay 2 PTP player configuration."""
+    client = FixtureClient(
+        [
+            ("players/all", [player()]),
+            ("config/players/get_value", "ap2_ptp"),
+        ]
+    )
+
+    client.require_airplay_2_ptp()
+
+    assert client.requests == [
+        (
+            "players/all",
+            {
+                "return_unavailable": True,
+                "return_disabled": True,
+                "return_protocol_players": False,
+            },
+        ),
+        (
+            "config/players/get_value",
+            {"player_id": "speaker", "key": "streaming_mode"},
+        ),
+    ]
+
+
+@pytest.mark.parametrize("mode", ["auto", "ap2_ntp", None])
+def test_airplay_2_ptp_requirement_rejects_other_modes(mode: JsonValue) -> None:
+    """Fail startup rather than accepting a non-PTP AirPlay route.
+
+    Args:
+        mode:
+            Persisted Music Assistant streaming mode returned by its API.
+
+    """
+    client = FixtureClient(
+        [
+            ("players/all", [player()]),
+            ("config/players/get_value", mode),
+        ]
+    )
+
+    with pytest.raises(MusicAssistantError, match="AirPlay 2 PTP"):
+        client.require_airplay_2_ptp()
+
+
 def result_object(value: JsonValue) -> dict[str, JsonValue]:
     """Narrow a compact result for readable assertions.
 

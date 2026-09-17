@@ -1,0 +1,73 @@
+--- stream_session.py
++++ stream_session.py
+@@ -33,7 +33,8 @@
+     StreamingProtocol,
+ )
+ from .helpers import get_final_output_format
++from .aec_reference import AecReferenceSink
+ from .stream import AirPlayStream
+ 
+ if TYPE_CHECKING:
+     from music_assistant_models.media_items import AudioFormat
+@@ -80,9 +81,13 @@
+         assert sync_clients
+         self.prov = airplay_provider
+         self.mass = airplay_provider.mass
+         self.pcm_format = pcm_format
+         self.media = media
+         self.sync_clients = sync_clients
++        self._aec_references = {
++            client.player_id: AecReferenceSink(client.player_id)
++            for client in sync_clients
++        }
+         self._audio_source_task: asyncio.Task[None] | None = None
+         self._player_ffmpeg: dict[str, FFMpeg] = {}
+         self._lock = asyncio.Lock()
+@@ -366,12 +371,14 @@
+     async def stop(self) -> None:
+         """Stop playback and cleanup."""
+         if self._audio_source_task and not self._audio_source_task.done():
+             self._audio_source_task.cancel()
+             with suppress(asyncio.CancelledError):
+                 await self._audio_source_task
+         await asyncio.gather(
+             *[self.remove_client(x, reason="session stop") for x in self.sync_clients],
+         )
++        for reference in self._aec_references.values():
++            reference.close()
+ 
+     async def remove_client(
+         self, airplay_player: AirPlayPlayer, reason: str = "client removed"
+@@ -879,7 +886,18 @@
+                 async for chunk in audio_source:
+                     if not self.sync_clients:
+                         break
+ 
++                    if self._aec_references and self.start_unix_ms:
++                        byte_offset = self._pcm_total_fed
++                        start_us = self.start_unix_ms * 1000 + (
++                            byte_offset * 1_000_000 // self._pcm_byte_rate
++                        )
++                        end_us = self.start_unix_ms * 1000 + (
++                            (byte_offset + len(chunk)) * 1_000_000 // self._pcm_byte_rate
++                        )
++                        for reference in self._aec_references.values():
++                            reference.send_audio(start_us, end_us - start_us, chunk)
++
+                     has_running_clients = await self._write_chunk_to_all_players(chunk)
+                     if not has_running_clients:
+                         self.prov.logger.debug(
+@@ -1378,7 +1396,13 @@
+         self.start_unix_ms = target_ms
+         self.start_time = target_ms / 1000
+         # the only place a session (re)gains a live timeline, so any park ends here
+         self.parked = False
++        for reference in self._aec_references.values():
++            reference.stream_start(
++                target_ms * 1000, self.pcm_format.sample_rate,
++                self.pcm_format.channels, self._pcm_frame_size,
++                self.pcm_format.content_type.value,
++            )
+ 
+     async def _flush_member(self, player: AirPlayPlayer) -> bool:
+         """Flush one member's live stream in place and report the binary's ack."""

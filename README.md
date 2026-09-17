@@ -185,11 +185,25 @@ your shell. You can copy `.env.example` to `.env` as a starting point:
 
 ```dotenv
 MUSIC_ASSISTANT_TOKEN=YOUR_ACCESS_TOKEN
+MUSIC_ASSISTANT_IP=192.168.1.50
 ```
 
 Credentials stay outside TOML. The process environment takes precedence over the
 selected dotenv file, including an explicitly empty value (which is an error).
 Dotenv values are not interpolated and do not modify the process environment.
+
+The Music Assistant Compose service also requires `MUSIC_ASSISTANT_IP`, the fixed
+IPv4 or IPv6 address of its AirPlay receiver. Before MA starts, its container
+refreshes `/data/homepod-mdns.json` from that receiver's live mDNS records. If the
+receiver is temporarily undiscoverable, it advertises the last valid snapshot and
+retries live discovery once per minute. Startup fails when neither live records nor
+a complete snapshot is available.
+
+The Compose service reads the project-root `.env` for its receiver address:
+
+```sh
+docker compose -f music/docker-compose.yaml up -d
+```
 
 The direct CLI needs **no LLM, model download, compilation, or inference**. After
 `uv sync --locked`, discover players and inspect their state:

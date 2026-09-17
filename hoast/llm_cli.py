@@ -229,6 +229,7 @@ def main() -> None:
         music: MusicClient | None = None
         if config.music is not None:
             music = MusicClient(config.music, music_token(config.music, args.env_file))
+            music.require_airplay_2_ptp()
             registered.extend(music.tools())
         if config.switch is not None:
             registered.append(LightClient(config.switch).tool())
