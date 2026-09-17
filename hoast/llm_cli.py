@@ -149,7 +149,7 @@ def main() -> None:
     """Run configured voice turns by default, or stdin/stdout turns with --text.
 
     Voice startup warms English/Chinese TTS, STT and LLM before subscribing. Text
-    mode uses EOF and /reset. Diagnostics go to stderr and a durable log.
+    mode uses EOF and /reset. Diagnostics go to stderr without persistent logs.
     """
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -209,7 +209,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.text and args.debug_audio:
         parser.error("--debug-audio requires voice mode, without --text")
-    configure_logging(log_file=args.cache / "diagnostics/agent.log")
+    configure_logging()
     try:
         threads = (
             (1 if args.device == "GPU" else 2)
@@ -243,7 +243,18 @@ def main() -> None:
             model = FunctionGemma(settings, tools)
         else:
             settings_lfm = replace(
-                LFMConfig.from_cache(args.cache, threads=threads, device=args.device),
+                (
+                    LFMConfig(
+                        model_path=config.lfm_model_dir,
+                        cache_dir=args.cache,
+                        threads=threads,
+                        device=args.device,
+                    )
+                    if config.lfm_model_dir is not None
+                    else LFMConfig.from_cache(
+                        args.cache, threads=threads, device=args.device
+                    )
+                ),
                 system_prompt=SYSTEM_PROMPT,
                 max_new_tokens=args.max_new_tokens,
             )

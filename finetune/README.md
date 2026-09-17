@@ -580,10 +580,13 @@ The application accepts upstream `TokenizersBackend` metadata and the
 `PreTrainedTokenizerFast` metadata saved with merged fine-tuned checkpoints.
 Keep the exported tokenizer JSON and chat template intact.
 
-The assistant selects the LFM artifact through `<cache>/lfm/model.json`.
-`--model lfm` selects the model family, not a checkpoint directory. Register the
-target-local absolute path with this snippet, which replaces the selection for
-the chosen cache root:
+The assistant accepts a custom export through `[lfm].model_dir` in `config.toml`
+(for example, `model_dir = "models/openvino-int8"`, relative to the working
+directory). If that setting is omitted, it selects the LFM artifact through
+`<cache>/lfm/model.json`.
+`--model lfm` selects the model family, not a checkpoint directory. When using the
+cache manifest, register the target-local absolute path with this snippet, which
+replaces the selection for the chosen cache root:
 
 ```sh
 uv run python - <<'PY'

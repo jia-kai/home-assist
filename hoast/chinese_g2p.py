@@ -18,7 +18,7 @@ logger = get_logger(__name__)
 DEFAULT_SPEECH_PYTHON = Path(".cache/hoast/speech-env/.venv/bin/python")
 
 
-def _release(process: subprocess.Popen[bytes], log: BinaryIO) -> None:
+def _release(process: subprocess.Popen[bytes], log: BinaryIO | None) -> None:
     """Close the worker and its streams without leaving a background process.
 
     Args:
@@ -26,7 +26,7 @@ def _release(process: subprocess.Popen[bytes], log: BinaryIO) -> None:
             Owned Chinese phonemizer process.
 
         log:
-            Owned stderr log stream.
+            Owned stderr log stream, or None when stderr is inherited.
 
     """
     if process.stdin is not None:
@@ -42,7 +42,8 @@ def _release(process: subprocess.Popen[bytes], log: BinaryIO) -> None:
             process.wait()
     if process.stdout is not None:
         process.stdout.close()
-    log.close()
+    if log is not None:
+        log.close()
 
 
 @dataclass(slots=True, weakref_slot=True)
@@ -58,8 +59,8 @@ class ChineseG2P:
     timeout: float = 30.0
     """Maximum seconds per startup read, request write, or response read."""
 
-    log_file: Path = Path(".cache/hoast/diagnostics/chinese-g2p.log")
-    """Durable worker diagnostic log."""
+    log_file: Path | None = None
+    """Opt-in worker diagnostic log; None inherits console stderr without a file."""
 
     _process: subprocess.Popen[bytes] | None = field(
         default=None, init=False, repr=False
@@ -136,15 +137,19 @@ class ChineseG2P:
         return response
 
     def _start(self) -> None:
-        """Start the prepared worker and validate its protocol handshake."""
+        """Start the worker with console or opt-in file logs and validate its handshake."""
         if self._process is not None:
             return
         if not self.python.is_file():
             raise FileNotFoundError(
                 "Prepare Chinese TTS first: tools.prepare_tts --chinese"
             )
-        self.log_file.parent.mkdir(parents=True, exist_ok=True)
-        log = self.log_file.open("ab")
+        log: BinaryIO | None = None
+        log_args: list[str] = []
+        if self.log_file is not None:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            log = self.log_file.open("ab")
+            log_args = ["--log-file", str(self.log_file.resolve())]
         environment = os.environ.copy()
         environment.update(
             OMP_NUM_THREADS="1",
@@ -166,8 +171,7 @@ class ChineseG2P:
                     "hoast.chinese_g2p_worker",
                     "--english-language",
                     self.english_language,
-                    "--log-file",
-                    str(self.log_file.resolve()),
+                    *log_args,
                 ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -176,7 +180,8 @@ class ChineseG2P:
                 env=environment,
             )
         except BaseException:
-            log.close()
+            if log is not None:
+                log.close()
             raise
         self._process = process
         self._finalizer = weakref.finalize(self, _release, process, log)

@@ -1,4 +1,9 @@
 # Copy to config.toml and replace both zero placeholders with your coordinates.
+# Optional custom OpenVINO export, relative to the working directory.
+# Omit this table to use the prepared cache manifest.
+# [lfm]
+# model_dir = "models/openvino-int8"
+
 [weather]
 latitude = 0.0
 longitude = 0.0

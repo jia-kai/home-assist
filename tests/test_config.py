@@ -20,6 +20,7 @@ def test_config(tmp_path: Path) -> None:
     path.write_text("[weather]\nlatitude = 90\nlongitude = -180.0\n")
     assert load_config(path).weather == WeatherConfig(90, -180)
     assert load_config(path).music is None
+    assert load_config(path).lfm_model_dir is None
 
 
 @pytest.mark.parametrize(
@@ -37,6 +38,11 @@ def test_config(tmp_path: Path) -> None:
         "[weather]\nlatitude=1\nlongitude=inf",
         "[weather]\nlatitude=91\nlongitude=2",
         "[weather]\nlatitude=1\nlongitude=-181",
+        '[weather]\nlatitude=1\nlongitude=2\n[lfm]\nmodel_dir=""',
+        '[weather]\nlatitude=1\nlongitude=2\n[lfm]\nmodel_dir=" "',
+        "[weather]\nlatitude=1\nlongitude=2\n[lfm]\nmodel_dir=42",
+        "[weather]\nlatitude=1\nlongitude=2\n[lfm]",
+        '[weather]\nlatitude=1\nlongitude=2\n[lfm]\nmodel_dir="export"\nextra=1',
     ],
 )
 def test_invalid_config(tmp_path: Path, text: str) -> None:

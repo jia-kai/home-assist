@@ -145,6 +145,9 @@ class SystemConfig:
     satellite: SatelliteConfig | None = None
     """Voice endpoint, required for voice mode and optional for text/tool CLIs."""
 
+    lfm_model_dir: Path | None = None
+    """Custom OpenVINO LFM directory, relative to cwd; None uses the cache manifest."""
+
 
 def satellite_key(config: SatelliteConfig, env_file: Path = Path(".env")) -> str | None:
     """Read an explicitly configured satellite key; absent key_env means plaintext.
@@ -195,18 +198,21 @@ def music_token(config: MusicConfig, env_file: Path = Path(".env")) -> str:
 
 
 def load_config(path: Path) -> SystemConfig:
-    """Read required weather and optional music, switch, and satellite settings.
+    """Read weather, optional integrations, and an optional custom LFM directory.
 
     Args:
         path:
-            TOML file with weather coordinates and optional integration tables.
+            TOML file with weather coordinates, integration tables, and optional
+            [lfm].model_dir, resolved relative to the working directory.
 
     """
     with path.open("rb") as source:
         data = tomllib.load(source)
-    if "weather" not in data or set(data) - {"weather", "music", "switch", "satellite"}:
+    if "weather" not in data or set(data) - {
+        "weather", "music", "switch", "satellite", "lfm"
+    }:
         raise ValueError(
-            "System config requires [weather] and optional [music], [switch], [satellite]"
+            "System config requires [weather] and optional [music], [switch], [satellite], [lfm]"
         )
     weather = data["weather"]
     if not isinstance(weather, dict) or set(weather) != {"latitude", "longitude"}:
@@ -240,4 +246,13 @@ def load_config(path: Path) -> SystemConfig:
                 "[satellite] requires host; accepts port, capture_seconds, language, key_env"
             )
         satellite = SatelliteConfig(**settings)
-    return SystemConfig(WeatherConfig(**weather), music, switch, satellite)
+    lfm_model_dir = None
+    if "lfm" in data:
+        settings = data["lfm"]
+        if not isinstance(settings, dict) or set(settings) != {"model_dir"}:
+            raise ValueError("[lfm] requires exactly model_dir")
+        model_dir = settings["model_dir"]
+        if not isinstance(model_dir, str) or not model_dir.strip():
+            raise ValueError("lfm.model_dir must be a nonempty path string")
+        lfm_model_dir = Path(model_dir)
+    return SystemConfig(WeatherConfig(**weather), music, switch, satellite, lfm_model_dir)

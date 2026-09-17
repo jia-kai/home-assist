@@ -15,10 +15,10 @@ logger = get_logger(__name__)
 
 
 def main() -> None:
-    """Initialize official G2P once, then process bounded protocol requests."""
+    """Serve bounded G2P requests with console diagnostics and optional file logging."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--english-language", default="en-us")
-    parser.add_argument("--log-file", type=Path, required=True)
+    parser.add_argument("--log-file", type=Path, help="Opt-in persistent diagnostic log")
     args = parser.parse_args()
     configure_logging(log_file=args.log_file, level="WARNING")
     try:

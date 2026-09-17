@@ -666,10 +666,11 @@ def test_native_run_waits_for_playback_and_disconnect_drains(
     assert not pipeline.app.assistant.agent.session.history
 
 
+@pytest.mark.parametrize("model_name", ["functiongemma", "lfm"])
 def test_entry_point_uses_satellite_config(
-    pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model_name: str
 ) -> None:
-    """Parse real TOML in main and select the configured voice orchestration by default.
+    """Use configured voice and model settings with console-only default diagnostics.
 
     Args:
         pipeline:
@@ -681,18 +682,25 @@ def test_entry_point_uses_satellite_config(
         tmp_path:
             Isolated TOML and cache paths.
 
+        model_name:
+            Model family, with LFM using a custom export without a cache manifest.
+
     """
     path = tmp_path / "config.toml"
     (tmp_path / "int8.json").write_text('{"path":"unused-export"}')
     path.write_text(
+        '[lfm]\nmodel_dir="models/openvino-int8"\n'
         '[weather]\nlatitude=0\nlongitude=0\n[switch]\nip="192.0.2.20"\n[satellite]\nhost="configured-satellite"\nport=7000\nlanguage="auto"\n'
     )
     pipeline.model.__enter__.return_value = pipeline.model
     model_factory = MagicMock(return_value=pipeline.model)
     runner = AsyncMock()
-    monkeypatch.setattr(llm_cli, "FunctionGemma", model_factory)
+    monkeypatch.setattr(
+        llm_cli, "FunctionGemma" if model_name == "functiongemma" else "LFM2", model_factory
+    )
     monkeypatch.setattr(llm_cli, "run_voice", runner)
-    monkeypatch.setattr(llm_cli, "configure_logging", MagicMock())
+    logging_setup = MagicMock()
+    monkeypatch.setattr(llm_cli, "configure_logging", logging_setup)
     monkeypatch.setattr(llm_cli, "configure_cpu_budget", MagicMock())
     monkeypatch.setattr(
         "sys.argv",
@@ -703,11 +711,14 @@ def test_entry_point_uses_satellite_config(
             "--cache",
             str(tmp_path),
             "--model",
-            "functiongemma",
+            model_name,
             "--debug-audio",
         ],
     )
     llm_cli.main()
+    logging_setup.assert_called_once_with()
+    if model_name == "lfm":
+        assert model_factory.call_args.args[0].model_path == Path("models/openvino-int8")
     runner.assert_awaited_once()
     assert runner.call_args.args[4] is True
     assert runner.call_args.args[1] == SatelliteConfig(

@@ -11,3 +11,4 @@ dist/
 !.env.example
 /config.toml
 task_plan.md
+/models

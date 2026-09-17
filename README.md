@@ -92,8 +92,20 @@ TTS input is limited to 400 characters at sentence/word boundaries after consumi
 the complete agent response; the text console retains the full grounded answer.
 
 In text mode, use `/reset` to clear history and EOF to exit. Conversational output goes to
-stdout; diagnostics go to stderr and `.cache/hoast/diagnostics/agent.log`
-(or the selected `--cache` root).
+stdout. In voice and text mode, diagnostics go to stderr without persistent log
+files by default, including the Chinese speech worker.
+
+To select a custom fine-tuned OpenVINO LFM export, add this to `config.toml`:
+
+```toml
+[lfm]
+model_dir = "models/openvino-int8"
+```
+
+The path is relative to the working directory (absolute paths also work). This
+setting bypasses the LFM cache manifest; without it, LFM uses
+`<cache>/lfm/model.json`. It applies to the default LFM model; `--model functiongemma`
+uses its own prepared model. Compiled model artifacts still use `--cache`.
 
 `--help` describes options and displays defaults. The LFM CPU budget defaults to
 `--threads auto`: one core for GPU execution, two for CPU. Explicit `1` or `2`

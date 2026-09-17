@@ -122,12 +122,18 @@ def test_lazy_routing_cache_voice_index_and_close(tmp_path: Path) -> None:
         assert engine._chinese is None
 
 
-def test_worker_large_requests_failure_recovery_and_cleanup(tmp_path: Path) -> None:
-    """Exercise real pipes with oversized pipe payloads, worker exit and ID failures.
+@pytest.mark.parametrize("file_logging", [False, True])
+def test_worker_large_requests_failure_recovery_and_cleanup(
+    tmp_path: Path, file_logging: bool
+) -> None:
+    """Exercise real pipes, recovery, and cleanup with console or opt-in file logging.
 
     Args:
         tmp_path:
             Isolated durable worker log location.
+
+        file_logging:
+            Whether to explicitly enable persistent worker diagnostics.
 
     """
     original = subprocess.Popen
@@ -143,6 +149,8 @@ def test_worker_large_requests_failure_recovery_and_cleanup(tmp_path: Path) -> N
                 Original binary pipe and environment settings.
 
         """
+        assert ("--log-file" in command) is file_logging
+        assert (kwargs["stderr"] is not None) is file_logging
         return original(
             [sys.executable, "-u", "-c", _WORKER],
             stdin=kwargs["stdin"],
@@ -152,7 +160,11 @@ def test_worker_large_requests_failure_recovery_and_cleanup(tmp_path: Path) -> N
             env=kwargs["env"],
         )
 
-    worker = ChineseG2P(Path(sys.executable), log_file=tmp_path / "worker.log")
+    worker = (
+        ChineseG2P(Path(sys.executable), log_file=tmp_path / "worker.log")
+        if file_logging
+        else ChineseG2P(Path(sys.executable))
+    )
     with patch("hoast.chinese_g2p.subprocess.Popen", side_effect=launch):
         try:
             assert worker._process is None
@@ -170,6 +182,7 @@ def test_worker_large_requests_failure_recovery_and_cleanup(tmp_path: Path) -> N
         finally:
             worker.close()
         assert process is not None and process.poll() is not None
+    assert (tmp_path / "worker.log").exists() is file_logging
 
 
 def test_worker_limits_deadlines_and_bad_handshake(tmp_path: Path) -> None:
