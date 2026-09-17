@@ -80,7 +80,9 @@ spoken as letters. English insertions explicitly decompose rhotic vowels into
 supported Kokoro phonemes rather than discarding those sounds.
 
 STT accepts PyAV-supported audio files and resamples/downmixes to mono 16 kHz.
-English recognition is the default; use `--language zh` or `auto` as appropriate.
+English recognition is the default. In voice configuration, `auto` chooses between
+English and Chinese, preferring English when the detected probabilities are close;
+use `zh` to force Chinese.
 The eight-second minimum encoder context avoids unnecessary short-input padding;
 uncertain decoding retries the full context. `--encoder-min-seconds 30` requests
 the full-padding reference. Silence retains an empty transcript. Returned STT text

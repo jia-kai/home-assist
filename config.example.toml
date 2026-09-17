@@ -24,6 +24,6 @@ ip = "192.168.42.20"
 host = "127.0.0.1"
 port = 6053
 capture_seconds = 6.0 # Hard maximum; 600 ms trailing silence ends capture earlier.
-language = "auto"
+language = "auto" # Detect English or Chinese; near ties select English.
 # For an encrypted ESPHome device, set this variable in .env or the environment.
 # key_env = "ESPHOME_API_KEY"

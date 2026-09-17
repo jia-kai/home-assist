@@ -14,7 +14,13 @@ import pytest
 import soundfile as sf
 
 from hoast.speech_text import english_phonemes, mixed_phonemes, prepare_speech_text
-from hoast.stt import STT, STTConfig, _WindowedWhisper
+from hoast.stt import (
+    ENGLISH_PREFERENCE_MARGIN,
+    STT,
+    STTConfig,
+    _select_preferred_language,
+    _WindowedWhisper,
+)
 from hoast.tts import TTS, TTSConfig, phoneme_batches
 from tools.prepare_stt import REVISION
 from tools.prepare_stt import prepare as prepare_stt
@@ -55,6 +61,57 @@ def test_configuration_validation() -> None:
     for context in (float("nan"), 3.0, 31.0):
         with pytest.raises(ValueError):
             STTConfig(encoder_min_seconds=context)
+
+
+def test_auto_language_selection_is_constrained_and_prefers_english() -> None:
+    """Choose only English or Chinese and give English its configured near-tie margin."""
+    assert _select_preferred_language([("zh", 0.70), ("en", 0.65)]) == ("en", 0.65)
+    assert _select_preferred_language([("en", 0.64), ("zh", 0.70)]) == ("zh", 0.70)
+    with pytest.raises(ValueError, match="English and Chinese"):
+        _select_preferred_language([("fr", 1.0)])
+    assert ENGLISH_PREFERENCE_MARGIN == 0.05
+
+
+def test_auto_language_restores_vad_timestamps_from_speech_chunks(
+    tmp_path: Path,
+) -> None:
+    """Keep VAD timestamps separate from collect_chunks metadata before restoration.
+
+    Args:
+        tmp_path:
+            Isolated dummy checkpoint directory.
+
+    """
+    for name in ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt"):
+        (tmp_path / name).touch()
+    features = np.zeros((80, 3000), dtype=np.float32)
+    speech_chunks = [{"start": 100, "end": 200}]
+    with (
+        patch("hoast.stt._WindowedWhisper") as backend,
+        patch("hoast.stt.Tokenizer"),
+        patch("hoast.stt.get_suppressed_tokens", return_value=[]),
+        patch("hoast.stt.get_speech_timestamps", return_value=speech_chunks),
+        patch(
+            "hoast.stt.collect_chunks",
+            return_value=([np.zeros(100, dtype=np.float32)], [{"offset": 0.0}]),
+        ),
+        patch("hoast.stt.restore_speech_timestamps", return_value=iter(())) as restore,
+    ):
+        recognizer = STT(STTConfig(model_path=tmp_path, language=None))
+        backend.return_value.feature_extractor.return_value = features
+        backend.return_value.feature_extractor.sampling_rate = 16000
+        backend.return_value.feature_extractor.nb_max_frames = 3000
+        backend.return_value.model.is_multilingual = True
+        backend.return_value.model.detect_language.return_value = [
+            [("<|en|>", 0.60), ("<|zh|>", 0.40)]
+        ]
+        backend.return_value.generate_segments.return_value = iter(())
+
+        segments, info = recognizer._decode(np.zeros(16000, dtype=np.float32))
+
+        assert list(segments) == []
+        assert info.language == "en"
+        assert restore.call_args.args[1] is speech_chunks
 
 
 def test_spoken_titles_and_explicit_phoneme_mapping() -> None:

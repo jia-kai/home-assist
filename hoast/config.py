@@ -98,7 +98,7 @@ class SatelliteConfig:
     """Maximum command capture duration in seconds, between 0.1 and 30."""
 
     language: str = "en"
-    """Whisper language code, or auto for language detection."""
+    """Whisper language code, or auto for English/Chinese detection favoring English."""
 
     key_env: str | None = None
     """Optional environment/dotenv variable containing the Noise encryption key."""

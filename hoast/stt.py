@@ -4,15 +4,23 @@ import argparse
 import math
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import ctranslate2
 import numpy as np
 from faster_whisper import WhisperModel
-from faster_whisper.audio import decode_audio
-from faster_whisper.transcribe import Segment, TranscriptionInfo
+from faster_whisper.audio import decode_audio, pad_or_trim
+from faster_whisper.tokenizer import Tokenizer
+from faster_whisper.transcribe import (
+    Segment,
+    TranscriptionInfo,
+    TranscriptionOptions,
+    get_suppressed_tokens,
+    restore_speech_timestamps,
+)
+from faster_whisper.vad import VadOptions, collect_chunks, get_speech_timestamps
 from numpy.typing import NDArray
 from scipy.signal import resample_poly
 
@@ -22,6 +30,32 @@ from .runtime import configure_cpu_budget
 
 logger = get_logger(__name__)
 DEFAULT_MODEL = Path(".cache/hoast/stt/small")
+ENGLISH_PREFERENCE_MARGIN = 0.05
+
+
+def _select_preferred_language(probabilities: Sequence[tuple[str, float]]) -> tuple[str, float]:
+    """Select English or Chinese, choosing English when their scores are close.
+
+    Args:
+        probabilities:
+            Whisper language-code probabilities from one detected audio window.
+
+    Returns:
+        The selected language code and its unmodified Whisper probability.
+
+    Raises:
+        ValueError: If Whisper omits English or Chinese from its language scores.
+
+    """
+    scores = dict(probabilities)
+    try:
+        english = scores["en"]
+        chinese = scores["zh"]
+    except KeyError as error:
+        raise ValueError("Whisper language detection must score English and Chinese") from error
+    if english + ENGLISH_PREFERENCE_MARGIN >= chinese:
+        return "en", english
+    return "zh", chinese
 
 
 class _WindowedWhisper(WhisperModel):
@@ -262,6 +296,8 @@ class STT:
                 Mono float32 waveform shaped (samples,) at 16 kHz.
 
         """
+        if self.config.language is None:
+            return self._decode_preferred_language(audio)
         return self.model.transcribe(
             audio,
             language=self.config.language,
@@ -272,6 +308,94 @@ class STT:
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 300},
             without_timestamps=self.config.without_timestamps,
+        )
+
+    def _decode_preferred_language(
+        self, audio: NDArray[np.float32]
+    ) -> tuple[Iterable[Segment], TranscriptionInfo]:
+        """Decode auto-selected English or Chinese while preferring English near a tie.
+
+        The implementation uses faster-whisper internals to give its first decoder
+        window the encoder output used for language detection, avoiding a second
+        encoder execution for the short voice-command inputs used by this service.
+
+        Args:
+            audio:
+                Mono float32 waveform shaped (samples,) at 16 kHz.
+
+        """
+        sampling_rate = self.model.feature_extractor.sampling_rate
+        vad_options = VadOptions(min_silence_duration_ms=300)
+        speech_chunks = get_speech_timestamps(audio, vad_options)
+        audio_chunks, _ = collect_chunks(audio, speech_chunks)
+        filtered_audio = np.concatenate(audio_chunks, axis=0)
+        features = self.model.feature_extractor(filtered_audio)
+        initial_features = features[
+            ..., : self.model.feature_extractor.nb_max_frames
+        ]
+        encoder_output = self.model.encode(pad_or_trim(initial_features))
+        language_probabilities = [
+            (token[2:-2], probability)
+            for token, probability in self.model.model.detect_language(encoder_output)[0]
+        ]
+        language, language_probability = _select_preferred_language(
+            language_probabilities
+        )
+        logger.debug(
+            "stt.language selected=%s probability=%.3f english=%.3f chinese=%.3f",
+            language,
+            language_probability,
+            dict(language_probabilities)["en"],
+            dict(language_probabilities)["zh"],
+        )
+        tokenizer = Tokenizer(
+            self.model.hf_tokenizer,
+            self.model.model.is_multilingual,
+            task="transcribe",
+            language=language,
+        )
+        options = TranscriptionOptions(
+            beam_size=self.config.beam_size,
+            best_of=1,
+            patience=1,
+            length_penalty=1,
+            repetition_penalty=1,
+            no_repeat_ngram_size=0,
+            log_prob_threshold=-1.0,
+            no_speech_threshold=0.6,
+            compression_ratio_threshold=2.4,
+            condition_on_previous_text=False,
+            prompt_reset_on_temperature=0.5,
+            temperatures=[0.0],
+            initial_prompt=None,
+            prefix=None,
+            suppress_blank=True,
+            suppress_tokens=get_suppressed_tokens(tokenizer, (-1,)),
+            without_timestamps=self.config.without_timestamps,
+            max_initial_timestamp=1.0,
+            word_timestamps=False,
+            prepend_punctuations="\"'“¿([{-",
+            append_punctuations="\"'.。,，!！?？:：”)]}、",
+            multilingual=False,
+            max_new_tokens=None,
+            clip_timestamps="0",
+            hallucination_silence_threshold=None,
+            hotwords=None,
+        )
+        segments = self.model.generate_segments(
+            features, tokenizer, options, False, encoder_output
+        )
+        return (
+            restore_speech_timestamps(segments, speech_chunks, sampling_rate),
+            TranscriptionInfo(
+                language=language,
+                language_probability=language_probability,
+                duration=audio.size / sampling_rate,
+                duration_after_vad=filtered_audio.size / sampling_rate,
+                transcription_options=options,
+                vad_options=vad_options,
+                all_language_probs=language_probabilities,
+            ),
         )
 
 
