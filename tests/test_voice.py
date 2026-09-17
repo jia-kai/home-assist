@@ -190,7 +190,7 @@ def test_disconnect_waits_for_stt_without_publishing() -> None:
 
 
 def test_streaming_silence_starts_stt_early() -> None:
-    """Feed a burst containing speech/silence/more speech and stop before the later speech."""
+    """Silence starts STT early and emits the satellite processing cue first."""
 
     async def run() -> None:
         """Verify exact retained PCM, native stop events, and detector reset on rearm."""
@@ -213,17 +213,28 @@ def test_streaming_silence_starts_stt_early() -> None:
         receiver = VoiceReceiver(client, handler, seconds=6, endpoint=endpoint)
         pcm = b"\x01\0" * 512 * 35
         for _ in range(2):
-            vad.side_effect = [0.9] * 10 + [0.1] * 19
+            vad.side_effect = [0.9] * 10 + [0.1] * 16
             await receiver.start("", 0, VoiceAssistantAudioSettings(), None)
             await receiver.receive(pcm, None)
             assert receiver.task is not None
             await asyncio.wait_for(receiver.task, timeout=1)
             assert receiver.end_reason == "silence"
-        assert received == [pcm[: (10 * 512 + 9600) * 2]] * 2
+        assert received == [pcm[: (10 * 512 + 8000) * 2]] * 2
         assert vad.reset.call_count == 2
         assert [kind for kind, _ in client.events].count(
             Event.VOICE_ASSISTANT_STT_VAD_END
         ) == 2
+        assert [kind for kind, _ in client.events].count(
+            Event.VOICE_ASSISTANT_INTENT_START
+        ) == 2
+        for start in range(0, len(client.events), 6):
+            assert [kind for kind, _ in client.events][start : start + 5] == [
+                Event.VOICE_ASSISTANT_RUN_START,
+                Event.VOICE_ASSISTANT_STT_START,
+                Event.VOICE_ASSISTANT_STT_VAD_END,
+                Event.VOICE_ASSISTANT_INTENT_START,
+                Event.VOICE_ASSISTANT_STT_END,
+            ]
         await receiver.close()
 
     asyncio.run(run())
@@ -306,7 +317,7 @@ def test_deadline_during_vad_still_trims_buffered_endpoint() -> None:
 
             Args:
                 pcm:
-                    Expected prefix ending at the first 600 ms silence endpoint.
+                    Expected prefix ending at the first 500 ms silence endpoint.
 
             """
             received.append(pcm)
@@ -339,7 +350,7 @@ def test_deadline_during_vad_still_trims_buffered_endpoint() -> None:
         assert receiver.task is not None
         await asyncio.wait_for(receiver.task, 1)
         assert receiver.end_reason == "silence"
-        assert received == [pcm[: (10 * 512 + 9600) * 2]]
+        assert received == [pcm[: (10 * 512 + 8000) * 2]]
         await receiver.close()
 
     asyncio.run(run())

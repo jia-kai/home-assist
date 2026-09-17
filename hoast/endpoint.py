@@ -11,7 +11,7 @@ from numpy.typing import NDArray
 
 FRAME_SAMPLES = 512
 FRAME_BYTES = FRAME_SAMPLES * 2
-SILENCE_SAMPLES = 9600
+SILENCE_SAMPLES = 8000
 
 
 class FrameVAD(Protocol):
@@ -93,11 +93,11 @@ class SileroVAD:
 
 @dataclass(slots=True)
 class SpeechEndpoint:
-    """Detect 600 ms trailing silence after speech, independently of packet boundaries.
+    """Detect 500 ms trailing silence after speech, independently of packet boundaries.
 
     Speech starts at probability >= 0.5; after onset, probability >= 0.35 resets
-    trailing silence. Nineteen silent 32 ms frames establish the 600 ms threshold
-    (608 ms observed); the returned sample boundary retains exactly 600 ms after
+    trailing silence. Sixteen silent 32 ms frames establish the 500 ms threshold
+    (512 ms observed); the returned sample boundary retains exactly 500 ms after
     the last non-silent frame. Partial final frames are never padded into silence.
     """
 

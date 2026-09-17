@@ -1,4 +1,4 @@
-"""Packet-independent 600 ms speech endpoints with mocked frame probabilities."""
+"""Packet-independent 500 ms speech endpoints with mocked frame probabilities."""
 
 from dataclasses import dataclass
 from unittest.mock import MagicMock
@@ -37,7 +37,7 @@ class MockVAD:
 
 @pytest.mark.parametrize("packet_bytes", [2, 98, 1024, 4096, 100000])
 def test_packet_independent_endpoint(packet_bytes: int) -> None:
-    """Ignore speech after an endpoint in the same packet; preserve exactly 600 ms.
+    """Ignore speech after an endpoint in the same packet; preserve exactly 500 ms.
 
     Args:
         packet_bytes:
@@ -46,29 +46,29 @@ def test_packet_independent_endpoint(packet_bytes: int) -> None:
     """
     vad = MockVAD()
     endpoint = SpeechEndpoint(vad)
-    pcm = SILENCE * 5 + SPEECH * 10 + SILENCE * 19 + SPEECH * 5
+    pcm = SILENCE * 5 + SPEECH * 10 + SILENCE * 16 + SPEECH * 5
     result = None
     for offset in range(0, len(pcm), packet_bytes):
         result = endpoint.feed(pcm[offset : offset + packet_bytes])
         if result is not None:
             break
-    assert result == 15 * 512 + 9600
-    assert vad.calls == 34
+    assert result == 15 * 512 + 8000
+    assert vad.calls == 31
     assert endpoint.feed(SPEECH) == result
-    assert vad.calls == 34
+    assert vad.calls == 31
 
 
 def test_initial_silence_and_short_pause() -> None:
-    """Initial silence never ends a command; a sub-600 ms pause resets on resumed speech."""
+    """Initial silence never ends a command; a sub-500 ms pause resets on resumed speech."""
     endpoint = SpeechEndpoint(MockVAD())
     assert endpoint.feed(SILENCE * 60) is None
     assert endpoint.feed(SPEECH * 2) is None
-    assert endpoint.feed(SILENCE * 18) is None
+    assert endpoint.feed(SILENCE * 15) is None
     assert endpoint.feed(SPEECH) is None
     assert endpoint.silence == 0
     last_speech_end = endpoint.samples
-    assert endpoint.feed(SILENCE * 18 + SILENCE[:768]) is None
-    assert endpoint.feed(SILENCE[768:]) == last_speech_end + 9600
+    assert endpoint.feed(SILENCE * 15 + SILENCE[:640]) is None
+    assert endpoint.feed(SILENCE[640:]) == last_speech_end + 8000
 
 
 def test_hysteresis_and_reset() -> None:
@@ -81,7 +81,7 @@ def test_hysteresis_and_reset() -> None:
     vad.return_value = 0.8
     endpoint.feed(SPEECH)
     vad.return_value = 0.1
-    endpoint.feed(SILENCE * 18)
+    endpoint.feed(SILENCE * 15)
     vad.return_value = 0.4
     assert endpoint.feed(SILENCE) is None
     assert endpoint.silence == 0

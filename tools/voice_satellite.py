@@ -114,6 +114,7 @@ def satellite_command(
         str(SATELLITE / "wakewords"),
         "--audio-input-channels",
         "1",
+        "--enable-thinking-sound",
         "--disable-peripheral-api",
         "--debug",
     ]

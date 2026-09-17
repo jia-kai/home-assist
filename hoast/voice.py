@@ -57,7 +57,7 @@ class VoiceReceiver:
     """Serialize satellite captures and pass PCM to an asynchronous transcript handler.
 
     All methods run on one asyncio loop. The native listener supplies a streaming
-    endpoint that finishes after 600 ms of silence following speech. Wall-clock
+    endpoint that finishes after 500 ms of silence following speech. Wall-clock
     and PCM-duration caps still bound silent, stalled, or continuously voiced input.
     Stop/cancel/disconnect discards incomplete audio. An already-running handler
     is awaited during shutdown; its external side effects cannot be cancelled.
@@ -300,13 +300,17 @@ class VoiceReceiver:
         self.done.set()
 
     async def _capture(self) -> None:
-        """Complete adaptive capture, optional replay, STT and agent/TTS before rearming."""
+        """Complete capture, cue silence-ended processing, then run STT and the agent."""
         try:
             self.event(Event.VOICE_ASSISTANT_RUN_START)
             self.event(Event.VOICE_ASSISTANT_STT_START)
             await self._wait_for_endpoint()
             ended_at = time.monotonic()
             self.event(Event.VOICE_ASSISTANT_STT_VAD_END)
+            processing_started = self.end_reason == "silence"
+            if processing_started:
+                # Satellites use INTENT_START to play their configured processing sound.
+                self.event(Event.VOICE_ASSISTANT_INTENT_START)
             if self.aborted or not self.audio:
                 self.event(
                     Event.VOICE_ASSISTANT_ERROR,
@@ -339,7 +343,6 @@ class VoiceReceiver:
                     if self.connected and self.on_transcript is not None:
                         self.on_transcript(text)
                     if self.connected and not self.aborted and self.on_turn is not None:
-                        self.event(Event.VOICE_ASSISTANT_INTENT_START)
                         await self.on_turn(
                             VoiceTurn(text, self.started_at, ended_at, self.cancelled)
                         )
@@ -411,7 +414,7 @@ async def listen(
     if debug_audio and replay_tts is None:
         raise ValueError("Debug replay requires a shared TTS instance")
     endpoint = SpeechEndpoint()
-    logger.info("voice.endpoint model=silero_v6 silence_ms=600 frame_ms=32")
+    logger.info("voice.endpoint model=silero_v6 silence_ms=500 frame_ms=32")
     while True:
         client = APIClient(host, port, password="", noise_psk=key)
         receiver = VoiceReceiver(
