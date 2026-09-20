@@ -23,6 +23,7 @@ dependencies = [
     "psutil>=7",
     "threadpoolctl>=3.6",
     "pyopencl==2026.1.4",
+    "soundcard>=0.4.3",
     "sounddevice>=0.5",
     "aioesphomeapi==45.3.1",
 ]

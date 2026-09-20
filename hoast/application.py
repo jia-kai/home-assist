@@ -156,7 +156,7 @@ class VoiceApplication:
     """End of the preceding accepted nonempty capture, in monotonic seconds."""
 
     def warmup(self) -> None:
-        """Warm English/Chinese TTS, generated-audio STT, then LLM without tool effects."""
+        """Warm all models without tool effects, then announce initialization."""
         clips = []
         for language, text in (
             ("en", "The assistant is ready."),
@@ -176,6 +176,8 @@ class VoiceApplication:
         logger.debug("warmup.llm generation=%r", result)
         self.assistant.new_session()
         logger.info("warmup.llm status=ready tools_dispatched=0")
+        self.tts.play("系统初始化完毕", blocking=True)
+        logger.info("warmup.announcement status=completed")
 
     def transcribe(self, pcm: bytes) -> str:
         """Recognize captured PCM on the single inference worker.

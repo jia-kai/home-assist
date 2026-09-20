@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -55,9 +56,22 @@ def prepare() -> None:
             stderr=output,
             check=True,
         )
-        if not (SATELLITE / ".venv").exists():
+        virtual_environment = SATELLITE / ".venv"
+        virtual_python = virtual_environment / "bin/python"
+        if virtual_environment.exists():
+            try:
+                subprocess.run(
+                    [str(virtual_python), "--version"],
+                    stdout=output,
+                    stderr=output,
+                    check=True,
+                )
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                logger.warning("satellite.prepare status=recreating_invalid_venv")
+                shutil.rmtree(virtual_environment)
+        if not virtual_environment.exists():
             subprocess.run(
-                ["uv", "venv", "--python", "3.13", str(SATELLITE / ".venv")],
+                ["uv", "venv", "--python", "3.13", str(virtual_environment)],
                 stdout=output,
                 stderr=output,
                 check=True,

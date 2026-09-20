@@ -301,6 +301,7 @@ def test_mocked_complete_pipeline(
             "stt-warm",
             "stt-warm",
             "llm-warm",
+            "play:系统初始化完毕",
         ]
         assert not pipeline.app.assistant.agent.session.history
         assert replay_tts is pipeline.tts
@@ -339,7 +340,7 @@ def test_mocked_complete_pipeline(
             debug_audio,
         )
     )
-    assert pipeline.timeline[5:] == ["stt", "llm", "light:True", "play:Light on."] * 2
+    assert pipeline.timeline[6:] == ["stt", "llm", "light:True", "play:Light on."] * 2
     assert events.count(Event.VOICE_ASSISTANT_RUN_END) == 2
     assert len(pipeline.histories[0]) == 1 and len(pipeline.histories[1]) > 1
     assert '"state": "off"' in pipeline.model.config.system_prompt

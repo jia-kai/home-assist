@@ -78,10 +78,6 @@ def build(output: Path = DEFAULT_KERNEL) -> Path:
     """
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise RuntimeError("The tuned speech kernel targets Linux x86_64 with AVX2")
-    compiler = shutil.which("c++")
-    if compiler is None:
-        raise FileNotFoundError("A C++ compiler is required to build the speech kernel")
-    output.parent.mkdir(parents=True, exist_ok=True)
     root = Path(ov.__file__).parent
     libraries = root / "libs"
     openvino_libraries = list(libraries.glob("libopenvino.so.*"))
@@ -101,6 +97,10 @@ def build(output: Path = DEFAULT_KERNEL) -> Path:
         ):
             logger.info("speech.kernels status=cached path=%s", output)
             return output
+    compiler = shutil.which("c++")
+    if compiler is None:
+        raise FileNotFoundError("A C++ compiler is required to build the speech kernel")
+    output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(".tmp.so")
     command = [
         compiler,

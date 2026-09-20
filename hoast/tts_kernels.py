@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import openvino as ov
@@ -11,7 +12,9 @@ from openvino.utils.node_factory import NodeFactory
 from .logging import get_logger
 
 logger = get_logger(__name__)
-DEFAULT_KERNEL = Path(".cache/hoast/tts/cpu-kernels/libhoast_speech.so")
+DEFAULT_KERNEL = Path(
+    os.environ.get("HOAST_SPEECH_KERNEL", ".cache/hoast/tts/cpu-kernels/libhoast_speech.so")
+)
 KERNEL_SOURCE = Path(__file__).with_name("kernels") / "snake.cpp"
 
 

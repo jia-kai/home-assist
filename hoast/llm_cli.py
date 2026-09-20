@@ -30,7 +30,7 @@ logger = get_logger(__name__)
 def prepare_voice(
     assistant: Assistant, config: SatelliteConfig, cache: Path
 ) -> VoiceApplication:
-    """Load and warm bilingual speech and LLM on the inference worker.
+    """Load and warm bilingual speech and LLM, then announce initialization.
 
     Args:
         assistant:

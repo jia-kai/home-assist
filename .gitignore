@@ -9,6 +9,7 @@ dist/
 .env
 .env.*
 !.env.example
+/music.env
 /config.toml
 task_plan.md
 /models

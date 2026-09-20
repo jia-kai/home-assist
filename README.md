@@ -58,6 +58,22 @@ uv run python -m hoast --config config.toml --device CPU
 uv run python -m hoast --config config.toml --text
 ```
 
+### Containers
+
+The root Compose file includes Music Assistant and starts the microphone satellite
+before Hoast. It is development-oriented: the source tree and model cache are
+mounted while Hoast's locked Python dependencies are built into the image. PipeWire
+is forwarded from `/run/user/1000`, and Hoast runs as UID/GID `1000:1000`.
+
+```sh
+docker compose up -d --build
+```
+
+The service requires the prepared `.cache/hoast/voice-satellite` assets and a
+PipeWire PulseAudio-compatible input named `Built-in Audio Analog Stereo` by default. Set
+`HOAST_SATELLITE_INPUT` in `.env` to choose another visible input. The shared AEC
+socket directory is `$HOME/music-data/aec-reference/`.
+
 Voice mode connects to `[satellite].host` in `config.toml`, receives command audio,
 runs STT and the tool-based agent, then plays its bounded reply through system
 audio. Startup warms English and Chinese TTS, feeds both generated clips to STT,
@@ -185,21 +201,21 @@ your shell. You can copy `.env.example` to `.env` as a starting point:
 
 ```dotenv
 MUSIC_ASSISTANT_TOKEN=YOUR_ACCESS_TOKEN
-MUSIC_ASSISTANT_IP=192.168.1.50
 ```
 
 Credentials stay outside TOML. The process environment takes precedence over the
 selected dotenv file, including an explicitly empty value (which is an error).
 Dotenv values are not interpolated and do not modify the process environment.
 
-The Music Assistant Compose service also requires `MUSIC_ASSISTANT_IP`, the fixed
-IPv4 or IPv6 address of its AirPlay receiver. Before MA starts, its container
+The Music Assistant Compose service requires `AIRPLAY_IP`, the fixed IPv4
+or IPv6 address of its AirPlay receiver. Copy `music.env.example` to `music.env`
+(which is gitignored) and set the address there. Before MA starts, its container
 refreshes `/data/homepod-mdns.json` from that receiver's live mDNS records. If the
 receiver is temporarily undiscoverable, it advertises the last valid snapshot and
 retries live discovery once per minute. Startup fails when neither live records nor
 a complete snapshot is available.
 
-The Compose service reads the project-root `.env` for its receiver address:
+The Compose service reads the project-root `music.env` for its receiver address:
 
 ```sh
 docker compose -f music/docker-compose.yaml up -d

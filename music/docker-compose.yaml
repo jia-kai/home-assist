@@ -7,13 +7,13 @@ services:
     # Network mode must be set to host for MA to discover and stream to players (see networking note below)
     network_mode: host
     env_file:
-      - ../.env
+      - ../music.env
     volumes:
       - ${USERDIR:-$HOME}/music-data:/data/
     environment:
       # Provide logging level as environment variable.
       # default=info, possible=(critical, error, warning, info, debug)
       - LOG_LEVEL=info
-      # Empty disables AEC-reference export until receivers bind per-player sockets.
-      - MA_AEC_REFERENCE_DIRECTORY=/data
+      # Hoast binds per-player sockets in this shared UID 1000 directory.
+      - MA_AEC_REFERENCE_DIRECTORY=/data/aec-reference
     mem_limit: 1g

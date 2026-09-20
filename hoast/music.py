@@ -155,7 +155,7 @@ class _CurrentMedia(_Response):
     """Optional source identity used to reject stale labels from another source."""
 
     uri: str | None = None
-    """Optional media URI used to compare observed track identity, not shown to users."""
+    """Optional media URI used for source and track identity, not shown to users."""
 
     queue_item_id: str | None = None
     """Optional queue item identity distinguishing repeated tracks at different positions."""
@@ -900,7 +900,13 @@ class MusicClient:
         if (
             player.playback_state == "playing"
             and media is not None
-            and media.source_id in (None, player.active_source)
+            and (
+                media.source_id in (None, player.active_source)
+                or (
+                    player.active_source is not None
+                    and media.uri == player.active_source
+                )
+            )
         ):
             playing = _playing_labels(media.title, media.artist)
         return {

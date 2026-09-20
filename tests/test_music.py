@@ -997,6 +997,16 @@ def test_music_next_uses_selected_member_for_server_routing() -> None:
         ),
         (
             "playing",
+            {
+                "title": "Connect Song",
+                "artist": "Connect Artist",
+                "source_id": "speaker",
+                "uri": "spotify",
+            },
+            "Now playing Connect Song by Connect Artist.",
+        ),
+        (
+            "playing",
             {"title": "Actual Song"},
             "Music is playing, but track details are unavailable.",
         ),

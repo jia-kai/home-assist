@@ -1,6 +1,6 @@
 """Start Music Assistant with live AirPlay discovery and a cached mDNS fallback.
 
-MUSIC_ASSISTANT_IP is required. The launcher refreshes a live receiver snapshot
+AIRPLAY_IP is required. The launcher refreshes a live receiver snapshot
 before MA starts and every minute thereafter. If discovery fails, it advertises
 the last valid snapshot until the receiver is visible again. Snapshots are stored
 with the Music Assistant data at /data/homepod-mdns.json.
@@ -37,6 +37,7 @@ _DEFAULT_COMMAND = (
     "--cache-dir",
     "/data/.cache",
 )
+_AEC_REFERENCE_DIRECTORY = Path("/data/aec-reference")
 
 
 @dataclass(slots=True)
@@ -194,16 +195,16 @@ def get_configured_ip() -> str:
         Normalized IPv4 or IPv6 receiver address.
 
     Raises:
-        RuntimeError: If MUSIC_ASSISTANT_IP is missing or invalid.
+        RuntimeError: If AIRPLAY_IP is missing or invalid.
 
     """
-    configured_ip = os.environ.get("MUSIC_ASSISTANT_IP")
+    configured_ip = os.environ.get("AIRPLAY_IP")
     if not configured_ip:
-        raise RuntimeError("MUSIC_ASSISTANT_IP is required")
+        raise RuntimeError("AIRPLAY_IP is required")
     try:
         return str(ipaddress.ip_address(configured_ip))
     except ValueError as error:
-        raise RuntimeError("MUSIC_ASSISTANT_IP must be an IP address") from error
+        raise RuntimeError("AIRPLAY_IP must be an IP address") from error
 
 
 def get_source_address(target_address: str) -> str:
@@ -227,6 +228,17 @@ def get_source_address(target_address: str) -> str:
     with socket.socket(family, socket.SOCK_DGRAM) as probe:
         probe.connect(endpoint)
         return str(probe.getsockname()[0])
+
+
+def prepare_aec_reference_directory() -> None:
+    """Create a Hoast-writable AEC socket directory in Music Assistant data.
+
+    The MA launcher runs as root while Hoast runs as UID/GID 1000. The directory
+    permits Hoast to bind its Unix datagram socket and MA to send reference PCM.
+    """
+    _AEC_REFERENCE_DIRECTORY.mkdir(mode=0o770, exist_ok=True)
+    os.chown(_AEC_REFERENCE_DIRECTORY, 1000, 1000)
+    os.chmod(_AEC_REFERENCE_DIRECTORY, 0o770)
 
 
 def require_complete_snapshot(services: list[AirPlayService], target_address: str) -> None:
@@ -441,6 +453,7 @@ def main() -> int:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
     target_address = get_configured_ip()
     cache_path = Path("/data/homepod-mdns.json")
+    prepare_aec_reference_directory()
     source_address = get_source_address(target_address)
     command = tuple(sys.argv[1:]) or _DEFAULT_COMMAND
     stop_event = threading.Event()

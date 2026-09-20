@@ -1,13 +1,24 @@
 """Nonblocking Unix-datagram export of native AirPlay reference PCM."""
 
-import json
 import os
 import socket
 import struct
 from dataclasses import dataclass, field
 
-_HEADER = struct.Struct("!4sB3xIQQ")
+_HEADER = struct.Struct("!4sBBBBIIQIIHH")
 _MAGIC = b"HAEC"
+_VERSION = 2
+_MAX_AUDIO_PAYLOAD_BYTES = 60_000
+_ENCODINGS = {
+    "s16le": 1,
+    "s24le": 2,
+    "s32le": 3,
+    "f32le": 4,
+    "f64le": 5,
+    "s16be": 6,
+    "s24be": 7,
+    "s32be": 8,
+}
 
 
 @dataclass(slots=True)
@@ -24,6 +35,21 @@ class AecReferenceSink:
 
     stream_id: int = field(default=0, init=False)
     """Monotonically increasing presentation generation included in every packet."""
+
+    _sequence: int = field(default=0, init=False)
+    """Monotonically increasing packet sequence number within the stream generation."""
+
+    _sample_rate: int = field(default=0, init=False)
+    """PCM sample rate in Hz included in every datagram header."""
+
+    _channels: int = field(default=0, init=False)
+    """Interleaved PCM channel count included in every datagram header."""
+
+    _frame_size: int = field(default=0, init=False)
+    """Bytes per interleaved PCM sample frame included in every datagram header."""
+
+    _encoding: int = field(default=0, init=False)
+    """Protocol PCM encoding code included in every datagram header."""
 
     _socket: socket.socket | None = field(default=None, init=False)
     """Nonblocking Unix datagram socket, created only while export is enabled."""
@@ -43,7 +69,7 @@ class AecReferenceSink:
         frame_size: int,
         content_type: str,
     ) -> None:
-        """Publish a host-timeline anchor and the dynamically selected PCM format.
+        """Publish a host-timeline anchor and set format fields for every datagram.
 
         Args:
             presentation_us:
@@ -59,36 +85,40 @@ class AecReferenceSink:
                 Bytes per interleaved PCM sample frame.
 
             content_type:
-                Music Assistant PCM content-type name.
+                Music Assistant PCM content-type name mapped to the protocol encoding.
 
         """
+        try:
+            encoding = _ENCODINGS[content_type]
+        except KeyError as error:
+            raise ValueError(f"Unsupported AEC PCM content type: {content_type}") from error
         self.stream_id += 1
-        metadata = json.dumps(
-            {
-                "sample_rate": sample_rate,
-                "channels": channels,
-                "frame_size": frame_size,
-                "content_type": content_type,
-            },
-            separators=(",", ":"),
-        ).encode()
-        self._send(1, presentation_us, 0, metadata)
+        self._sequence = 0
+        self._sample_rate = sample_rate
+        self._channels = channels
+        self._frame_size = frame_size
+        self._encoding = encoding
+        self._send(1, presentation_us, 0, b"")
 
     def send_audio(self, presentation_us: int, duration_us: int, data: bytes) -> None:
-        """Export one PCM chunk without blocking native AirPlay playback.
+        """Export PCM in datagrams small enough for Unix datagram transport.
 
         Args:
             presentation_us:
                 Host Unix presentation time of the first PCM sample in microseconds.
 
             duration_us:
-                PCM chunk duration in microseconds.
+                PCM chunk duration in microseconds, apportioned across datagrams.
 
             data:
                 Native interleaved PCM bytes passed into the AirPlay player pipeline.
 
         """
-        self._send(2, presentation_us, duration_us, data)
+        for offset in range(0, len(data), _MAX_AUDIO_PAYLOAD_BYTES):
+            payload = data[offset : offset + _MAX_AUDIO_PAYLOAD_BYTES]
+            payload_start_us = presentation_us + duration_us * offset // len(data)
+            payload_end_us = presentation_us + duration_us * (offset + len(payload)) // len(data)
+            self._send(2, payload_start_us, payload_end_us - payload_start_us, payload)
 
     def close(self) -> None:
         """Release the datagram socket when its native AirPlay session ends."""
@@ -99,7 +129,7 @@ class AecReferenceSink:
     def _send(
         self, packet_type: int, presentation_us: int, duration_us: int, payload: bytes
     ) -> None:
-        """Send one packet, dropping it if the receiver is unavailable or saturated.
+        """Send one self-describing packet and drop it when transport is unavailable.
 
         Args:
             packet_type:
@@ -112,14 +142,26 @@ class AecReferenceSink:
                 PCM duration in microseconds, or zero for a start packet.
 
             payload:
-                JSON format metadata for start or PCM bytes for audio.
+                Empty start payload or PCM bytes for audio.
 
         """
         if not self.socket_path:
             return
         packet = _HEADER.pack(
-            _MAGIC, packet_type, self.stream_id, presentation_us, duration_us
+            _MAGIC,
+            _VERSION,
+            packet_type,
+            self._encoding,
+            0,
+            self.stream_id,
+            self._sequence,
+            presentation_us,
+            duration_us,
+            self._sample_rate,
+            self._channels,
+            self._frame_size,
         ) + payload
+        self._sequence += 1
         try:
             self._get_socket().sendto(packet, self.socket_path)
         except (BlockingIOError, ConnectionRefusedError, FileNotFoundError, OSError):

@@ -1,0 +1,29 @@
+include:
+  - path: music/docker-compose.yaml
+
+services:
+  hoast:
+    build: .
+    image: home-assist/hoast:latest
+    container_name: hoast
+    restart: unless-stopped
+    mem_limit: 5g
+    network_mode: host
+    user: "1000:1000"
+    env_file:
+      - .env
+    environment:
+      - HOME=/tmp/hoast-home
+      - PYTHONDONTWRITEBYTECODE=1
+      - XDG_RUNTIME_DIR=/run/user/1000
+      - XDG_CACHE_HOME=/workspace/src/.cache
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+    volumes:
+      - ./:/workspace/src:ro
+      - ./.cache:/workspace/src/.cache
+      - /run/user/1000:/run/user/1000
+      - ${USERDIR:-$HOME}/music-data:/data
+    tmpfs:
+      - /tmp/hoast-home:uid=1000,gid=1000,mode=0700
+    devices:
+      - /dev/dri:/dev/dri
