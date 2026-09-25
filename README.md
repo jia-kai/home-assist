@@ -60,19 +60,31 @@ uv run python -m hoast --config config.toml --text
 
 ### Containers
 
-The root Compose file includes Music Assistant and starts the microphone satellite
-before Hoast. It is development-oriented: the source tree and model cache are
-mounted while Hoast's locked Python dependencies are built into the image. PipeWire
-is forwarded from `/run/user/1000`, and Hoast runs as UID/GID `1000:1000`.
+The root Compose file starts Music Assistant, Hoast and the reSpeaker AEC
+reference bridge. Hoast connects directly to the reSpeaker ESPHome API configured
+in root `config.toml`; the encrypted API key comes from root `.env` through
+`satellite.key_env`. The bridge reads the device address and MA player ID from
+the same config, then binds that player's socket in the shared
+`$HOME/music-data/aec-reference/` directory. Both services use the Hoast image
+and run as UID/GID `1000:1000`. The source tree and model cache are mounted;
+PipeWire is forwarded from `/run/user/1000` for Hoast's system audio output.
 
 ```sh
 docker compose up -d --build
 ```
 
-The service requires the prepared `.cache/hoast/voice-satellite` assets and a
-PipeWire PulseAudio-compatible input named `Built-in Audio Analog Stereo` by default. Set
-`HOAST_SATELLITE_INPUT` in `.env` to choose another visible input. The shared AEC
-socket directory is `$HOME/music-data/aec-reference/`.
+The root Compose configuration does not start the Linux microphone simulator.
+If an earlier deployment used the standalone bridge Compose file, stop and
+remove its bridge container before starting the root stack to release the
+shared socket:
+
+```sh
+docker rm -f respeaker-aec-reference-bridge-1
+docker compose up -d --build
+```
+
+See [`respeaker/README.md`](respeaker/README.md) for firmware installation and
+the bridge's audio path.
 
 Voice mode connects to `[satellite].host` in `config.toml`, receives command audio,
 runs STT and the tool-based agent, then plays its bounded reply through system
@@ -158,10 +170,11 @@ See [docs/speech.md](docs/speech.md) for voice/language options, reusable Python
 engines and local artifact paths. The linked study documents preserve the tuning
 journey, rejected approaches and measured results.
 
-For local-microphone wake-word development and the reSpeaker ESPHome interface,
-see [Network microphone development](docs/voice-satellite.md). The simulator uses
-OHF Linux Voice Assistant with microWakeWord; `python -m hoast.voice` receives
-native wake/audio events and emits transcripts for the agent.
+For local-microphone wake-word development, see
+[Network microphone development](docs/voice-satellite.md). Its optional simulator
+uses OHF Linux Voice Assistant with microWakeWord; `python -m hoast.voice`
+receives native wake/audio events. The deployed hardware configuration is in
+[`respeaker/README.md`](respeaker/README.md).
 
 ## Weather
 

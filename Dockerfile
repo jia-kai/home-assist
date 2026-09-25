@@ -34,8 +34,6 @@ RUN PYTHONPATH=/opt/hoast/build-src /opt/hoast/.venv/bin/python \
 FROM base
 
 COPY --from=kernel-build /opt/hoast/kernels /opt/hoast/kernels
-COPY docker/hoast-entrypoint.py /usr/local/bin/hoast-entrypoint.py
-
 ENV PATH=/opt/hoast/.venv/bin:$PATH
 ENV PYTHONPATH=/workspace/src
 ENV HOME=/workspace/src
@@ -43,5 +41,5 @@ ENV UV_CACHE_DIR=/workspace/src/.cache/uv
 ENV HOAST_SPEECH_KERNEL=/opt/hoast/kernels/libhoast_speech.so
 WORKDIR /workspace/src
 USER 1000:1000
-ENTRYPOINT ["/opt/hoast/.venv/bin/python", "/usr/local/bin/hoast-entrypoint.py"]
+ENTRYPOINT ["/opt/hoast/.venv/bin/python"]
 CMD ["-m", "hoast", "--config", "/workspace/src/config.toml"]

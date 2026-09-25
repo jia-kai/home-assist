@@ -1,0 +1,16 @@
+.git/
+.venv/
+.cache/
+.pytest_cache/
+.ruff_cache/
+models/
+.env
+.env.*
+config.toml
+music.env
+task_plan.md
+respeaker/.esphome/
+respeaker/secrets.yaml*
+respeaker/captures/
+**/__pycache__/
+*.wav

@@ -6,6 +6,8 @@ services:
     build: .
     image: home-assist/hoast:latest
     container_name: hoast
+    entrypoint: ["/opt/hoast/.venv/bin/python"]
+    command: ["-m", "hoast", "--config", "/workspace/src/config.toml"]
     restart: unless-stopped
     mem_limit: 5g
     network_mode: host
@@ -27,3 +29,20 @@ services:
       - /tmp/hoast-home:uid=1000,gid=1000,mode=0700
     devices:
       - /dev/dri:/dev/dri
+
+  aec-reference-bridge:
+    build: .
+    image: home-assist/hoast:latest
+    restart: unless-stopped
+    network_mode: host
+    user: "1000:1000"
+    entrypoint: ["/opt/hoast/.venv/bin/python", "-m", "respeaker.core.bridge"]
+    command:
+      - --config
+      - /workspace/src/config.toml
+      - --socket-directory
+      - /data/aec-reference
+    volumes:
+      - ./:/workspace/src:ro
+      - ./.cache:/workspace/src/.cache
+      - ${USERDIR:-$HOME}/music-data:/data

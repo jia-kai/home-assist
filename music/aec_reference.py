@@ -1,14 +1,20 @@
 """Nonblocking Unix-datagram export of native AirPlay reference PCM."""
 
+import logging
 import os
+import queue
 import socket
 import struct
+import threading
+import time
 from dataclasses import dataclass, field
 
 _HEADER = struct.Struct("!4sBBBBIIQIIHH")
 _MAGIC = b"HAEC"
 _VERSION = 2
 _MAX_AUDIO_PAYLOAD_BYTES = 60_000
+_MAX_PENDING_RECORDS = 128
+LOGGER = logging.getLogger(__name__)
 _ENCODINGS = {
     "s16le": 1,
     "s24le": 2,
@@ -51,15 +57,28 @@ class AecReferenceSink:
     _encoding: int = field(default=0, init=False)
     """Protocol PCM encoding code included in every datagram header."""
 
-    _socket: socket.socket | None = field(default=None, init=False)
-    """Nonblocking Unix datagram socket, created only while export is enabled."""
+    _pending: queue.Queue[bytes] = field(
+        default_factory=lambda: queue.Queue(maxsize=_MAX_PENDING_RECORDS), init=False
+    )
+    """Bounded HAEC records awaiting the background Unix socket writer."""
+
+    _stopped: threading.Event = field(default_factory=threading.Event, init=False)
+    """Shutdown signal for the background writer."""
+
+    _writer: threading.Thread | None = field(default=None, init=False)
+    """Background worker that can wait for Unix socket backpressure."""
+
+    _dropped: int = field(default=0, init=False)
+    """Records rejected by the bounded queue since this sink started."""
 
     @property
     def socket_path(self) -> str:
         """Return this player's socket path, or an empty path when export is disabled."""
         if not self.socket_directory:
             return ""
-        return os.path.join(self.socket_directory, f"aec-reference-{self.player_id}.sock")
+        return os.path.join(
+            self.socket_directory, f"aec-reference-{self.player_id}.sock"
+        )
 
     def stream_start(
         self,
@@ -91,7 +110,9 @@ class AecReferenceSink:
         try:
             encoding = _ENCODINGS[content_type]
         except KeyError as error:
-            raise ValueError(f"Unsupported AEC PCM content type: {content_type}") from error
+            raise ValueError(
+                f"Unsupported AEC PCM content type: {content_type}"
+            ) from error
         self.stream_id += 1
         self._sequence = 0
         self._sample_rate = sample_rate
@@ -117,19 +138,19 @@ class AecReferenceSink:
         for offset in range(0, len(data), _MAX_AUDIO_PAYLOAD_BYTES):
             payload = data[offset : offset + _MAX_AUDIO_PAYLOAD_BYTES]
             payload_start_us = presentation_us + duration_us * offset // len(data)
-            payload_end_us = presentation_us + duration_us * (offset + len(payload)) // len(data)
+            payload_end_us = presentation_us + duration_us * (
+                offset + len(payload)
+            ) // len(data)
             self._send(2, payload_start_us, payload_end_us - payload_start_us, payload)
 
     def close(self) -> None:
-        """Release the datagram socket when its native AirPlay session ends."""
-        if self._socket is not None:
-            self._socket.close()
-            self._socket = None
+        """Request background delivery of queued audio, without blocking playback."""
+        self._stopped.set()
 
     def _send(
         self, packet_type: int, presentation_us: int, duration_us: int, payload: bytes
     ) -> None:
-        """Send one self-describing packet and drop it when transport is unavailable.
+        """Queue one HAEC record without blocking Music Assistant playback.
 
         Args:
             packet_type:
@@ -147,34 +168,90 @@ class AecReferenceSink:
         """
         if not self.socket_path:
             return
-        packet = _HEADER.pack(
-            _MAGIC,
-            _VERSION,
-            packet_type,
-            self._encoding,
-            0,
-            self.stream_id,
-            self._sequence,
-            presentation_us,
-            duration_us,
-            self._sample_rate,
-            self._channels,
-            self._frame_size,
-        ) + payload
+        packet = (
+            _HEADER.pack(
+                _MAGIC,
+                _VERSION,
+                packet_type,
+                self._encoding,
+                0,
+                self.stream_id,
+                self._sequence,
+                presentation_us,
+                duration_us,
+                self._sample_rate,
+                self._channels,
+                self._frame_size,
+            )
+            + payload
+        )
         self._sequence += 1
+        if self._stopped.is_set():
+            raise RuntimeError("AEC reference sink is closed")
+        if self._writer is None:
+            self._writer = threading.Thread(
+                target=self._write_loop, name="ma-aec-reference", daemon=True
+            )
+            self._writer.start()
         try:
-            self._get_socket().sendto(packet, self.socket_path)
-        except (BlockingIOError, ConnectionRefusedError, FileNotFoundError, OSError):
-            pass
+            self._pending.put_nowait(packet)
+        except queue.Full:
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 100 == 0:
+                LOGGER.warning(
+                    "aec.reference status=overflow dropped=%d", self._dropped
+                )
 
-    def _get_socket(self) -> socket.socket:
-        """Return the best-effort nonblocking Unix datagram socket.
+    def _write_loop(self) -> None:
+        """Deliver ordered records on a connection-oriented Unix socket.
 
-        Returns:
-            Socket used only for outgoing reference packets.
+        Socket waits and reconnects run outside Music Assistant's playback loop.
+        Audio past its presentation deadline is discarded on reconnection.
 
         """
-        if self._socket is None:
-            self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-            self._socket.setblocking(False)
-        return self._socket
+        connection: socket.socket | None = None
+        failed = False
+        try:
+            while not self._stopped.is_set() or not self._pending.empty():
+                try:
+                    packet = self._pending.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                presentation_us = _HEADER.unpack_from(packet)[7]
+                while True:
+                    if presentation_us < time.time_ns() // 1000:
+                        LOGGER.warning(
+                            "aec.reference status=expired sequence=%d",
+                            _HEADER.unpack_from(packet)[6],
+                        )
+                        break
+                    try:
+                        if connection is None:
+                            connection = socket.socket(
+                                socket.AF_UNIX, socket.SOCK_SEQPACKET
+                            )
+                            connection.settimeout(0.5)
+                            connection.connect(self.socket_path)
+                            failed = False
+                        sent = connection.send(packet)
+                        if sent != len(packet):
+                            raise OSError("Incomplete AEC sequence packet")
+                        break
+                    except OSError as error:
+                        if connection is not None:
+                            connection.close()
+                            connection = None
+                        if not failed:
+                            LOGGER.warning(
+                                "aec.reference status=disconnected reason=%s", error
+                            )
+                            failed = True
+                        if self._stopped.is_set():
+                            LOGGER.warning(
+                                "aec.reference status=aborted reason=closed_without_bridge"
+                            )
+                            return
+                        time.sleep(0.1)
+        finally:
+            if connection is not None:
+                connection.close()

@@ -1,0 +1,5 @@
+secrets.yaml*
+*.local.yaml
+.esphome/
+captures/
+*.wav

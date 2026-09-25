@@ -1,0 +1,242 @@
+# Minimal XVF3800 satellite: ESPHome native voice transport without media/timers.
+substitutions:
+  name: hoast-respeaker
+  friendly_name: Voice satellite
+  respeaker_ref: 7b96e8b00a60174441d09c5c0b26378cccd0b1f2
+  led_ring_cmd: "18"
+  wake_route_category: "255"
+  wake_route_source: "0"
+  asr_route_category: "255"
+  asr_route_source: "0"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.8.2
+  includes:
+    - firmware/aec_receiver.h
+    - firmware/debug_audio.h
+    - firmware/xmos_control.h
+  on_boot:
+    - priority: -100
+      then:
+        - lambda: |-
+            auto *receiver = new hoast::AecReceiver(id(i2s_reference));
+            receiver->setup();
+            hoast::debug_audio = new hoast::DebugAudio(id(i2s_mics), id(mww), id(internal_i2c));
+            hoast::debug_audio->setup();
+            id(wake_route_status).publish_state("pending");
+            id(wake_route_pending) = true;
+
+globals:
+  - id: wake_route_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: wake_route_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: asr_route_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+text_sensor:
+  - platform: template
+    id: wake_route_status
+    name: Wake Route
+    update_interval: never
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_LWIP_MAX_SOCKETS: "20"
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+  ignore_not_found: false
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components:
+      - xvf_microphone
+  - source:
+      type: git
+      url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration
+      ref: ${respeaker_ref}
+    components:
+      - respeaker_xvf3800
+    refresh: 1d
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+  actions:
+    - action: arm_debug_audio
+      variables:
+        token: string
+      then:
+        - lambda: |-
+            if (hoast::debug_audio != nullptr) hoast::debug_audio->arm(token);
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+time:
+  - platform: sntp
+    id: host_clock
+    servers:
+      - !secret ntp_host
+
+i2c:
+  - id: internal_i2c
+    sda: GPIO5
+    scl: GPIO6
+    frequency: 400kHz
+
+respeaker_xvf3800:
+  id: respeaker
+  address: 0x2C
+  i2c_id: internal_i2c
+  dfu_version:
+    name: Firmware Version
+    update_interval: 30s
+  firmware:
+    url: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration/raw/${respeaker_ref}/application_xvf3800_inthost-lr48-sqr-i2c-v1.0.7-release.bin
+    version: "1.0.7"
+    md5: 043a848f544ff2c7265ac19685daf5de
+
+i2s_audio:
+  - id: i2s_input
+    i2s_lrclk_pin:
+      number: GPIO7
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO8
+      allow_other_uses: true
+  - id: i2s_output
+    i2s_lrclk_pin:
+      number: GPIO7
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO8
+      allow_other_uses: true
+
+microphone:
+  - platform: i2s_audio
+    id: i2s_mics
+    i2s_din_pin: GPIO43
+    adc_type: external
+    pdm: false
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    i2s_mode: secondary
+    i2s_audio_id: i2s_input
+    channel: stereo
+  - platform: xvf_microphone
+    id: asr_mic
+    microphone: i2s_mics
+    channel: 0
+  - platform: xvf_microphone
+    id: wake_mic
+    microphone: i2s_mics
+    channel: 1
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_reference
+    sample_rate: 48000
+    i2s_mode: secondary
+    i2s_dout_pin: GPIO44
+    bits_per_sample: 32bit
+    i2s_audio_id: i2s_output
+    dac_type: external
+    channel: stereo
+    timeout: never
+    buffer_duration: 100ms
+
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: wake_mic
+    channels: 0
+  stop_after_detection: false
+  models:
+    - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu
+  on_wake_word_detected:
+    - lambda: |-
+        hoast::set_ring(id(internal_i2c), ${led_ring_cmd}, 0x600060);
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
+
+voice_assistant:
+  id: va
+  microphone:
+    microphone: asr_mic
+    channels: 0
+  micro_wake_word: mww
+  use_wake_word: false
+  noise_suppression_level: 0
+  auto_gain: 0 dbfs
+  volume_multiplier: 1
+  on_client_connected:
+    - micro_wake_word.start:
+  on_client_disconnected:
+    - voice_assistant.stop:
+    - micro_wake_word.stop:
+  on_end:
+    - lambda: |-
+        hoast::set_ring(id(internal_i2c), ${led_ring_cmd}, 0);
+
+interval:
+  - interval: 250ms
+    then:
+      - lambda: |-
+          if (id(wake_route_pending) && !id(wake_route_ready)) {
+            static unsigned tries = 0;
+            id(wake_route_ready) = hoast::set_output_route(
+                id(internal_i2c), 19, ${wake_route_category}, ${wake_route_source});
+            if (!id(wake_route_ready) && ++tries == 40) {
+              id(wake_route_status).publish_state("error");
+              ESP_LOGE("xmos_ctrl", "status=failed reason=wake_route_timeout");
+            }
+          }
+          if (id(wake_route_pending) && id(wake_route_ready) &&
+              !id(asr_route_ready)) {
+            static unsigned tries = 0;
+            id(asr_route_ready) = hoast::set_output_route(
+                id(internal_i2c), 15, ${asr_route_category}, ${asr_route_source});
+            if (!id(asr_route_ready) && ++tries == 40) {
+              id(wake_route_status).publish_state("error");
+              ESP_LOGE("xmos_ctrl", "status=failed reason=asr_route_timeout");
+            }
+          }
+          if (id(wake_route_pending) && id(wake_route_ready) &&
+              id(asr_route_ready) && id(wake_route_status).state != "ready")
+            id(wake_route_status).publish_state("ready");
+  - interval: 10ms
+    then:
+      - lambda: |-
+          if (hoast::debug_audio != nullptr) hoast::debug_audio->loop();
