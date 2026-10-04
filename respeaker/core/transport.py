@@ -24,7 +24,8 @@ FRAMES_PER_PACKET = 480
 NTP_UNIX_OFFSET = 2_208_988_800
 TARGET_LEAD_US = 3_000_000
 PACKET_DURATION_US = 10_000
-MAX_PENDING_PACKETS = 800
+MAX_PENDING_AUDIO_SECONDS = 5 * 60
+MAX_PENDING_PACKETS = MAX_PENDING_AUDIO_SECONDS * 1_000_000 // PACKET_DURATION_US
 ENCODING_BYTES = {1: 2, 2: 3, 3: 4, 4: 4, 5: 8, 6: 2, 7: 3, 8: 4}
 
 
@@ -147,6 +148,15 @@ class RtpSender:
     first_packet: bool = True
     """Whether the next audio packet opens an RTP stream generation."""
 
+    def new_stream(self) -> None:
+        """Start an independent RTP/RTCP generation for new MA audio."""
+        self.ssrc = int.from_bytes(os.urandom(4), "big")
+        self.sequence = 0
+        self.packet_count = 0
+        self.octet_count = 0
+        self.last_report_us = 0
+        self.first_packet = True
+
     def send(self, samples: NDArray[np.int16], presentation_us: int) -> None:
         """Send contiguous 48 kHz mono blocks with timestamps of their first samples.
 
@@ -232,7 +242,7 @@ class PacedReference:
     """RTP/RTCP sender retaining the original sample presentation timestamps."""
 
     pending: deque[ScheduledPacket] = field(default_factory=deque)
-    """Scheduled 48 kHz packets in playback order."""
+    """At most five minutes of 48 kHz PCM in playback order (30,000 packets)."""
 
     last_sent_us: int | None = None
     """Host send time of the preceding packet, when one was sent."""
@@ -246,8 +256,45 @@ class PacedReference:
         self.last_sent_us = None
         self.expired = 0
 
+    def _record_expired(self, count: int) -> None:
+        """Count and report reference packets discarded past presentation time.
+
+        Args:
+            count:
+                Number of newly expired ten-millisecond packets.
+
+        """
+        if not count:
+            return
+        previous = self.expired
+        self.expired += count
+        if previous == 0 or self.expired // 100 > previous // 100:
+            LOGGER.warning("reference.packet status=expired count=%d", self.expired)
+
+    def _discard_expired(self, now_us: int) -> None:
+        """Discard all stale queued audio and rebase the remaining send times.
+
+        Args:
+            now_us:
+                Current host Unix time in microseconds.
+
+        """
+        count = 0
+        while self.pending and self.pending[0].presentation_us < now_us:
+            self.pending.popleft()
+            count += 1
+        self._record_expired(count)
+        if not count:
+            return
+        previous_us = self.last_sent_us
+        for packet in self.pending:
+            packet.send_us = max(packet.presentation_us - TARGET_LEAD_US, now_us)
+            if previous_us is not None:
+                packet.send_us = max(packet.send_us, previous_us + PACKET_DURATION_US)
+            previous_us = packet.send_us
+
     def enqueue(self, chunk: ReferenceChunk, now_us: int) -> None:
-        """Resample source audio and schedule RTP no faster than real time.
+        """Resample fresh source audio and schedule RTP no faster than real time.
 
         Args:
             chunk:
@@ -257,22 +304,38 @@ class PacedReference:
                 Current host Unix time in microseconds.
 
         """
+        self._discard_expired(now_us)
         target_frames = round(len(chunk.samples) * SAMPLE_RATE / chunk.sample_rate)
         if not target_frames:
             return
         positions = np.arange(target_frames) * chunk.sample_rate / SAMPLE_RATE
         resampled = np.interp(positions, np.arange(len(chunk.samples)), chunk.samples)
         pcm = (np.clip(resampled, -1, 32767 / 32768) * 32768).astype(np.int16)
-        packet_count = (len(pcm) + FRAMES_PER_PACKET - 1) // FRAMES_PER_PACKET
-        if len(self.pending) + packet_count > MAX_PENDING_PACKETS:
+        fresh_offsets = [
+            offset
+            for offset in range(0, len(pcm), FRAMES_PER_PACKET)
+            if chunk.presentation_us + offset * 1_000_000 // SAMPLE_RATE >= now_us
+        ]
+        self._record_expired(
+            (len(pcm) + FRAMES_PER_PACKET - 1) // FRAMES_PER_PACKET - len(fresh_offsets)
+        )
+        if len(self.pending) + len(fresh_offsets) > MAX_PENDING_PACKETS:
+            oldest_lead_ms = (
+                (self.pending[0].presentation_us - now_us) // 1000
+                if self.pending
+                else None
+            )
             LOGGER.warning(
-                "reference.buffer status=overflow queued=%d incoming=%d",
+                "reference.buffer status=overflow queued=%d incoming=%d "
+                "oldest_lead_ms=%s incoming_lead_ms=%d",
                 len(self.pending),
-                packet_count,
+                len(fresh_offsets),
+                oldest_lead_ms,
+                (chunk.presentation_us - now_us) // 1000,
             )
             return
         previous_us = self.pending[-1].send_us if self.pending else self.last_sent_us
-        for offset in range(0, len(pcm), FRAMES_PER_PACKET):
+        for offset in fresh_offsets:
             presentation_us = chunk.presentation_us + offset * 1_000_000 // SAMPLE_RATE
             due_us = max(presentation_us - TARGET_LEAD_US, now_us)
             if previous_us is not None:
@@ -285,23 +348,19 @@ class PacedReference:
             previous_us = due_us
 
     def send_ready(self, now_us: int) -> None:
-        """Send at most one due RTP packet; skip audio past presentation.
+        """Discard all expired audio, then send at most one due RTP packet.
 
         Args:
             now_us:
                 Current host Unix time in microseconds.
 
         """
+        self._discard_expired(now_us)
         if not self.pending or self.pending[0].send_us > now_us:
             return
         packet = self.pending.popleft()
-        if packet.presentation_us < now_us:
-            self.expired += 1
-            if self.expired == 1 or self.expired % 100 == 0:
-                LOGGER.warning("reference.packet status=expired count=%d", self.expired)
-        else:
-            self.sender.send(packet.pcm, packet.presentation_us)
-            self.last_sent_us = now_us
+        self.sender.send(packet.pcm, packet.presentation_us)
+        self.last_sent_us = now_us
         if self.pending:
             self.pending[0].send_us = max(
                 self.pending[0].send_us, now_us + PACKET_DURATION_US
@@ -424,9 +483,7 @@ def forward_haec(path: Path, destination: tuple[str, int]) -> None:
                 paced.clear()
                 last_stream = chunk.stream_id
                 last_sequence = None
-                sender.ssrc = int.from_bytes(os.urandom(4), "big")
-                sender.last_report_us = 0
-                sender.first_packet = True
+                sender.new_stream()
                 LOGGER.info(
                     "reference.stream status=start generation=%d", chunk.stream_id
                 )

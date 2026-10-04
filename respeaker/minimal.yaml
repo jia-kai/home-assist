@@ -25,10 +25,15 @@ esphome:
             receiver->setup();
             hoast::debug_audio = new hoast::DebugAudio(id(i2s_mics), id(mww), id(internal_i2c));
             hoast::debug_audio->setup();
+            id(reference_gain_status).publish_state("pending");
             id(wake_route_status).publish_state("pending");
             id(wake_route_pending) = true;
 
 globals:
+  - id: reference_gain_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   - id: wake_route_pending
     type: bool
     restore_value: no
@@ -43,6 +48,10 @@ globals:
     initial_value: 'false'
 
 text_sensor:
+  - platform: template
+    id: reference_gain_status
+    name: AEC Reference Gain
+    update_interval: never
   - platform: template
     id: wake_route_status
     name: Wake Route
@@ -214,7 +223,19 @@ interval:
   - interval: 250ms
     then:
       - lambda: |-
-          if (id(wake_route_pending) && !id(wake_route_ready)) {
+          if (id(wake_route_pending) && !id(reference_gain_ready)) {
+            static unsigned tries = 0;
+            id(reference_gain_ready) = hoast::set_reference_unity_gain(id(internal_i2c));
+            if (id(reference_gain_ready)) {
+              id(reference_gain_status).publish_state("1.0");
+            } else if (++tries == 40) {
+              id(reference_gain_status).publish_state("error");
+              id(wake_route_status).publish_state("error");
+              ESP_LOGE("xmos_ctrl", "status=failed reason=reference_gain_timeout");
+            }
+          }
+          if (id(wake_route_pending) && id(reference_gain_ready) &&
+              !id(wake_route_ready)) {
             static unsigned tries = 0;
             id(wake_route_ready) = hoast::set_output_route(
                 id(internal_i2c), 19, ${wake_route_category}, ${wake_route_source});
@@ -223,7 +244,7 @@ interval:
               ESP_LOGE("xmos_ctrl", "status=failed reason=wake_route_timeout");
             }
           }
-          if (id(wake_route_pending) && id(wake_route_ready) &&
+          if (id(wake_route_pending) && id(reference_gain_ready) && id(wake_route_ready) &&
               !id(asr_route_ready)) {
             static unsigned tries = 0;
             id(asr_route_ready) = hoast::set_output_route(
@@ -233,7 +254,7 @@ interval:
               ESP_LOGE("xmos_ctrl", "status=failed reason=asr_route_timeout");
             }
           }
-          if (id(wake_route_pending) && id(wake_route_ready) &&
+          if (id(wake_route_pending) && id(reference_gain_ready) && id(wake_route_ready) &&
               id(asr_route_ready) && id(wake_route_status).state != "ready")
             id(wake_route_status).publish_state("ready");
   - interval: 10ms

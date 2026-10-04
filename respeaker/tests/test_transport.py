@@ -10,6 +10,9 @@ import pytest
 
 from respeaker.core.transport import (
     HAEC_HEADER,
+    MAX_PENDING_AUDIO_SECONDS,
+    MAX_PENDING_PACKETS,
+    PACKET_DURATION_US,
     RTCP_SR,
     RTP_HEADER,
     PacedReference,
@@ -95,6 +98,32 @@ def test_rtp_sequence_and_timestamps_continue_across_haec_chunks() -> None:
     finally:
         sender.socket.close()
         rtp.close()
+
+
+def test_new_rtp_stream_resets_sender_report_counters() -> None:
+    """Give each new SSRC its own RTP sequence and RTCP byte totals."""
+    rtp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rtcp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rtp.bind(("127.0.0.1", 0))
+    rtcp.bind(("127.0.0.1", rtp.getsockname()[1] + 1))
+    rtp.settimeout(1)
+    rtcp.settimeout(1)
+    sender = RtpSender(("127.0.0.1", rtp.getsockname()[1]), ssrc=42)
+    start_us = 1_750_000_000_000_000
+    try:
+        sender.send(np.zeros(480, dtype=np.int16), start_us)
+        rtp.recv(1024)
+        rtcp.recv(1024)
+        sender.new_stream()
+        sender.send(np.zeros(480, dtype=np.int16), start_us + 2_000_000)
+        _, marker, sequence, _, ssrc = RTP_HEADER.unpack_from(rtp.recv(1024))
+        assert (marker, sequence, ssrc) == (0x80, 0, sender.ssrc)
+        report = RTCP_SR.unpack(rtcp.recv(1024))
+        assert (report[3], report[7], report[8]) == (sender.ssrc, 1, 960)
+    finally:
+        sender.socket.close()
+        rtp.close()
+        rtcp.close()
 
 
 def test_parse_haec_rejects_wrong_frame_size_and_decodes_s24le() -> None:
@@ -194,13 +223,132 @@ def test_paced_reference_handles_late_burst_without_wifi_flood() -> None:
 
 
 def test_paced_reference_bounds_queued_audio(caplog: pytest.LogCaptureFixture) -> None:
-    """A large MA burst reports overflow without taking down the bridge."""
+    """Accept exactly five minutes of PCM, then reject overflow without mutation.
+
+    Args:
+        caplog:
+            Captures the warning for a chunk beyond the queue capacity.
+
+    """
     sender = RtpSender(("127.0.0.1", 5070))
     paced = PacedReference(sender)
     try:
-        chunk = ReferenceChunk(1, 1, 9_000_000, 48_000, np.zeros(801 * 480, np.float32))
-        paced.enqueue(chunk, 1_000_000)
-        assert not paced.pending
+        assert MAX_PENDING_AUDIO_SECONDS == 300
+        assert MAX_PENDING_PACKETS * PACKET_DURATION_US == 300_000_000
+        samples = np.zeros(48_000, np.float32)
+        for second in range(MAX_PENDING_AUDIO_SECONDS):
+            chunk = ReferenceChunk(
+                1, second, 9_000_000 + second * 1_000_000, 48_000, samples
+            )
+            paced.enqueue(chunk, 1_000_000)
+        assert len(paced.pending) == MAX_PENDING_PACKETS == 30_000
+        assert "reference.buffer status=overflow" not in caplog.text
+        first, last = paced.pending[0], paced.pending[-1]
+        extra = ReferenceChunk(1, 300, 309_000_000, 48_000, np.zeros(480, np.float32))
+        paced.enqueue(extra, 1_000_000)
+        assert len(paced.pending) == MAX_PENDING_PACKETS
+        assert paced.pending[0] is first
+        assert paced.pending[-1] is last
         assert "reference.buffer status=overflow" in caplog.text
     finally:
         sender.socket.close()
+
+
+def test_paced_reference_accepts_more_than_eight_seconds() -> None:
+    """Retain an MA burst exceeding eight seconds without altering send-ahead."""
+    sender = RtpSender(("127.0.0.1", 5070))
+    paced = PacedReference(sender)
+    try:
+        samples = np.zeros(9 * 48_000, np.float32)
+        paced.enqueue(ReferenceChunk(1, 1, 4_000_000, 48_000, samples), 1_000_000)
+        assert len(paced.pending) == 900
+        assert paced.pending[0].send_us == 1_000_000
+        assert paced.pending[-1].presentation_us == 12_990_000
+        assert paced.pending[-1].send_us == 9_990_000
+    finally:
+        sender.socket.close()
+
+
+def test_paced_reference_skips_stale_backlog_and_resumes_fresh_audio() -> None:
+    """Clear an expired backlog at once, then transmit fresh PCM on time."""
+    rtp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rtp.bind(("127.0.0.1", 0))
+    rtp.settimeout(0.1)
+    sender = RtpSender(("127.0.0.1", rtp.getsockname()[1]), ssrc=99)
+    paced = PacedReference(sender)
+    start_us = 1_750_000_000_000_000
+    stale = ReferenceChunk(
+        1, 1, start_us + 3_000_000, 48_000, np.zeros(800 * 480, np.float32)
+    )
+    fresh = ReferenceChunk(
+        1, 2, start_us + 12_010_000, 48_000, np.full(960, 0.5, np.float32)
+    )
+    try:
+        paced.enqueue(stale, start_us)
+        assert len(paced.pending) == 800
+        paced.enqueue(fresh, start_us + 12_000_000)
+        assert paced.expired == 800
+        assert len(paced.pending) == 2
+        paced.send_ready(start_us + 12_000_000)
+        assert (
+            RTP_HEADER.unpack_from(rtp.recv(1024))[3]
+            == (fresh.presentation_us * 48_000 // 1_000_000) & 0xFFFFFFFF
+        )
+        paced.send_ready(start_us + 12_000_000)
+        with pytest.raises(socket.timeout):
+            rtp.recv(1024)
+        paced.send_ready(start_us + 12_010_000)
+        assert (
+            RTP_HEADER.unpack_from(rtp.recv(1024))[3]
+            == ((fresh.presentation_us + 10_000) * 48_000 // 1_000_000) & 0xFFFFFFFF
+        )
+    finally:
+        sender.socket.close()
+        rtp.close()
+
+
+def test_paced_reference_expires_queued_audio_without_pacing_drops() -> None:
+    """Discard expired packets together instead of spending ten ms on each."""
+    sender = RtpSender(("127.0.0.1", 5070))
+    paced = PacedReference(sender)
+    start_us = 1_750_000_000_000_000
+    chunk = ReferenceChunk(
+        1, 1, start_us + 3_000_000, 48_000, np.zeros(500 * 480, np.float32)
+    )
+    try:
+        paced.enqueue(chunk, start_us)
+        paced.send_ready(start_us + 9_000_000)
+        assert paced.expired == 500
+        assert not paced.pending
+        assert paced.sender.packet_count == 0
+        assert paced.wait_seconds(start_us + 9_000_000) is None
+    finally:
+        sender.socket.close()
+
+
+def test_paced_reference_rebases_future_audio_after_expired_prefix() -> None:
+    """Catch up to a fresh queued packet without inheriting stale send times."""
+    rtp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rtp.bind(("127.0.0.1", 0))
+    rtp.settimeout(0.1)
+    sender = RtpSender(("127.0.0.1", rtp.getsockname()[1]), ssrc=42)
+    paced = PacedReference(sender)
+    start_us = 1_750_000_000_000_000
+    chunk = ReferenceChunk(
+        1, 1, start_us + 3_000_000, 48_000, np.zeros(500 * 480, np.float32)
+    )
+    try:
+        paced.enqueue(chunk, start_us)
+        for packet in paced.pending:
+            packet.send_us += 10_000_000
+        paced.send_ready(start_us + 6_990_000)
+        assert paced.expired == 399
+        assert len(paced.pending) == 100
+        assert paced.sender.packet_count == 1
+        rtp.recv(1024)
+        paced.send_ready(start_us + 6_990_000)
+        with pytest.raises(socket.timeout):
+            rtp.recv(1024)
+    finally:
+        sender.socket.close()
+        rtp.close()

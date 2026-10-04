@@ -62,7 +62,14 @@ port, and an NTP server on the IoT AP host. `arduino-cli` is not required.
 
    The ESP32 image embeds the official XMOS image and installs it over I²C if
    the reported version differs. Wait for `version=1.0.9` and
-   `wake_route=ready`. Ready means the ESP read back both output routes.
+   `wake_route=ready`. Ready means the ESP read back both output routes and
+   confirmed `AUDIO_MGR_REF_GAIN=1.0` (unity amplitude gain). The
+   `AEC Reference Gain` text sensor reports `pending`, `1.0`, or `error`;
+   startup retries transient I²C responses and reports a timeout after ten
+   seconds while continuing to retry. The gain is applied after DSP setup,
+   including any automatic update, without writing DSP configuration to flash.
+   The pinned 48 kHz master image matches the official current I²S release;
+   its MD5 is `b62766ccf8fbbaf924d0d13beace495b`.
 
 3. Root Docker Compose runs Hoast directly against `[satellite].host` and reads
    `ESPHOME_API_KEY` from root `.env`. It also starts the MA reference bridge,
@@ -131,7 +138,10 @@ backpressure cannot stall MA's Python audio loop. The bridge downmixes and
 resamples to 48 kHz L16, then sends **one RTP packet per 10 ms** about
 **three seconds before** its original presentation timestamp. If MA supplies
 less lead, the bridge sends at real-time speed. The queue reports overflow and
-expired audio rather than silently discarding it. RTCP sender reports map RTP
+expired audio rather than silently discarding it. The host queue holds at most
+**five minutes of PCM** (30,000 packets of at most 10 ms each); this capacity
+does not add playback latency or change the three-second send-ahead target.
+RTCP sender reports map RTP
 sample time to host time. The ESP synchronizes to host NTP and retains up to
 **4.2 seconds of future reference** in PSRAM. It feeds the XMOS I²S far-end
 input when each sample is due; the host pacing does not delay music playback.
