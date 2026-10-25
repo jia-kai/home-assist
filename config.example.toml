@@ -1,6 +1,6 @@
 # Copy to config.toml and replace both zero placeholders with your coordinates.
 # Optional custom OpenVINO export, relative to the working directory.
-# Omit this table to use the prepared cache manifest.
+# Omit this table to use the default prepared model.
 # [lfm]
 # model_dir = "models/openvino-int8"
 
@@ -23,7 +23,7 @@ ip = "192.168.42.20"
 [satellite]
 host = "127.0.0.1"
 port = 6053
-capture_seconds = 6.0 # Hard maximum; 600 ms trailing silence ends capture earlier.
-language = "auto" # Detect English or Chinese; near ties select English.
+capture_seconds = 6.0 # Hard maximum; 500 ms trailing silence ends capture earlier.
+language = "auto" # Detect the spoken language automatically.
 # For an encrypted ESPHome device, set this variable in .env or the environment.
 # key_env = "ESPHOME_API_KEY"

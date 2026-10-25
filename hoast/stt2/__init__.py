@@ -4,6 +4,8 @@ No FunASR runtime, framework checkpoint load, downloader or subprocess bridge is
 used. Prepare the pinned local checkpoint with tools/prepare_stt2.py first.
 Runtime supports complete utterances in one batch, without VAD or truncation.
 Attention is quadratic in utterance length; max_audio_seconds defaults to 60.
+Source rates must be integer 8000..192000 Hz with reduced resampling factors
+at most 4000, bounding both output expansion and polyphase FIR allocation.
 """
 
 import logging
@@ -39,6 +41,9 @@ LANGUAGE_IDS: dict[str, int] = {
     "ko": 12,
 }
 _METADATA = re.compile(r"<\|[^<>]*\|>")
+_MIN_SOURCE_RATE = 8000
+_MAX_SOURCE_RATE = 192000
+_MAX_RESAMPLE_FACTOR = 4000
 
 
 class FrameEngine(Protocol):
@@ -205,6 +210,18 @@ class STTConfig:
             Over-limit input raises before decoding files or resampling arrays;
             increase explicitly for deliberate longer diagnostics, never truncate.
 
+        max_input_samples:
+            Positive integer inclusive source scalar-sample budget. File frames
+            times channels are checked before decoding; mono arrays before scans.
+
+        max_output_tokens:
+            Positive integer inclusive collapsed nonblank CTC token budget,
+            including metadata tokens, checked before SentencePiece decoding.
+
+        max_output_chars:
+            Positive integer inclusive character budget for both raw decoded
+            text and canonical text; excess raises without truncating either.
+
         release_after_call:
             Release OpenVINO intermediate buffers after success or failure while
             retaining weights. ONNX Runtime rejects this option.
@@ -235,6 +252,15 @@ class STTConfig:
     release_after_call: bool = False
     """Release OpenVINO intermediate storage after each call, retaining model weights."""
 
+    max_input_samples: int = 2_880_000
+    """Inclusive source scalar-sample limit, including every file channel."""
+
+    max_output_tokens: int = 1024
+    """Inclusive collapsed nonblank CTC token limit before tokenizer decoding."""
+
+    max_output_chars: int = 4096
+    """Inclusive raw and canonical Unicode character limit; excess is rejected."""
+
     def __post_init__(self) -> None:
         """Reject invalid settings instead of falling back to another language/backend."""
         if not isinstance(self.model_path, Path):
@@ -252,6 +278,10 @@ class STTConfig:
             raise TypeError("max_audio_seconds must be a number")
         if not math.isfinite(self.max_audio_seconds) or self.max_audio_seconds <= 0:
             raise ValueError("max_audio_seconds must be finite and positive")
+        for name in ("max_input_samples", "max_output_tokens", "max_output_chars"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
 
 
 class STT:
@@ -280,13 +310,13 @@ class STT:
     """Allowed process CPU IDs selected by the shared one/two-core budget helper."""
 
     last_raw_text: str | None
-    """Most recent SentencePiece output including metadata; None before a decode."""
+    """Bounded successful SentencePiece output; cleared when a new request starts."""
 
     last_timings: dict[str, float]
-    """Last successful call's validation/resample/frontend/inference/decode/total seconds."""
+    """Successful call's stage seconds; cleared when a new request starts."""
 
     last_profile: list[NodeProfile]
-    """OpenVINO's latest counters or ORT's finalized session nodes; [] when disabled."""
+    """Successful call's counters or finalized ORT nodes; cleared on a new request."""
 
     _lock: RLock
     """Reentrant lock serializing each instance's complete transcription and release."""
@@ -355,22 +385,41 @@ class STT:
 
         Multi-channel files are averaged to mono in float32 and resampled to
         16 kHz. No VAD, truncation or silence heuristic changes the model input.
-        File frame/rate metadata is checked against max_audio_seconds before
-        allocating decoded audio. Decoded duration is checked again downstream.
+        File frame/rate metadata and frames times channels are checked against
+        duration and scalar-sample limits before decoding. Decoded geometry is
+        checked before averaging. Starting a request clears prior audit outputs.
+        Source rates must be 8000..192000 Hz and both reduced factors for
+        resampling to 16000 Hz must be at most 4000, checked before file decoding.
 
         Args:
             path:
                 Existing WAV, FLAC, OGG or another format supported by libsndfile.
+                Its source rate must satisfy the supported resampling bounds.
 
         """
         with self._lock:
             self._ensure_open()
+            self._clear_audit()
             started = time.perf_counter()
             if not path.is_file():
                 raise FileNotFoundError(path)
             metadata = sf.info(path)
             self._validate_duration(metadata.frames, metadata.samplerate)
+            if (
+                type(metadata.channels) is not int
+                or not 1 <= metadata.channels <= self.config.max_input_samples
+            ):
+                raise ValueError(
+                    "STT2 audio channels must be a bounded positive integer"
+                )
+            self._validate_input_samples(metadata.frames * metadata.channels)
             samples, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+            if (
+                samples.shape != (metadata.frames, metadata.channels)
+                or sample_rate != metadata.samplerate
+            ):
+                raise ValueError("STT2 decoded audio does not match file metadata")
+            self._validate_input_samples(samples.size)
             mono = np.asarray(samples.mean(axis=1, dtype=np.float32), dtype=np.float32)
             decoded = time.perf_counter()
             result = self.transcribe_samples(mono, int(sample_rate))
@@ -383,24 +432,52 @@ class STT:
         if self._closed:
             raise RuntimeError("STT2 recognizer is closed")
 
-    def _validate_duration(self, frame_count: int, sample_rate: int) -> None:
-        """Reject invalid metadata and source duration above the inclusive limit.
+    def _clear_audit(self) -> None:
+        """Drop prior text, timings and counters before accepting a new request."""
+        self.last_raw_text = None
+        self.last_timings = {}
+        self.last_profile = []
 
-        This constant-time check runs before full-array scans, resampling and
-        feature extraction. It never changes or truncates the supplied audio.
+    def _validate_input_samples(self, sample_count: int) -> None:
+        """Reject source scalar-sample counts above the inclusive allocation budget.
+
+        Args:
+            sample_count:
+                Total source samples across all channels, before resampling.
+
+        """
+        if sample_count > self.config.max_input_samples:
+            raise ValueError(
+                f"STT2 source samples {sample_count} exceeds "
+                f"max_input_samples={self.config.max_input_samples}"
+            )
+
+    def _validate_duration(self, frame_count: int, sample_rate: int) -> None:
+        """Reject unsupported resampling geometry and excessive source duration.
+
+        Cheap scalar checks run before file decoding, full-array scans,
+        resampling and feature extraction. The rate range bounds output
+        expansion to 2x; reduced factors bound polyphase FIR filter allocation.
+        Supplied audio is never changed or truncated.
 
         Args:
             frame_count:
                 Number of source audio frames (samples per channel), nonnegative.
 
             sample_rate:
-                Positive integer source sampling rate in Hz.
+                Exact integer source sampling rate, inclusive 8000..192000 Hz.
+                Reduced up/down factors to 16000 Hz must each be at most 4000.
 
         """
         if type(frame_count) is not int or frame_count < 0:
             raise ValueError("STT2 audio frame count must be a nonnegative integer")
         if type(sample_rate) is not int or sample_rate <= 0:
             raise ValueError("STT2 sample_rate must be a positive integer")
+        if not _MIN_SOURCE_RATE <= sample_rate <= _MAX_SOURCE_RATE:
+            raise ValueError("STT2 sample_rate must be in [8000,192000] Hz")
+        divisor = math.gcd(sample_rate, SAMPLE_RATE)
+        if max(SAMPLE_RATE // divisor, sample_rate // divisor) > _MAX_RESAMPLE_FACTOR:
+            raise ValueError("STT2 reduced resampling factors must be at most 4000")
         duration = frame_count / sample_rate
         if duration > self.config.max_audio_seconds:
             raise ValueError(
@@ -413,17 +490,20 @@ class STT:
 
         Cleanup runs under the inference lock after outputs and counters are
         copied. Successful timing totals include cleanup; weights remain loaded.
+        Starting a request clears prior audit outputs, including on failure.
 
         Args:
             samples:
                 Nonempty finite mono float32 waveform shaped (samples,).
 
             sample_rate:
-                Positive integer source sampling rate in Hz.
+                Exact integer source rate in 8000..192000 Hz with reduced
+                resampling factors at most 4000; checked before scanning samples.
 
         """
         with self._lock:
             self._ensure_open()
+            self._clear_audit()
             started = time.perf_counter()
             try:
                 text = self._transcribe_samples(samples, sample_rate)
@@ -457,8 +537,10 @@ class STT:
         resampled samples (25 ms) are required; shorter/empty input raises
         ValueError explicitly. All input audio is retained; silence can decode
         to metadata only, returning an empty canonical string.
-        Duration above max_audio_seconds raises before scanning sample values,
-        resampling or frontend/inference work; the limit is inclusive.
+        Source samples and duration are bounded before scanning values or
+        resampling. Collapsed tokens are bounded before decoding; raw and
+        canonical text are both bounded before retention. Limits are inclusive
+        and excess raises rather than truncates.
 
         Args:
             samples:
@@ -466,8 +548,9 @@ class STT:
                 in [-1,1]; caller must not mutate it while inference is running.
 
             sample_rate:
-                Positive integer input sample rate in Hz; polyphase resampling
-                converts other rates to 16000 Hz before feature extraction.
+                Exact integer input rate in 8000..192000 Hz with reduced
+                resampling factors at most 4000. Polyphase resampling converts
+                supported rates to 16000 Hz before feature extraction.
 
         """
         with self._lock:
@@ -480,6 +563,7 @@ class STT:
             if samples.dtype != np.float32 or samples.ndim != 1 or not samples.size:
                 raise ValueError("STT2 samples must be a nonempty mono float32 array")
             self._validate_duration(samples.shape[0], sample_rate)
+            self._validate_input_samples(samples.size)
             if not np.isfinite(samples).all():
                 raise ValueError("STT2 samples must contain only finite values")
             validated = time.perf_counter()
@@ -507,9 +591,15 @@ class STT:
             if frame_ids.shape != (features.shape[0] + 4,):
                 raise ValueError("STT2 engine returned an incorrect number of frames")
             ids = collapse_ctc(frame_ids)
+            if len(ids) > self.config.max_output_tokens:
+                raise ValueError("STT2 output exceeds max_output_tokens")
             raw = tokenizer.decode(ids)
-            self.last_raw_text = raw
+            if len(raw) > self.config.max_output_chars:
+                raise ValueError("STT2 raw output exceeds max_output_chars")
             text = canonical_text(raw)
+            if len(text) > self.config.max_output_chars:
+                raise ValueError("STT2 canonical output exceeds max_output_chars")
+            self.last_raw_text = raw
             completed = time.perf_counter()
             self.last_profile = profile
             self.last_timings = {

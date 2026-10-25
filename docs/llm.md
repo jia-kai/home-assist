@@ -2,6 +2,44 @@
 
 ## Models and setup
 
+### Memory boundaries and request budgets
+
+Explicit `--memory-reclaim` runs Python cycle collection and supported
+process-allocator `malloc_trim(0)` before and after each serialized LLM call.
+It is disabled by default to avoid latency increases. This retains the
+model and live native/GPU buffers; it is not a GenAI cache-release API or a
+guarantee of lower RSS. Optional RSS/cgroup counters and before/after byte counts,
+GC/trim outcomes and elapsed seconds are written to the normal diagnostic log.
+`memory.events:max` indicates limit-pressure attempts, not OOM kills.
+
+Standalone `LFMConfig`/`LLMConfig` default to `reclaim_after_call=False`; explicitly
+set it to `True` for the same two-boundary policy. Garbage collection and trimming
+add latency; `Generation.elapsed_seconds` excludes that boundary overhead.
+Completed results own their text/call data before cleanup. On failure, unwound
+exception-frame locals are cleared to release temporary arrays while preserving
+exception messages, stack locations, cause/context links and notes.
+
+The application bounds each LLM call to `--max-new-tokens 384` and
+`--max-context-tokens 4096` by default. The context budget includes the prompt and
+reserved output tokens. Library output defaults to 128 tokens. Both model APIs
+also enforce `max_prompt_chars=32768` before tokenization and
+`max_output_chars=8192` before parsing; the application uses a 4096-character
+output budget. Requests outside these budgets raise rather than truncate, and
+generation reaching its token limit is rejected as potentially partial tool
+syntax. Streamed fragments remain provisional until final validation.
+
+Voice mode separately logs cheap `memory.usage` observations at transcription,
+agent and synthesis boundaries, after turn history is discarded, and every
+60 seconds, including idle periods. The periodic `voice.idle` label is not a
+busy-state predicate; correlate command events before attributing idle growth.
+These observations never collect cycles, trim heaps,
+scan mappings or retain samples. They include process RSS, charged cgroup memory,
+anonymous/anonymous-huge-page/shared/file counters, OOM events and Python
+allocation counts. Sampling time is logged; cgroup numbers include charged cache
+and are not interchangeable with process RSS. The idle monitor is canceled and
+joined before speech-owner cleanup. This captures sparse multi-day growth
+without enabling the higher-latency reclamation experiment.
+
 ### Selected bounded-CPU configuration
 
 The interactive CLI uses `--threads auto`: **GPU = one CPU core, CPU = two**.

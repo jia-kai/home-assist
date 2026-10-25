@@ -107,6 +107,15 @@ checked again after decoding. Inputs are never truncated. Set a larger explicit
 limit for deliberate long-utterance diagnostics; attention memory/time remain
 quadratic, and the duration guard is not a fixed RAM cap.
 
+The independent source sample budget, `max_input_samples=2_880_000`, counts
+frames times channels for files and mono samples for array inputs. Source rates
+must be integer 8,000–192,000 Hz, and reduced resampling up/down factors must each
+be at most 4,000; common 44,100/48,000-Hz rates are supported. Validation precedes
+file decoding or array scanning/resampling to bound both decoded data and FIR
+filter allocation. `max_output_tokens=1024` bounds collapsed CTC IDs, including
+metadata, before token decoding. `max_output_chars=4096` independently bounds raw
+and canonical strings. All limits are inclusive and reject rather than truncate.
+
 The engine owns one synchronous request and one inference stream. CPU compilation
 requests latency mode, FP32 inference and exactly one or two inference threads.
 `backend="GPU"` explicitly selects an experimental GPU candidate with the same

@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
@@ -17,6 +17,7 @@ from .lights import LightClient
 from .llm import DEFAULT_CACHE, FunctionGemma, LLMConfig, Tool, ToolRegistry
 from .llm import SYSTEM_PROMPT as FUNCTION_ACTIVATION
 from .logging import configure_logging, get_logger
+from .memory import log_memory_usage
 from .music import MusicClient
 from .runtime import configure_cpu_budget
 from .session import Session
@@ -45,6 +46,9 @@ def prepare_voice(
     Both speech engines receive the same one/two-thread process budget as LLM.
     Voice synthesis uses 0.85x speed for startup speech and spoken replies;
     standalone synthesis/benchmark defaults are unchanged.
+    Voice TTS accepts at most 400 input characters and produces at most 30 seconds
+    of audio. STT permits 15 seconds or the configured capture maximum, whichever
+    is larger, and rejects more than 256 CTC tokens or 512 decoded characters.
     Artifact overrides are explicit; missing artifacts fail without downloads or
     backend fallback. Startup failure releases every constructed speech engine.
 
@@ -80,6 +84,8 @@ def prepare_voice(
                 else tts_model_dir,
                 threads=threads,
                 speed=0.85,
+                max_input_chars=400,
+                max_audio_seconds=30.0,
             )
         )
         cleanup.callback(tts.close)
@@ -91,6 +97,9 @@ def prepare_voice(
                 threads=threads,
                 language=None if config.language == "auto" else config.language,
                 backend=stt_backend,
+                max_audio_seconds=max(15.0, config.capture_seconds),
+                max_output_tokens=256,
+                max_output_chars=512,
             )
         )
         cleanup.callback(stt.close)
@@ -98,6 +107,17 @@ def prepare_voice(
         application.warmup()
         cleanup.pop_all()
         return application
+
+
+async def _monitor_memory_usage() -> None:
+    """Sample counters every 60 seconds, including silence, until owner cancellation.
+
+    Run on the event loop: these small counter reads do not submit inference work,
+    spawn threads, retain samples, or touch models.
+    """
+    while True:
+        await asyncio.sleep(60)
+        log_memory_usage("voice.idle")
 
 
 async def run_voice(
@@ -113,6 +133,9 @@ async def run_voice(
     tts_model_dir: Path | None = None,
 ) -> None:
     """Warm and run the native voice pipeline with one serialized inference worker.
+
+    Own one periodic counter-only monitor after startup; cancel and join it before
+    releasing speech resources on listener completion, failure, or cancellation.
 
     Args:
         assistant:
@@ -160,12 +183,17 @@ async def run_voice(
             ),
         )
         application: VoiceApplication | None = None
+        memory_monitor: asyncio.Task[None] | None = None
         try:
             try:
                 application = await asyncio.shield(future)
             except asyncio.CancelledError:
                 application = await future
                 raise
+            log_memory_usage("voice.startup")
+            memory_monitor = asyncio.create_task(
+                _monitor_memory_usage(), name="voice-memory-monitor"
+            )
 
             async def transcribe(pcm: bytes) -> str:
                 """Run STT without blocking native API keepalives.
@@ -201,8 +229,14 @@ async def run_voice(
                 replay_tts=application.tts,
             )
         finally:
-            if application is not None:
-                await loop.run_in_executor(worker, application.close)
+            try:
+                if memory_monitor is not None:
+                    memory_monitor.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await memory_monitor
+            finally:
+                if application is not None:
+                    await loop.run_in_executor(worker, application.close)
 
 
 def main() -> None:
@@ -282,6 +316,17 @@ def main() -> None:
         default=384,
         help="Maximum generated tokens per model call",
     )
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=4096,
+        help="Maximum prompt plus reserved output tokens; oversized requests fail",
+    )
+    parser.add_argument(
+        "--memory-reclaim",
+        action="store_true",
+        help="Opt into full Python GC/heap trimming at LLM boundaries; adds latency",
+    )
     args = parser.parse_args()
     if args.text and args.debug_audio:
         parser.error("--debug-audio requires voice mode, without --text")
@@ -316,6 +361,9 @@ def main() -> None:
                 LLMConfig.from_cache(args.cache, threads=threads, device=args.device),
                 system_prompt=FUNCTION_ACTIVATION + ". " + SYSTEM_PROMPT,
                 max_new_tokens=args.max_new_tokens,
+                max_context_tokens=args.max_context_tokens,
+                max_output_chars=4096,
+                reclaim_after_call=args.memory_reclaim,
             )
             model = FunctionGemma(settings, tools)
         else:
@@ -334,6 +382,9 @@ def main() -> None:
                 ),
                 system_prompt=SYSTEM_PROMPT,
                 max_new_tokens=args.max_new_tokens,
+                max_context_tokens=args.max_context_tokens,
+                max_output_chars=4096,
+                reclaim_after_call=args.memory_reclaim,
             )
             model = LFM2(settings_lfm, tools)
         with model:

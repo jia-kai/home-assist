@@ -30,7 +30,19 @@ DEFAULT_MODEL = Path("models/tts2")
 
 @dataclass(slots=True, frozen=True)
 class TTSConfig:
-    """Prepared native Melo artifacts and explicit CPU/backend controls."""
+    """Prepared native Melo artifacts and explicit CPU/backend controls.
+
+    Args:
+        max_input_chars:
+            Positive integer inclusive raw Unicode character limit, checked
+            before stripping, speech preparation or loading language resources.
+
+        max_audio_seconds:
+            Finite positive inclusive generated duration in seconds, including
+            each segment's trailing speed-adjusted gap. Excess is rejected
+            before frame expansion, flow, decoder or retained audio allocation.
+
+    """
 
     model_path: Path = DEFAULT_MODEL
     """Root containing separate EN/ZH graphs, tokenizers and frontend resources."""
@@ -83,6 +95,12 @@ class TTSConfig:
     release_after_call: bool = False
     """Release all loaded stage intermediates after synthesis, retaining weights."""
 
+    max_input_chars: int = 4000
+    """Inclusive raw Unicode character budget before text preparation/model load."""
+
+    max_audio_seconds: float = 30.0
+    """Inclusive waveform duration in seconds, including all inter-segment/end gaps."""
+
     def __post_init__(self) -> None:
         """Reject invalid resource, precision-independent synthesis and RNG settings."""
         if type(self.threads) is not int or self.threads not in (1, 2):
@@ -112,6 +130,12 @@ class TTSConfig:
             raise ValueError("max_segments must be a positive integer")
         if type(self.max_phone_positions) is not int or self.max_phone_positions < 1:
             raise ValueError("max_phone_positions must be a positive integer")
+        if type(self.max_input_chars) is not int or self.max_input_chars < 1:
+            raise ValueError("max_input_chars must be a positive integer")
+        if type(self.max_audio_seconds) not in (int, float):
+            raise TypeError("max_audio_seconds must be a number")
+        if not math.isfinite(self.max_audio_seconds) or self.max_audio_seconds <= 0:
+            raise ValueError("max_audio_seconds must be finite and positive")
         if not self.voice or not self.chinese_voice:
             raise ValueError("Speaker names must be nonempty")
 
@@ -255,7 +279,7 @@ class TTS:
     """Validated graph, voice, noise and CPU budget configuration."""
 
     last_timings: dict[str, Any]
-    """Last full synthesis stage wall times, geometry and optional per-node counters."""
+    """Successful synthesis stage metrics; cleared when a new request starts."""
 
     _core: ov.Core | None
     """Shared core, absent for playback-only instances or after cleanup."""
@@ -426,15 +450,19 @@ class TTS:
         All stages finish consuming borrowed tensors before cleanup runs under
         the inference lock. Cleanup also runs after failures; weights stay loaded.
         Successful timing totals include release, but exclude audio playback.
+        Starting a request clears previous timing and geometry snapshots.
 
         Args:
             text:
                 Nonempty speakable text; Han-containing speech uses the ZH frontend.
+                Raw Unicode characters must fit config.max_input_chars; excess
+                raises before stripping, preparation or language resource loading.
 
         """
         with self._lock:
             if self._closed or self._playback_only:
                 raise RuntimeError("TTS is closed or playback-only")
+            self.last_timings = {}
             started = time.perf_counter()
             try:
                 result = self._synthesize(text)
@@ -479,13 +507,20 @@ class TTS:
     def _synthesize(self, text: str) -> tuple[NDArray[np.float32], int]:
         """Return native-rate mono FP32 speech with language routing and explicit noise.
 
+        Cumulative generated frames and waveform duration, including each
+        trailing gap, are checked before expanding the current segment's priors.
+        All limits reject excess instead of truncating speech.
+
         Args:
             text:
                 Nonempty speakable text; Han-containing speech uses the ZH mixed frontend.
+                Raw character length is bounded before stripping or preparation.
         """
         with self._lock:
             if self._closed or self._playback_only:
                 raise RuntimeError("TTS is closed or playback-only")
+            if len(text) > self.config.max_input_chars:
+                raise ValueError("Text exceeds max_input_chars")
             if not text.strip():
                 raise ValueError("text must be nonempty")
             started = time.perf_counter()
@@ -502,6 +537,7 @@ class TTS:
             rng = np.random.default_rng(self.config.seed)
             parts = []
             total_frames = 0
+            total_samples = 0
             sentences = resources.frontend.split(text)
             if len(sentences) > self.config.max_segments:
                 raise ValueError("Utterance exceeds the configured segment limit")
@@ -573,14 +609,24 @@ class TTS:
                 durations = np.ceil(
                     np.exp(log_duration.reshape(-1)) / self.config.speed
                 ).astype(np.int64)
-                expanded_mean, expanded_log_scale = expand_prior(
-                    mean, log_scale, durations, self.config.max_frames
-                )
-                total_frames += expanded_mean.shape[-1]
+                segment_frames = sum(int(value) for value in durations)
+                if not 0 < segment_frames <= self.config.max_frames:
+                    raise ValueError(
+                        f"Generated frames {segment_frames} outside "
+                        f"[1,{self.config.max_frames}]"
+                    )
+                total_frames += segment_frames
                 if total_frames > self.config.max_total_frames:
                     raise ValueError(
                         "Utterance exceeds the configured total-frame limit"
                     )
+                gap_samples = int(resources.rate * 0.05 / self.config.speed)
+                total_samples += segment_frames * resources.hop + gap_samples
+                if total_samples / resources.rate > self.config.max_audio_seconds:
+                    raise ValueError("Utterance exceeds max_audio_seconds")
+                expanded_mean, expanded_log_scale = expand_prior(
+                    mean, log_scale, durations, self.config.max_frames
+                )
                 epsilon = rng.standard_normal(expanded_mean.shape, dtype=np.float32)
                 latent = (
                     expanded_mean
@@ -605,10 +651,7 @@ class TTS:
                 parts.extend(
                     (
                         output.reshape(-1).copy(),
-                        np.zeros(
-                            int(resources.rate * 0.05 / self.config.speed),
-                            dtype=np.float32,
-                        ),
+                        np.zeros(gap_samples, dtype=np.float32),
                     )
                 )
                 profile: dict[str, Any] = {
@@ -654,6 +697,9 @@ class TTS:
             if not parts:
                 raise ValueError("Text produced no speakable segments")
             audio = np.concatenate(parts)
+            assert audio.size == total_samples, (
+                "Waveform/predicted sample count mismatch"
+            )
             if not np.isfinite(audio).all():
                 raise RuntimeError("Melo returned nonfinite audio")
             elapsed = time.perf_counter() - started

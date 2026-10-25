@@ -59,6 +59,31 @@ provenance. Runtime performs no download. Whisper, CTranslate2 and Kokoro are
 not application dependencies. ONNX Runtime also serves the optional STT2
 community backend.
 
+## Speech size budgets
+
+Voice recognition permits at most 15 seconds or the configured capture maximum,
+whichever is larger, so bilingual startup clips can still be checked. It rejects
+more than 256 collapsed CTC tokens (including model metadata) or 512 decoded
+characters. Normal satellite capture remains bounded separately by
+`satellite.capture_seconds`.
+
+Standalone STT defaults to 60 seconds and 2,880,000 source scalar samples;
+file samples count frames times channels before decoding. It accepts source
+rates from 8,000 through 192,000 Hz, with reduced polyphase resampling factors
+at most 4,000. These checks bound file/array and filter allocations before scans,
+decoding or resampling. Output defaults to 1,024 collapsed tokens and 4,096 raw
+or canonical characters. All budgets reject oversize input/output without
+truncating potentially action-bearing text.
+
+Voice TTS accepts at most 400 raw input characters; standalone synthesis accepts
+4,000. Both default to 30 seconds of output audio, including every inter-segment
+and trailing gap at the selected speed. Predicted duration and total latent
+frames are checked before expansion, flow and decoder work for each segment.
+The existing segment, phone-position, BERT-token and per-segment frame limits
+remain additional guards. Slower speech can exceed the audio budget and is
+rejected rather than cut short. These are size bounds, not a fixed whole-process
+RAM cap.
+
 ## Evidence and development
 
 - [Native architecture, pinned resources and preparation](speech2-native.md)

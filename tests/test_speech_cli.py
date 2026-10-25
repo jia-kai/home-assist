@@ -59,10 +59,14 @@ def test_prepare_voice_backend(
     assert settings.backend == ("cpu" if backend is None else backend)
     assert settings.model_path == Path("models/stt2")
     assert settings.threads == 2 and settings.language is None
+    assert settings.max_audio_seconds == 15.0
+    assert settings.max_output_tokens == 256 and settings.max_output_chars == 512
     tts_settings = tts_factory.call_args.args[0]
     assert tts_settings.model_path == Path("models/tts2")
     assert tts_settings.threads == 2 and tts_settings.backend == "cpu"
     assert tts_settings.speed == 0.85
+    assert tts_settings.max_input_chars == 400
+    assert tts_settings.max_audio_seconds == 30.0
     assert not settings.release_after_call
     assert not tts_settings.release_after_call
     assert result is application
@@ -126,9 +130,13 @@ def test_run_voice_backend(
     application.respond.assert_not_called()
 
 
+@pytest.mark.parametrize("reclaim", [False, True])
 @pytest.mark.parametrize("backend", [None, "cpu", "GPU", "ort"])
 def test_assistant_cli_backend(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, backend: Backend | None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    backend: Backend | None,
+    reclaim: bool,
 ) -> None:
     """Parse STT selection independently of the unchanged LLM device/model defaults.
 
@@ -141,6 +149,9 @@ def test_assistant_cli_backend(
 
         backend:
             Explicit backend, or None to exercise the omitted CPU default.
+
+        reclaim:
+            Default disabled cleanup or explicit boundary-reclamation opt-in.
 
     """
     config_path = tmp_path / "config.toml"
@@ -164,6 +175,8 @@ def test_assistant_cli_backend(
     argv = ["hoast", "--config", str(config_path), "--cache", str(tmp_path)]
     if backend is not None:
         argv.extend(["--stt-backend", backend])
+    if reclaim:
+        argv.append("--memory-reclaim")
     monkeypatch.setattr("sys.argv", argv)
     llm_cli.main()
     runner.assert_awaited_once()
@@ -176,6 +189,10 @@ def test_assistant_cli_backend(
     assert runner.call_args.args[3] == tmp_path
     settings = model_factory.call_args.args[0]
     assert settings.device == "GPU" and settings.threads == 2
+    assert settings.reclaim_after_call is reclaim
+    assert settings.max_context_tokens == 4096
+    assert settings.max_new_tokens == 384
+    assert settings.max_output_chars == 4096
     function_factory.assert_not_called()
     budget.assert_called_once_with(2)
 

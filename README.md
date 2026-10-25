@@ -1,569 +1,238 @@
-# Home Assistant
+# Hoast
 
-A local home assistant with tool-based actions and grounded answers. It runs
-LFM2.5-350M through OpenVINO on Intel GPU by default, with CPU execution available.
+A local home assistant for weather, music and light control, with English and
+Chinese voice support. Language and speech models run on your machine; weather
+requests and music services still need network access.
+
+Hoast uses LFM2.5 for language, SenseVoiceSmall for recognition, and MeloTTS for
+speech. The language model uses an Intel GPU by default, with a CPU option.
+Speech runs on the CPU.
+
+## What you can ask
+
+- “What's the weather today?” or “Will it rain in Seattle tomorrow?”
+- “Play some music,” “stop music,” or “next song.”
+- “Play Blue in Green by Miles Davis.”
+- “Set music volume to 30 percent.”
+- “Turn on the light” or “关灯。”
+
+Music requires Music Assistant; light control requires a compatible Kasa relay.
+These integrations are optional. Weather uses Celsius and defaults to your home
+location. Small local models can misunderstand requests, so check the result of
+important actions.
 
 ## Setup
 
-This is a source-tree development project. The bootstrap installs
-[uv](https://docs.astral.sh/uv/) into user-local storage if needed, installs Python
-3.14 and the locked dependencies into `.venv`, and prepares LFM2.5 plus native
-SenseVoiceSmall STT and English/Chinese MeloTTS. All speech runtime and preparation
-use the same Python 3.14 environment; no speech worker environment is provisioned.
+Run commands from the project root. The current bootstrap targets Linux with:
+
+- Bash, Git, `taskset`, and a running systemd user manager.
+- An Intel GPU with a working OpenCL driver. Preparation compiles GPU models even
+  if you intend to use CPU inference afterward.
+- At least **7 GiB of available RAM** during model preparation, plus disk space
+  for dependencies and models.
+- Internet access for the initial downloads, and curl or wget if uv is missing.
+
+### 1. Prepare the models
 
 ```sh
 ./prepare.sh
-# Also prepare the optional gated FunctionGemma model, after obtaining HF access:
-./prepare.sh --with-functiongemma
-# No network: cached uv/Python/dependencies, prepared LFM selection and speech inputs:
-./prepare.sh --offline
 ```
 
-The script can be invoked from another directory and always prepares this checkout.
-It validates pinned inputs, reuses `.cache/speech-bench/models/` and `source/` when
-available, and fetches missing speech inputs into `models/speech2-inputs/`.
-It prepares LFM's GPU/CPU caches and exports native speech graphs serially with
-at most two CPU cores and a 4 GiB memory cap. Default speech artifacts are FP32
-OpenVINO STT at `models/stt2` and decoder-only FP16 Melo at
-`models/tts2/{EN,ZH}` (BERT/encoder/flow remain FP32). The qualified default
-speech policy is CPU with two threads, independent of the LLM's `--device GPU`.
-Explicit `--tts-precision FP32` uses the separate `models/tts2-fp32` root.
-Preparation includes Melo's
-original-source numerical gates, **not** a speech latency benchmark, inference
-smoke test, or broad recognition/perceptual qualification. Missing offline inputs
-fail with durable diagnostics rather than claiming readiness.
+This installs uv if needed, creates a Python 3.14 environment in `.venv`, and
+prepares the language, speech and voice-activity models. It does not configure or
+start services.
 
-Existing artifact targets are **never replaced**. On a repeat run, select fresh
-`--stt-output` and `--tts-output` roots, or use already prepared roots directly in
-the application. `./prepare.sh --help` lists explicit source/resource, artifact,
-backend and precision options. Full bootstrap/stage logs are saved under
-`.cache/hoast/diagnostics/prepare/`; standalone input-fetch failures also have
-unique logs under `.cache/hoast/diagnostics/fetch-speech2/`.
+**Prepare once.** If your models are already prepared, skip this step. Existing
+model outputs are not overwritten; use fresh output paths for a new export.
+For offline setup, other models and custom paths, see the
+[speech preparation guide](docs/speech2-native.md) and
+[language model guide](docs/llm.md).
 
-Prerequisites are Linux, Bash, git, `systemd-run`/`systemctl` with
-a running user manager, `taskset`, and a working Intel OpenCL driver for UHD 630
-(LFM GPU preparation). The resource guard requires at least 7 GiB available memory
-before each model step. Network access is needed for missing dependencies/models;
-bootstrapping uv also needs curl or wget. `--offline` disables uv/HF/speech input
-network access and requires uv already on PATH, plus a prior LFM
-`models/lfm/model.json` selection and its local artifacts (and
-`models/functiongemma/model.json` for optional offline FunctionGemma). The online LLM
-download commands resolve Hugging Face metadata, so offline bootstrap reuses
-these selections instead of invoking them. System packages, services,
-containers and configuration files are not modified or started.
-If uv was newly installed, add its directory (normally `$HOME/.local/bin`) to your
-shell's PATH before using the `uv` commands below. The bootstrap adjusts PATH for
-its own run without editing shell startup files.
+### 2. Configure your home
 
-Other commands below run from the project root. Permanent models, pinned speech
-preparation inputs and selection manifests live in `models/`; disposable
-downloads, compilation caches and logs live in `.cache/hoast/`. Deleting `.cache`
-does not remove prepared runtime models.
-Alternative models and backend details are covered in
-[docs/llm.md](docs/llm.md).
-
-Copy the example configuration, then set your home coordinates in decimal degrees:
+For a new installation:
 
 ```sh
 cp config.example.toml config.toml
 ```
 
-`config.toml` is gitignored. Configure the optional `[music]` table as described
-below, or remove it to disable music integration.
+Edit `config.toml`:
 
-The required `[weather]` table accepts finite numeric WGS84 `latitude` (−90 to 90)
-and `longitude` (−180 to 180). Replace the example coordinates with your own.
-Unknown configuration keys are rejected.
+- Set `[weather].latitude` and `longitude` to your home coordinates.
+- Remove `[music]` unless you have configured Music Assistant below.
+- Remove `[switch]` unless you have configured your Kasa relay below.
+- For voice mode, set `[satellite].host` to your voice satellite's address.
+  Text mode does not require a satellite.
 
-## Run
+Keep existing configuration when upgrading. `config.toml` and local secret files
+are gitignored; never put access tokens or API keys in the TOML file.
 
-```sh
-uv run python -m hoast --config config.toml
-# Use CPU instead of the default Intel GPU:
-uv run python -m hoast --config config.toml --device CPU
-# Explicit keyboard/text mode:
-uv run python -m hoast --config config.toml --text
-```
-
-### Containers
-
-The root Compose file starts Music Assistant and Hoast. The reSpeaker AEC
-reference bridge service is commented out; uncomment its block in
-`docker-compose.yaml` to enable it explicitly. Hoast connects directly to the
-reSpeaker ESPHome API configured in root `config.toml`; the encrypted API key comes from root `.env` through
-`satellite.key_env`. The bridge reads the device address and MA player ID from
-the same config, then binds that player's socket in the shared
-`$HOME/music-data/aec-reference/` directory. Both services use the Hoast image
-and run as UID/GID `1000:1000`. The source tree and model cache are mounted;
-PipeWire is forwarded from `/run/user/1000` for Hoast's system audio output.
-Hoast has a 5.5 GiB memory limit for native SenseVoice/Melo and the GPU LLM, and
-uses host CPUs 4–5 with bounded two-worker inference pools. Adjust `cpuset` for
-hosts with a different CPU layout. The bridge is not required for host-side
-capture cues or speech playback.
+### 3. Try text mode
 
 ```sh
-docker compose up -d --build
+.venv/bin/python -m hoast --config config.toml --text
 ```
 
-To rebuild/recreate only Hoast without restarting Music Assistant:
+Use `/reset` to clear the conversation and Ctrl+D to exit. To run the language
+model on CPU instead:
 
 ```sh
-# Bound build containers as well as the deployed service (classic Docker builder).
-DOCKER_BUILDKIT=0 docker build --cpuset-cpus 4,5 --memory 3g -t home-assist/hoast:latest .
-# Stop any independently running native Hoast before starting the container.
-docker compose up -d --no-build --no-deps --force-recreate hoast
+.venv/bin/python -m hoast --config config.toml --text --device CPU
 ```
 
-The root Compose configuration does not start the Linux microphone simulator.
-If an earlier deployment used the standalone bridge Compose file, stop and
-remove its bridge container before starting the root stack to release the
-shared socket:
+## Voice mode
 
-```sh
-docker rm -f respeaker-aec-reference-bridge-1
-docker compose up -d --build
-```
+Voice mode receives audio from an ESPHome voice satellite and plays replies
+through the computer's audio output. It does not use the computer's microphone
+automatically. See the [reSpeaker guide](respeaker/README.md) for supported
+hardware, firmware and installation.
 
-See [`respeaker/README.md`](respeaker/README.md) for firmware installation and
-the bridge's audio path.
-
-Voice mode connects to `[satellite].host` in `config.toml`, receives command audio,
-runs STT and the tool-based agent, then plays its bounded reply through system
-audio. Startup speech and replies use Melo's 0.85x speaking speed (about 15%
-slower than the standalone synthesizer's 1.0x default). Startup warms English and
-Chinese TTS, feeds both generated clips to STT,
-then warms LLM inference without dispatching tools. Listening starts after warm-up.
-The satellite stays busy until playback drains. Every voice command starts a
-fresh LLM session and discards its history on completion; voice follow-ups do not
-reuse earlier commands. Text mode retains conversation history until `/reset`.
-Capture ends adaptively after **500 ms of detected
-silence following speech**. `satellite.capture_seconds` is the hard maximum
-(six seconds by default), not a mandatory wait. Initial silence waits for speech
-or the maximum; short pauses are tolerated. Silero uses 32 ms frames, so endpoint
-notification has frame/packet granularity while retained trailing silence is 500 ms.
-
-To hear exactly what the controller captured, run:
-
-```sh
-uv run python -m hoast --config config.toml --debug-audio
-```
-
-Debug mode plays a high start tone, the captured command, and a lower end tone
-through system audio before STT. It deliberately adds the replay duration to each
-turn; the satellite stays busy until all processing/playback finishes.
-Replay and synthesized replies share the TTS playback API and queue. Linux playback
-uses an available PipeWire/PulseAudio adapter to mix with the satellite's audio.
-
-The system prompt gets only music **on/off** state (or explicit unavailability)
-before every request. It does not include background title, artist, volume, source,
-or player metadata. Explicit user requests and tool answers retain their own context.
-With `[switch]` configured, the agent can turn its light relay on or off. Observed
-music starts/resumes with available track metadata produce
-“Now playing {title} by {artist}”; the mix seed is not used as the current track.
-TTS input is limited to 400 characters at sentence/word boundaries after consuming
-the complete agent response; the text console retains the full grounded answer.
-
-In text mode, use `/reset` to clear history and EOF to exit. Conversational output goes to
-stdout. In voice and text mode, diagnostics go to stderr without persistent log
-files by default. Native English/Chinese speech runs in the application process.
-
-To select a custom fine-tuned OpenVINO LFM export, add this to `config.toml`:
+Update the satellite table in `config.toml`:
 
 ```toml
-[lfm]
-model_dir = "models/openvino-int8"
+[satellite]
+host = "192.168.1.30"
+language = "auto"
+capture_seconds = 6.0
+# For an encrypted API, also set:
+# key_env = "ESPHOME_API_KEY"
 ```
 
-The path is relative to the working directory (absolute paths also work). This
-setting bypasses the LFM selection manifest; without it, LFM uses
-`models/lfm/model.json`. It applies to the default LFM model; `--model functiongemma`
-uses its own prepared model. Compiled model artifacts still use `--cache`.
-
-`--help` describes options and displays defaults. In text mode, the LFM CPU budget
-defaults to `--threads auto`: one core for GPU execution, two for CPU. Voice mode
-uses the qualified shared two-thread STT/TTS/LLM budget. Explicit `1` or `2`
-overrides it. LFM GPU inference uses FP16 computation with INT8-stored weights.
-
-## Speech
-
-Application imports are `hoast.stt2.STT`/`STTConfig` and
-`hoast.tts2.TTS`/`TTSConfig`: native SenseVoiceSmall with repository-owned NumPy
-FBANK/LFR/CMVN, and native EN/ZH Melo normalization/G2P/BERT plus four resident
-OpenVINO stages. Runtime does not import FunASR, sherpa, Melo's frontend, or
-`g2p_en`; it does not execute an alternate Python interpreter. Cached package
-paths are **data locations only**. The application uses CPU speech with a shared
-two-core budget in voice mode; LFM GPU selection does not move speech to GPU.
-
-### Pinned inputs and offline preparation
-
-The input helper defaults to offline validation. Explicit `--download` fetches
-only full-revision and SHA256-pinned SenseVoice, EN/ZH Melo/BERT assets, the exact
-Melo git commit, and static frontend resources. English resources are extracted
-from the pinned `g2p_en` 2.1.0 wheel (NPZ/text only, not installed or imported).
-CMU dictionary/reference tagger ZIPs come from a pinned `nltk_data` commit, with
-archive and member hashes; NLTK's downloader is not invoked. A restricted
-primitive-only reader converts the tagger data during preparation. Existing
-mismatched inputs fail, rather than being silently replaced. These commands are
-for a separate preparation session, not while timed benchmarks are running:
+If encryption is enabled, put `ESPHOME_API_KEY` in `.env` or the process
+environment. Use the key configured on the device.
 
 ```sh
-# Input acquisition only: no exports, installs or model inference.
-.venv/bin/python -m tools.fetch_speech2 --download
-# Offline validation of the same inputs (including available benchmark caches):
-.venv/bin/python -m tools.fetch_speech2 --offline
-
-# Entire offline bootstrap, supplying explicit data/source locations if needed:
-./prepare.sh --offline --stt-source /data/SenseVoiceSmall --melo-source /data/MeloTTS --assets-manifest /data/melo-assets.json --g2p-resource-dir /data/g2p_en --nltk-resource-dir /data/nltk_data
+.venv/bin/python -m hoast --config config.toml
 ```
 
-Explicit local paths must contain the pinned bytes described in
-[docs/speech2-native.md](docs/speech2-native.md), not arbitrary substitutes. An
-assets manifest maps the four EN/ZH Melo/BERT repositories to `revision`, absolute
-`snapshot` path, and file records (`name`, `bytes`, `sha256`); the helper publishes
-a compatible `<output stem>.melo-assets.json` alongside its input inventory. Missing
-sources, resources or cached dependencies stop offline setup. Acquiring inputs
-does **not** make application artifacts ready; export them with `prepare.sh` or
-the explicit serial conversion commands in the native guide.
+Wait for the initialization announcement, then say the satellite's wake word
+and your request. Capture ends after about half a second of silence, up to the
+configured maximum. Each voice command starts a fresh conversation; include the
+full request rather than relying on an earlier command's context.
 
-STT preparation also requires the official pinned model card and verbatim
-`MODEL_LICENSE`, `FunASR-LICENSE`, `SenseVoice-LICENSE`, and `provenance.json`.
-The helper fetches legal texts only from the audited full-commit URLs and verifies
-their pinned SHA256/byte sizes and provenance. It reuses `source/licenses` or
-`.cache/speech-bench/licenses/sensevoice`; missing offline texts fail. Supply
-`--license-dir /data/sensevoice-licenses` to either helper/bootstrap to select
-explicit local-only legal inputs. A source-license URL reference is preserved
-as such, not represented as a standalone grant; model/source/resource terms
-remain distinct. Review the legal notices before redistributing artifacts.
-
-### Artifact/backend selection
-
-FP32 OpenVINO STT and decoder-only FP16 Melo on CPU, two threads, are the measured
-qualified bootstrap defaults. Melo BERT/encoder/flow remain FP32. FP32 Melo is an
-explicit comparison option. For separate
-roots, including the qualified local development artifacts:
+To replay captured audio while troubleshooting:
 
 ```sh
-# New exports: refuses any existing target; choose different roots for reruns.
-./prepare.sh --offline --stt-output models/stt2-fp32 --tts-precision FP16-decoder --tts-output models/tts2-fp16-decoder
-# FP32 Melo comparison, using fresh separate speech output roots:
-./prepare.sh --offline --stt-output /new/stt2-fp32 --tts-precision FP32 --tts-output /new/tts2-fp32
-# Use existing qualified roots without preparing or overwriting them:
-.venv/bin/python -m hoast --config config.toml --stt-backend cpu --stt-model-dir models/stt2-fp32 --tts-model-dir models/tts2-fp16-decoder --threads 2
-# Optional bilingual round-trip smoke (real inference, no deployment/playback):
-.venv/bin/python -m tools.check_speech2 --stt-model-dir models/stt2-fp32 --tts-model-dir models/tts2-fp16-decoder --stt-backend cpu --tts-backend cpu --threads 2 --chinese
-
-# Opt-in community UINT8 ONNX Runtime candidate, with distinct artifacts:
-.venv/bin/python -m tools.fetch_speech2 --download --with-community --output models/speech2-inputs/community-inputs.json
-./prepare.sh --offline --stt-backend ort --stt-precision UINT8 --stt-output models/stt2-community-ort --tts-output models/tts2-ort-comparison
+.venv/bin/python -m hoast --config config.toml --debug-audio
 ```
 
-`--stt-backend ort` requires `--stt-precision UINT8` and imports the pinned
-community ONNX graph; `cpu`/`GPU` select OpenVINO artifacts without fallback.
-`--stt-precision FP16` and GPU are explicit experimental choices, not qualified
-defaults. Backend selection is recorded in the printed application command;
-setup does not infer a model to benchmark that backend. TTS application execution
-remains CPU. Source/weights are read-only and preparation publishes fresh roots.
-
-Development qualification: native STT FP32 OpenVINO CPU was faster than the
-Whisper comparison, whereas community UINT8 OpenVINO was slower. Community UINT8
-ONNX Runtime was faster in measured comparisons but remains an **opt-in**, not
-the default, because held-out recognition regressions affect transcript fidelity.
-Melo FP32 and decoder-only
-FP16 passed six EN/ZH/mixed real texts (decoder-only SNR approximately 61–69 dB).
-Storage precision is not an execution-speed or hardware-INT8 claim; these scoped
-gates do not establish broad WER/CER or perceptual quality. Consult
-[the native architecture, pins and preparation guide](docs/speech2-native.md) and
-[measured comparisons](docs/speech2-benchmarks.md) for evidence and limitations.
-SenseVoiceSmall and Melo are the supported speech engines; see the
-[speech overview](docs/speech.md). Whisper/Kokoro measurements remain historical
-comparison evidence, not runnable backends. Endpoint detection uses the pinned
-standalone Silero v6 ONNX model at `models/vad/silero_vad_v6.onnx`; bootstrap
-prepares it with `tools.prepare_vad`. Runtime never downloads model assets.
-For an existing installation, `uv run python -m tools.prepare_vad` acquires and
-verifies that model; `--offline` validates its local copy without network access.
-The container image/deployment policy is a separate integration boundary—this
-bootstrap does not rebuild containers or change their Python/system packages.
-
-For local-microphone wake-word development, see
-[Network microphone development](docs/voice-satellite.md). Its optional simulator
-uses OHF Linux Voice Assistant with microWakeWord; `python -m hoast.voice`
-receives native wake/audio events. The deployed hardware configuration is in
-[`respeaker/README.md`](respeaker/README.md).
-
-## Weather
-
-Open-Meteo supplies observations, forecasts, and city geocoding.
-Weather requests default to home; named cities are resolved
-through geocoding. “Next week” means next Monday through Sunday in the destination
-timezone. Model inference is local; weather retrieval needs network access.
-The city value `Home` also selects configured home coordinates, ignoring case
-and surrounding whitespace.
-When multiple cities match, region/country qualifiers filter candidates first.
-Ranking then prefers exact names, national capitals, larger populations, and
-finally great-circle proximity to home. Missing population ranks below known
-counts; ties across all criteria use provider order. Include a region or country
-to disambiguate a city. Candidate metadata is logged at debug level; selection,
-ranking criteria, and distance are logged at info level.
-
-Spoken responses are brief. Unknown or ambiguous locations prompt a request for
-the exact location. Candidate lists stay in diagnostics, long labels are
-shortened, and music confirmations mention at most the first artist.
-
-With `now` or no specified period, answers combine today's forecast with the
-current temperature. Explicit `today` omits the current temperature. Answers
-identify named locations and requested forecast periods. Temperatures are
-Celsius, rounded to integers; rain chances are rounded percentages.
-Unknown period strings (including `current`) select `now`. Recognized periods
-ignore case and surrounding whitespace; `next week` and `next-week` select `next_week`.
+Replay adds time to each turn. For local-microphone development and advanced
+speech options, see [voice satellite development](docs/voice-satellite.md) and
+the [speech guide](docs/speech.md).
 
 ## Music
 
-### Setup
+1. Start Music Assistant and configure your music providers and player. The
+   assistant currently requires the selected player to use **AirPlay 2 PTP**.
+2. In Music Assistant, open **Settings → Profile** and create a long-lived access
+   token. Store it in the project-root `.env` or export it in your shell:
 
-Music tools target Music Assistant 2.10.3's authenticated HTTP API.
-In the Music Assistant UI, open **Settings → Profile** and create a long-lived
-access token.
-Put it in the project-root `.env` (already gitignored), or export the variable in
-your shell. You can copy `.env.example` to `.env` as a starting point:
+   ```dotenv
+   MUSIC_ASSISTANT_TOKEN=YOUR_ACCESS_TOKEN
+   ```
 
-```dotenv
-MUSIC_ASSISTANT_TOKEN=YOUR_ACCESS_TOKEN
-```
+3. Set the music configuration, changing the server URL if needed:
 
-Credentials stay outside TOML. The process environment takes precedence over the
-selected dotenv file, including an explicitly empty value (which is an error).
-Dotenv values are not interpolated and do not modify the process environment.
+   ```toml
+   [music]
+   server_url = "http://localhost:8095"
+   player_id = "YOUR_PLAYER_ID"
+   token_env = "MUSIC_ASSISTANT_TOKEN"
+   ```
 
-The Music Assistant Compose service requires `AIRPLAY_IP`, the fixed IPv4
-or IPv6 address of its AirPlay receiver. Copy `music.env.example` to `music.env`
-(which is gitignored) and set the address there. Before MA starts, its container
-refreshes `/data/homepod-mdns.json` from that receiver's live mDNS records. If the
-receiver is temporarily undiscoverable, it advertises the last valid snapshot and
-retries live discovery once per minute. Startup fails when neither live records nor
-a complete snapshot is available.
+4. List players, then replace `YOUR_PLAYER_ID` with the desired player's ID:
 
-The Compose service reads the project-root `music.env` for its receiver address:
+   ```sh
+   .venv/bin/python -m hoast.music_cli --config config.toml players
+   ```
+
+Music Assistant must be available when Hoast starts. Remove `[music]` to disable
+this integration.
+
+“Play” resumes existing playback. A request with a song title or artist starts
+a new mix; specifying the artist helps avoid choosing a different recording.
+“Stop” uses Music Assistant's pause control, which can stop sources that cannot
+be paused.
+
+You can check the connection without loading any models:
 
 ```sh
-docker compose -f music/docker-compose.yaml up -d
+.venv/bin/python -m hoast.music_cli --config config.toml status
 ```
 
-The direct CLI needs **no LLM, model download, compilation, or inference**. After
-`uv sync --locked`, discover players and inspect their state:
+## Light control
 
-```sh
-uv run python -m hoast.music_cli players
-uv run python -m hoast.music_cli --player YOUR_PLAYER_ID status
-```
-
-Without `--config`, it uses `http://localhost:8095`, an empty player ID, and
-`MUSIC_ASSISTANT_TOKEN` from the environment or working-directory `.env`.
-It does not implicitly load `config.toml`. An empty player ID selects a player
-only when exactly one enabled, available nonprotocol player exists; otherwise
-the JSON result asks for a player and includes choices. `players` lists choices
-without selecting one.
-
-Configure the optional `[music]` table in `config.toml`. Replace `YOUR_PLAYER_ID`
-with the intended player's ID from the `players` command:
+Set your compatible Kasa relay's IP address in `config.toml`:
 
 ```toml
-[music]
-server_url = "http://localhost:8095"
-player_id = "YOUR_PLAYER_ID"
-token_env = "MUSIC_ASSISTANT_TOKEN"
+[switch]
+ip = "192.168.1.40"
 ```
 
-All three fields are optional strings. Defaults are `http://localhost:8095`, an
-empty player ID, and `MUSIC_ASSISTANT_TOKEN`. Change the server URL if your server
-runs elsewhere; it must be an HTTP(S) origin without credentials, query, fragment,
-or API path. The interactive runner accepts `--env-file` to select a token file.
+This enables on/off control of the connected light. Remove `[switch]` to disable
+it. See the [switch guide](docs/switch.md) for device setup and direct controls.
 
-### Direct CLI
+## Docker
 
-**Global options must precede the subcommand.** `--player` and `--server` override
-TOML/defaults; `--env-file` selects a dotenv file (default `.env`). Explicit
-`--config` reads the system TOML and therefore requires `[weather]`; a weather-only
-file uses music defaults for this CLI.
+The included Compose stack runs Hoast and Music Assistant. Prepare the models
+and configure voice mode first. Review the Compose CPU affinity, memory limit,
+UID/GID and audio paths for your machine; the supplied settings target UID 1000
+with PipeWire/PulseAudio and Intel graphics.
+
+Create `.env` and `music.env` from their example files if they do not already
+exist. Keep any existing secrets. Set your tokens/API key in `.env`, and set
+`AIRPLAY_IP` in `music.env` to the fixed address of your AirPlay receiver.
 
 ```sh
-uv run python -m hoast.music_cli --config config.toml --player YOUR_PLAYER_ID status
-uv run python -m hoast.music_cli --player YOUR_PLAYER_ID pause
-uv run python -m hoast.music_cli --player YOUR_PLAYER_ID resume
-uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume louder
-uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume quieter
-uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume raise 20
-uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume lower 10
-uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume set 0
-uv run python -m hoast.music_cli --player YOUR_PLAYER_ID volume YOUR_VOLUME_LEVEL
-uv run python -m hoast.music_cli --player YOUR_PLAYER_ID play --title "YOUR_SONG_TITLE" --artist "YOUR_ARTIST_NAME"
+docker compose up -d --build
 ```
 
-Replace the `YOUR_…` placeholders before running these commands. Volume levels
-must be integers from 0 to 100. Raise/lower amounts are percentage-point changes;
-omitting a relative amount selects five points.
+The optional AEC reference bridge is disabled in the Compose file. See the
+[reSpeaker guide](respeaker/README.md) before enabling it.
 
-### Playback behavior
+Do not run native Hoast and its container at the same time. If a systemd service
+manages your deployment, use that service to stop/start Hoast rather than
+launching a competing Compose instance.
 
-The CLI and agent share the same music handlers. `stop` is an alias for `pause`
-and preserves the retained stream.
-`play` with both title and artist omitted, empty, or whitespace-only delegates to
-native resume, with the same state-dependent success or refusal as `resume` and
-no search or new stream. A nonblank title and/or recording artist requests a new
-mix; `--author` aliases `--artist`. Title/artist matching is exact after Unicode,
-case, punctuation, and whitespace normalization. Provider duplicates and version-only variants
-with the same normalized title and full artist set collapse to the first available
-ranked result; there is no version selector. Title-only requests choose the first
-available exact-title match in Music Assistant's search order, even when covers
-by other artists also match. Specify `--artist` to constrain the performer; that
-constraint is never relaxed. Different collaborator sets matching an explicit artist can still
-require clarification. Artist-only homonyms can collapse because names alone do
-not establish artist identity. Missing or remaining ambiguous matches do not
-start playback; candidates stay in diagnostic results and logs.
+## Troubleshooting
 
-- **New play replaces the resolved active queue** with an Endless Mix seeded by
-  the match. “Infinite” playback means provider-backed recommendations and dynamic
-  refill, not a guarantee of unlimited music. The seed may not play first.
-- **Play/resume and pause use MA's player controls**: `players/cmd/play` and
-  `players/cmd/pause`. MA handles idle-queue restoration, source capabilities,
-  protocol fallbacks, and group/sync routing. The selected player ID is sent to
-  MA; effective group state is read for observations. Play can restore an idle
-  queue or source even when local source/capability metadata is absent. Pause can
-  become a stop when MA cannot pause the output; observed stops are reported as
-  stopped. Empty queues and unsupported sources can still be rejected by MA.
-- **What is playing?** uses the read-only `what_is_playing()` tool. Its observed
-  result renders “Now playing {title} by {artist}” when both labels are available;
-  paused/idle playback and missing metadata are described without inventing names.
-  Play/resume automatically call this same lookup, reuse fresh post-command
-  observations, and include its result as `playback` for text rendering. Explicit
-  new mixes also read back the player after the queue operation. Requested-only
-  starts retain acknowledgement wording until playback is observed.
-- **Next song / switch song** uses the `music_next` tool, sending
-  `players/cmd/next` once. MA chooses the appropriate external source, queue, or
-  native next action. A changed observed media identity confirms advancement;
-  delayed/unchanged/missing metadata yields “Next song requested.” Next is never
-  retried. The direct CLI equivalent is `python -m hoast.music_cli next`.
-  The read-only query is `python -m hoast.music_cli now-playing`.
-- Explicit play/pause intents use directional commands, so asking to play an
-  already-playing player does not pause it. The frontend button uses a toggle
-  (and a Stop action for stop-only sources/radio); voice pause delegates the
-  server's pause behavior. State checks are not atomic with dispatch.
-  `confirmation: "requested"` means acknowledged, while `"observed"`
-  means the expected state was seen in an immediate snapshot; neither proves
-  audible playback or future recommendation supply.
+- **Model preparation fails:** check `.cache/hoast/diagnostics/prepare/` and
+  `./prepare.sh --help`. If outputs already exist, use them directly or choose
+  fresh output paths; do not delete working models just to rerun setup.
+- **No voice input or reply:** check the satellite address, API key and computer's
+  audio output. Use `--debug-audio` to hear what was captured.
+- **Music is unavailable:** check that Music Assistant is running, the token and
+  player ID are correct, and the player uses AirPlay 2 PTP.
+- **The container restarts:** inspect its logs and check for memory-limit kills.
+  The supplied memory limit may need adjustment for your workload. Input/output
+  bounds and memory observations do not guarantee OOM-free operation.
 
-Verified against official MA 2.10.3
-[player commands](https://github.com/music-assistant/server/blob/3e21f8293fbcd8710dc2d3c8afc2c94418187cf9/music_assistant/controllers/players/controller.py)
-and the current official frontend's
-[Play button](https://github.com/music-assistant/frontend/blob/f838bc60c42c0b04077179d658e1d70130b53193/src/layouts/default/PlayerOSD/PlayerControlBtn/PlayBtn.vue)
-and [Next button](https://github.com/music-assistant/frontend/blob/f838bc60c42c0b04077179d658e1d70130b53193/src/layouts/default/PlayerOSD/PlayerControlBtn/NextBtn.vue).
-
-### Volume
-
-Volume works while idle or playing and changes only volume, without playback,
-queue, or source changes. All values are integers in `[0, 100]`. `louder` and
-`quieter` add/subtract the supplied percentage points, defaulting to five when
-omitted, with results clamped to `[0, 100]`. `set` requires an explicit percentage;
-zero is valid. For example, raising 40 by 20 produces 60, not 48.
-Invalid CLI arguments are rejected before client setup
-or any mutation. Group/sync targets use the effective group's reading and volume
-command. `players` and `status` expose group-aware `volume_level` (null when
-unavailable); `status` resolves the effective target, while `players` lists each
-target's own reading. Unsupported volume control or a missing relative reading
-returns `cannot_volume`; an absolute setting can proceed without a current reading.
-Volume results distinguish `level` (target) from `observed_level` (readback).
-`volume_set` is `observed` only when immediate readback matches, otherwise
-`requested`; `volume_unchanged` is an observed no-op. Routing or volume drift
-before dispatch refuses mutation; routing drift afterward reports `cannot_volume`
-with `confirmation: "requested"`, without retrying.
-
-### Output and diagnostics
-
-Stdout contains one compact JSON result, without a tool-call wrapper. Diagnostics
-go to stderr; exceptions retain tracebacks, chains, and notes in
-`.cache/hoast/diagnostics/music-cli.log`, relative to the working directory, with
-the resolved token redacted. Commands are never retried.
-
-| Exit | Meaning                                                                  |
-| ---- | ------------------------------------------------------------------------ |
-| 0    | Read succeeded, command accepted, or already in the requested state.       |
-| 1    | Configuration, credential, tool validation, transport, or execution error. |
-| 2    | CLI syntax error, or an actionable result below.                           |
-
-Selection/search/volume refusals include `player_required`, `not_found`, `ambiguous`,
-and `cannot_volume`. They retain their result on stdout even with exit code 2.
-MA player-command errors, including empty-queue and unsupported-source failures,
-are execution errors with exit code 1. An unconfirmed accepted command has
-`confirmation: "requested"`; it is not retried.
-
-## Local agent and model API
-
-The shared concise routing prompt is in `hoast/prompts.py`. The offline
-[fine-tuning toolkit](finetune/README.md) builds reproducible English, Chinese,
-code-switched, and STT-confusion examples using production schemas and the official
-LFM template. Generate the canonical dataset with `uv run python -m finetune.generate`.
-STT output and external user turns share basic-punctuation normalization in
-`hoast/input_text.py`. Structured prompts, schemas, tool results, and internal
-repair diagnostics retain their syntax. The fine-tuning guide covers canonical
-dataset generation, LoRA training, export, and held-out evaluation.
-
-`hoast.agent.LocalAgent` accepts weather plus optional complete core music tools
-(`pause_music`, `resume_music`, `play_music`, `volume_music`). The `music_next`
-and `what_is_playing` extensions require that music group; `set_light` is independently optional.
-Production music registration includes all six music tools. Each turn allows
-at most four calls, including at most one music action and one light action.
-Standalone “play” and “stop” deterministically resume and
-pause through `Session.request_tools`, bypassing model inference while retaining
-history. Matching uses canonical user text, ignores case, and trims terminal
-sentence punctuation for shortcut recognition.
-Longer requests, including “play music”, still use model routing and
-can misroute. Without music configured, shortcuts say “Music isn't configured.”
-Standalone “louder” and “quieter” also bypass inference and adjust by five points;
-“quiter” is accepted as a spelling alias for “quieter”. An explicit integer amount,
-such as “louder 20 percent”, overrides that default.
-“Next”, “next song”, “next track”, “switch song”, “skip song”, and “skip track”
-directly dispatch `music_next` with empty arguments.
-“What is playing”, “what's playing”, and “what song is playing” directly dispatch
-`what_is_playing`; the query is read-only and does not count as a music mutation.
-
-Tool schemas live in `declare_music_tools()` (`hoast/music.py`),
-`declare_weather_tool()` (`hoast/weather.py`), and `declare_light_tool()`
-(`hoast/lights.py`). Runtime clients bind these declarations to their handlers;
-`finetune/tooling.py` aggregates the full non-executable catalog for dataset work.
-`hoast/llm_cli.py:main` assembles enabled tools from configuration and
-passes them into `ToolRegistry` (`hoast/llm.py`), whose `schemas()` supplies the
-LLM-facing tool list and whose dispatch validates and invokes handlers.
-`LocalAgent.__post_init__` validates renderer-compatible registry composition;
-its allowed-name sets do not register tools or control MA playback semantics.
-
-Ambiguous control requests default to music. A model response without a tool call
-prompts a clarification without changing playback. The agent stores grounded
-spoken summaries in model history; full tool results remain available in
-diagnostics and through the raw session API.
-
-Invalid generated calls receive up to two repair attempts before any tool runs.
-If repair fails, the agent asks you to rephrase and preserves prior history.
-Other errors and closed, abandoned answer streams reset history. Tool execution
-is never retried.
-
-See [docs/llm.md](docs/llm.md) for model preparation, raw `Session` API usage,
-agent contracts, and speed/quality measurements. Small models can misroute
-requests or hallucinate facts; the documented measurements cover narrow
-diagnostic workloads.
-
-## Development
+For the current container:
 
 ```sh
-uv run pytest
-uv run pyright hoast tools tests
-uv run ruff check hoast tools tests
-uv run ruff format --check hoast tools tests
+docker logs --timestamps --tail 100 hoast
 ```
 
-Tests use embedded fixtures and temporary directories, without downloading models.
-Configure application logging once with `hoast.logging.configure_logging`;
-preparation commands retain full failures under `.cache/hoast/diagnostics/`.
+For installations managed by the user `hoast.service`, the journal retains
+output across container recreation:
+
+```sh
+journalctl --user -u hoast.service --since '1 day ago'
+```
+
+Logs can contain spoken requests and local device details; review them before
+sharing. Memory observations are recorded at voice stages and every minute
+without forced garbage collection. Advanced budgets and optional reclamation
+are described in the [language model guide](docs/llm.md).
+
+## Further reading
+
+- [Speech setup and runtime options](docs/speech.md)
+- [Language model setup and advanced configuration](docs/llm.md)
+- [Voice satellite development](docs/voice-satellite.md)
+- [Fine-tuning your language model](finetune/README.md)
 
 ## License
 
-The project code is licensed under the [MIT License](LICENSE). Downloaded models
-and third-party dependencies are covered by their respective licenses.
+Project code is licensed under the [MIT License](LICENSE). Downloaded models and
+third-party dependencies have their own licenses; review them before redistribution.

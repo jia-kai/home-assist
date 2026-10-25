@@ -24,9 +24,12 @@ from .llm import (
     Generation,
     ToolCall,
     ToolRegistry,
+    _clear_exception_frames,
     _ov_streamer,
+    _reclaim_after_generation,
 )
 from .logging import get_logger
+from .memory import reclaim_memory
 
 logger = get_logger(__name__)
 SYSTEM_PROMPT = "You are a helpful assistant."
@@ -253,10 +256,31 @@ class LFMConfig:
     device: Literal["CPU", "GPU"] = "GPU"
     """OpenVINO device, GPU by default; loading errors never trigger fallback."""
 
+    reclaim_after_call: bool = False
+    """Collect and trim before and after generation without unloading the model."""
+
+    max_prompt_chars: int = 32768
+    """Maximum formatted prompt characters, checked before tokenization."""
+
+    max_output_chars: int = 8192
+    """Maximum decoded raw characters, checked before parsing tool calls."""
+
     def __post_init__(self) -> None:
         """Reject invalid serving settings before allocating a model."""
         if self.device not in ("CPU", "GPU"):
             raise ValueError("Device must be CPU or GPU")
+        for name in (
+            "threads",
+            "max_new_tokens",
+            "max_context_tokens",
+            "max_prompt_chars",
+            "max_output_chars",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if type(self.reclaim_after_call) is not bool:
+            raise ValueError("reclaim_after_call must be a bool")
         if (
             self.threads not in (1, 2)
             or not 0 < self.max_new_tokens < self.max_context_tokens <= 32768
@@ -442,6 +466,13 @@ class LFM2:
     ) -> Generation:
         """Canonicalize user language and generate with the native structured template.
 
+        Optional reclamation runs under the inference lock before and after the
+        call, including failures, and is excluded from result timing. Unwound
+        exception-graph frame locals are cleared before reclamation; tracebacks
+        retain their stack locations. Cleanup failures are logged and noted on
+        an active inference failure rather than replacing it. Streaming fragments
+        precede final size/protocol validation and are not validated tool calls.
+
         Args:
             messages:
                 Nonempty Hugging Face-style history. System/developer roles are
@@ -456,12 +487,42 @@ class LFM2:
                 Callback exceptions abort generation and propagate.
 
         """
+        with self._lock:
+            if self._model is None or self._tokenizer is None:
+                raise RuntimeError("Load LFM2 before generating")
+            failure: BaseException | None = None
+            try:
+                if self.config.reclaim_after_call:
+                    reclaim_memory("lfm.before")
+                return self._generate_messages(messages, on_text)
+            except BaseException as error:
+                failure = error
+                if self.config.reclaim_after_call:
+                    _clear_exception_frames(error)
+                raise
+            finally:
+                if self.config.reclaim_after_call:
+                    _reclaim_after_generation("lfm.after", failure, reclaim_memory)
+
+    def _generate_messages(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        on_text: Callable[[str], None] | None,
+    ) -> Generation:
+        """Return an owned result, keeping native temporaries inside this frame.
+
+        Args:
+            messages:
+                History validated and rendered for the configured model.
+
+            on_text:
+                Optional synchronous raw-text callback; exceptions propagate.
+
+        """
         # Tensor wrapping is required only when actually generating a response.
         import openvino as ov
 
         with self._lock:
-            if self._model is None or self._tokenizer is None:
-                raise RuntimeError("Load LFM2 before generating")
             if not messages or any(
                 message["role"] not in ("user", "assistant", "tool")
                 for message in messages
@@ -485,6 +546,8 @@ class LFM2:
                 tokenize=False,
                 add_generation_prompt=True,
             )
+            if len(prompt) > self.config.max_prompt_chars:
+                raise ValueError("Request exceeds configured prompt character limit")
             # CPU int64 input IDs have shape (batch=1, prompt_tokens).
             inputs = self._tokenizer(
                 prompt, add_special_tokens=False, return_tensors="np"
@@ -506,14 +569,16 @@ class LFM2:
                     else {}
                 ),
             )
+            count = len(output.tokens[0])
+            if count >= self.config.max_new_tokens:
+                raise ValueError("Generation reached output limit")
             raw = self._tokenizer.decode(
                 output.tokens[0],
                 skip_special_tokens=False,
                 clean_up_tokenization_spaces=False,
             )
-            count = len(output.tokens[0])
-            if count >= self.config.max_new_tokens:
-                raise ValueError("Generation reached output limit")
+            if len(raw) > self.config.max_output_chars:
+                raise ValueError("Generation exceeds configured output character limit")
             try:
                 text, calls = parse_response(raw)
                 self.tools.validate(calls)

@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from traceback import clear_frames
 from types import TracebackType
 from typing import Any, Literal, Self
 
@@ -16,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, JsonValue
 
 from .input_text import canonical_user_messages
 from .logging import get_logger
+from .memory import reclaim_memory
 
 logger = get_logger(__name__)
 DEFAULT_CACHE = Path(".cache/hoast")
@@ -25,6 +27,72 @@ SYSTEM_PROMPT = (
 )
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _NUMBER = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+
+
+def _clear_exception_frames(error: BaseException) -> None:
+    """Drop unwound frame locals throughout an exception graph before trimming.
+
+    Traceback stack locations, exception notes, group membership, and cause and
+    context links are preserved. Both visible and suppressed contexts are visited
+    because either can retain native temporaries. Cycles are visited only once;
+    active frames cannot be cleared and are skipped by ``clear_frames``.
+
+    Args:
+        error:
+            Root failure whose reachable traceback-frame locals are released.
+
+    """
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        clear_frames(current.__traceback__)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+
+
+def _reclaim_after_generation(
+    boundary: str,
+    failure: BaseException | None,
+    reclaim: Callable[[str], None],
+) -> None:
+    """Reclaim memory without replacing an active generation or callback failure.
+
+    Unexpected cleanup errors propagate after successful generation. During an
+    existing failure they are logged with tracebacks and attached as notes to the
+    original exception, whose identity and cause/context graph remain unchanged.
+
+    Args:
+        boundary:
+            Model-specific after-generation boundary label used in diagnostics.
+
+        failure:
+            Active generation failure, or None when generation succeeded.
+
+        reclaim:
+            Boundary reclamation operation; injected to retain model-local hooks.
+
+    """
+    try:
+        reclaim(boundary)
+    except BaseException as cleanup_error:
+        if failure is None:
+            raise
+        failure.add_note(
+            f"Memory reclamation failed at {boundary}: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+        logger.exception(
+            "Memory reclamation failed at %s; preserving generation failure",
+            boundary,
+        )
 
 
 def _text_streamer(
@@ -511,6 +579,15 @@ class LLMConfig:
     device: Literal["CPU", "GPU"] = "CPU"
     """Explicit OpenVINO device; GPU selects the Intel GPU without fallback."""
 
+    reclaim_after_call: bool = False
+    """Collect and trim before and after generation without unloading the model."""
+
+    max_prompt_chars: int = 32768
+    """Maximum formatted prompt characters, checked before tokenization."""
+
+    max_output_chars: int = 8192
+    """Maximum decoded raw characters, checked before parsing tool calls."""
+
     @classmethod
     def from_cache(
         cls,
@@ -566,8 +643,18 @@ class LLMConfig:
             raise ValueError("The torch backend supports CPU only")
         if self.attention_backend not in ("PA", "SDPA"):
             raise ValueError("Attention backend must be PA or SDPA")
-        if self.threads < 1 or self.max_new_tokens < 1:
-            raise ValueError("Thread and output-token counts must be positive")
+        for name in (
+            "threads",
+            "max_new_tokens",
+            "max_context_tokens",
+            "max_prompt_chars",
+            "max_output_chars",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if type(self.reclaim_after_call) is not bool:
+            raise ValueError("reclaim_after_call must be a bool")
         if not self.max_new_tokens < self.max_context_tokens <= 32768:
             raise ValueError("Context must exceed output budget and be <= 32768")
         if SYSTEM_PROMPT not in self.system_prompt:
@@ -594,7 +681,7 @@ class Generation:
     """Number of generated tokens including termination tokens."""
 
     elapsed_seconds: float
-    """Wall time for prompt formatting, generation, parsing, and validation."""
+    """Formatting/generation/parsing/validation seconds, excluding reclamation."""
 
     first_token_seconds: float
     """Backend time to first generated token, excluding prompt formatting."""
@@ -775,6 +862,13 @@ class FunctionGemma:
     ) -> Generation:
         """Canonicalize user language and generate native history with raw streaming.
 
+        Optional reclamation runs under the inference lock before and after the
+        call, including failures, and is excluded from result timing. Unwound
+        exception-graph frame locals are cleared before reclamation; tracebacks
+        retain their stack locations. Cleanup failures are logged and noted on
+        an active inference failure rather than replacing it. Streaming fragments
+        precede final size/protocol validation and are not validated tool calls.
+
         Args:
             messages:
                 Nonempty user/assistant/tool history; user language is canonicalized
@@ -783,6 +877,40 @@ class FunctionGemma:
 
             on_text:
                 Optional decoded-token callback including protocol. Exceptions propagate.
+
+        """
+        with self._lock:
+            if self._model is None or self._tokenizer is None:
+                raise RuntimeError("Load FunctionGemma before generating")
+            failure: BaseException | None = None
+            try:
+                if self.config.reclaim_after_call:
+                    reclaim_memory("functiongemma.before")
+                return self._generate_messages(messages, on_text)
+            except BaseException as error:
+                failure = error
+                if self.config.reclaim_after_call:
+                    _clear_exception_frames(error)
+                raise
+            finally:
+                if self.config.reclaim_after_call:
+                    _reclaim_after_generation(
+                        "functiongemma.after", failure, reclaim_memory
+                    )
+
+    def _generate_messages(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        on_text: Callable[[str], None] | None,
+    ) -> Generation:
+        """Return an owned result, keeping native temporaries inside this frame.
+
+        Args:
+            messages:
+                History validated and rendered for the configured model.
+
+            on_text:
+                Optional synchronous raw-text callback; exceptions propagate.
 
         """
         with self._lock:
@@ -802,6 +930,8 @@ class FunctionGemma:
                 tokenize=False,
                 add_generation_prompt=True,
             )
+            if len(prompt) > self.config.max_prompt_chars:
+                raise ValueError("Request exceeds configured prompt character limit")
             inputs = self._tokenizer(
                 prompt,
                 add_special_tokens=False,
@@ -829,6 +959,10 @@ class FunctionGemma:
                         streamer=timer,
                     )[0, input_count:]
                 output_count = len(output)
+                if output_count >= self.config.max_new_tokens:
+                    raise ValueError(
+                        "Generation reached token limit; refusing partial calls"
+                    )
                 raw = self._tokenizer.decode(
                     output,
                     skip_special_tokens=False,
@@ -849,18 +983,20 @@ class FunctionGemma:
                         else {}
                     ),
                 )
+                output_count = len(output.tokens[0])
+                if output_count >= self.config.max_new_tokens:
+                    raise ValueError(
+                        "Generation reached token limit; refusing partial calls"
+                    )
                 raw = self._tokenizer.decode(
                     output.tokens[0],
                     skip_special_tokens=False,
                     clean_up_tokenization_spaces=False,
                 )
-                output_count = len(output.tokens[0])
                 assert output_count == output.perf_metrics.get_num_generated_tokens()
                 first_token = output.perf_metrics.get_ttft().mean / 1000.0
-            if output_count >= self.config.max_new_tokens:
-                raise ValueError(
-                    f"Generation reached token limit; refusing partial calls: {raw}"
-                )
+            if len(raw) > self.config.max_output_chars:
+                raise ValueError("Generation exceeds configured output character limit")
             try:
                 text, calls = parse_response(raw)
                 self.tools.validate(calls)
