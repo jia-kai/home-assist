@@ -1,4 +1,4 @@
-"""Bounded PCM buffering with a playback-only worker and low device latency."""
+"""Bounded PCM buffering with a playback-only worker and explicit device timing."""
 
 import math
 import sys
@@ -12,6 +12,8 @@ from numpy.typing import NDArray
 from .logging import get_logger
 
 logger = get_logger(__name__)
+DEVICE_BUFFER_SECONDS = 0.06
+"""Request three 20-ms device periods, independent of the producer queue capacity."""
 
 
 def system_output_device() -> int | None:
@@ -57,6 +59,9 @@ class AudioPlayback:
     _rate: int
     """PCM sample rate in Hz."""
 
+    _block_frames: int
+    """Maximum queued block size and requested device period, about 20 ms."""
+
     _closing: bool
     """Whether submission has ended and the worker should drain."""
 
@@ -86,6 +91,7 @@ class AudioPlayback:
         if self._capacity < 1:
             raise ValueError("Audio buffer must accommodate at least one frame")
         self._rate = rate
+        self._block_frames = max(1, rate // 50)
         self._condition = threading.Condition()
         self._queue = deque()
         self._pending = 0
@@ -110,7 +116,7 @@ class AudioPlayback:
         """
         if samples.ndim != 1 or samples.dtype != np.float32 or not samples.size:
             raise ValueError("Expected nonempty mono float32 audio")
-        block_size = min(self._capacity, max(1, self._rate // 50))
+        block_size = min(self._capacity, self._block_frames)
         for offset in range(0, samples.size, block_size):
             block = samples[offset : offset + block_size]
             with self._condition:
@@ -147,7 +153,14 @@ class AudioPlayback:
             self._raise_failure()
 
     def _run(self) -> None:
-        """Write queued PCM on a low-latency device and publish any worker failure."""
+        """Write unchanged PCM, flush the device tail, and propagate device failures.
+
+        The device gets three 20-ms periods rather than a host-specific "low"
+        buffer smaller than one write. At end of submission, silence covering
+        reported output latency plus one period pushes accepted PCM through the
+        ALSA/PipeWire adapter before stopping; adapter stop alone can lose the
+        buffered tail. Flush silence is not queued speech or producer capacity.
+        """
         try:
             with self._condition:
                 self._condition.wait_for(lambda: bool(self._queue) or self._closing)
@@ -157,10 +170,16 @@ class AudioPlayback:
                 samplerate=self._rate,
                 channels=1,
                 dtype="float32",
-                latency="low",
+                latency=DEVICE_BUFFER_SECONDS,
+                blocksize=self._block_frames,
                 device=system_output_device(),
             ) as stream:
-                logger.info("tts.audio status=opened device_latency=%s", stream.latency)
+                output_latency = stream.latency
+                if isinstance(output_latency, tuple) or (
+                    not math.isfinite(output_latency) or output_latency < 0
+                ):
+                    raise RuntimeError("Output device reported invalid scalar latency")
+                logger.info("tts.audio status=opened device_latency=%s", output_latency)
                 while True:
                     with self._condition:
                         self._condition.wait_for(
@@ -176,6 +195,19 @@ class AudioPlayback:
                     with self._condition:
                         self._pending -= block.size
                         self._condition.notify_all()
+                drain_frames = (
+                    math.ceil(output_latency * self._rate) + self._block_frames
+                )
+                silence = np.zeros(self._block_frames, dtype=np.float32)
+                for offset in range(0, drain_frames, self._block_frames):
+                    if stream.write(
+                        silence[: min(self._block_frames, drain_frames - offset)]
+                    ):
+                        logger.warning(
+                            "tts.audio status=underflow reason=output_buffer_underrun phase=drain"
+                        )
+                # The sounddevice context manager suppresses stop errors by default.
+                stream.stop(ignore_errors=False)
             logger.info("tts.audio status=drained")
         except BaseException as error:
             logger.exception("tts.audio status=failed")

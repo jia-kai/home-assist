@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 import numpy as np
+from numpy.typing import NDArray
 
 from .agent import LocalAgent
 from .lfm import LFM2
@@ -13,11 +14,51 @@ from .logging import get_logger
 from .music import MusicAssistantError, MusicClient
 from .prompts import build_system_prompt
 from .session import Session
-from .stt import STT
-from .tts import TTS
+from .stt2 import STT
+from .tts2 import TTS
 from .voice import VoiceTurn
 
 logger = get_logger(__name__)
+
+
+def _startup_audio(
+    samples: NDArray[np.float32], sample_rate: int
+) -> NDArray[np.float32]:
+    """Level startup speech only, then prepend 200 ms of output-settling silence.
+
+    Target whole-clip RMS 0.07 (about -23 dBFS), capped at 4x gain and 0.8 peak
+    before resampling, leaving headroom for interpolation. This is scalar gain,
+    not clipping/compression; silence remains silence and input is never mutated.
+    Full-array statistics are limited to this one short startup announcement.
+
+    Args:
+        samples:
+            Nonempty mono float32 normalized speech returned by the synthesizer.
+
+        sample_rate:
+            Positive integer native waveform rate in Hz.
+
+    """
+    if samples.dtype != np.float32 or samples.ndim != 1 or not samples.size:
+        raise ValueError("Startup speech must be nonempty mono float32 PCM")
+    if type(sample_rate) is not int or sample_rate <= 0:
+        raise ValueError("Startup sample rate must be a positive integer")
+    peak = float(np.max(np.abs(samples)))
+    rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
+    if not np.isfinite(peak) or not np.isfinite(rms):
+        raise ValueError("Startup speech must be finite")
+    gain = min(4.0, 0.07 / rms, 0.8 / peak) if peak > 0 else 1.0
+    logger.info(
+        "warmup.announcement status=leveled source_rms=%.6f source_peak=%.6f "
+        "gain=%.4f output_peak=%.6f preroll_seconds=0.2",
+        rms,
+        peak,
+        gain,
+        peak * gain,
+    )
+    return np.concatenate(
+        (np.zeros(round(sample_rate * 0.2), dtype=np.float32), samples * gain)
+    )
 
 
 def bounded_speech(text: str, limit: int = 400) -> str:
@@ -133,11 +174,11 @@ class Assistant:
 class VoiceApplication:
     """Serialize recognition, grounded agent work, and blocking system playback.
 
-    Run synchronous methods on the application's single inference worker. A new
-    conversation starts when first PCM arrival is over 30 seconds after the end
-    of the previous nonempty capture. Recognition/inference/playback time is not
-    substituted for those capture timestamps. Playback already started is drained
-    on cancellation, while later tool dispatch and playback are suppressed.
+    Run synchronous methods on the application's single inference worker. Each
+    accepted voice command uses fresh conversation state regardless of capture
+    timestamps, then discards its history on completion, failure or cancellation.
+    Loaded models and tools are reused. Playback already started is drained on
+    cancellation, while later tool dispatch and playback are suppressed.
     """
 
     assistant: Assistant
@@ -152,11 +193,19 @@ class VoiceApplication:
     output: Callable[[str], None] = console_text
     """Text sink for recognized input and full grounded output."""
 
-    previous_audio_end: float | None = field(default=None, init=False)
-    """End of the preceding accepted nonempty capture, in monotonic seconds."""
+    def close(self) -> None:
+        """Drain playback and release both speech engines on the inference worker.
+
+        Recognition resources are released even if playback cleanup fails. Native
+        engines make repeated cleanup safe; the caller retains ownership of LLM.
+        """
+        try:
+            self.tts.close()
+        finally:
+            self.stt.close()
 
     def warmup(self) -> None:
-        """Warm all models without tool effects, then announce initialization."""
+        """Warm models without tool effects, then drain leveled initialization speech."""
         clips = []
         for language, text in (
             ("en", "The assistant is ready."),
@@ -176,7 +225,8 @@ class VoiceApplication:
         logger.debug("warmup.llm generation=%r", result)
         self.assistant.new_session()
         logger.info("warmup.llm status=ready tools_dispatched=0")
-        self.tts.play("系统初始化完毕", blocking=True)
+        samples, rate = self.tts.synthesize("系统初始化完毕")
+        self.tts.play_samples(_startup_audio(samples, rate), rate, blocking=True)
         logger.info("warmup.announcement status=completed")
 
     def transcribe(self, pcm: bytes) -> str:
@@ -191,50 +241,37 @@ class VoiceApplication:
         return self.stt.transcribe_samples(samples, 16000)
 
     def respond(self, turn: VoiceTurn) -> None:
-        """Run one uncancelled command and drain bounded speech before returning.
+        """Run one independent command, drain speech, and discard its history.
 
         Full grounded text goes to the text sink. Expected top-level turn failures
-        are logged with tracebacks, reset conversation state, and produce a brief
-        spoken failure. A playback error propagates to the native pipeline handler.
+        are logged with tracebacks and produce a brief spoken failure. A playback
+        error propagates to the native pipeline handler. Every accepted turn gets
+        fresh state, cleaned up even on empty output or sink/playback errors;
+        a turn already cancelled at entry does not run or change session state.
 
         Args:
             turn:
-                Transcript, capture timestamps, and disconnect/abort cancellation flag.
+                Transcript and disconnect/abort cancellation flag; capture timestamps
+                are metadata and do not control conversation state.
 
         """
         if turn.cancelled.is_set():
             return
-        if (
-            self.previous_audio_end is None
-            or turn.started_at - self.previous_audio_end > 30
-        ):
-            self.assistant.new_session()
-            logger.info(
-                "agent.session status=new audio_gap=%s",
-                None
-                if self.previous_audio_end is None
-                else turn.started_at - self.previous_audio_end,
-            )
-        self.previous_audio_end = turn.ended_at
-        self.output("You: " + turn.text)
+        self.assistant.new_session()
+        logger.info("agent.session status=new mode=voice")
         try:
-            answer = self.assistant.reply(turn.text, turn.cancelled.is_set)
-        except Exception:
-            logger.exception("agent.turn status=failed")
-            self.assistant.new_session()
-            answer = "I couldn't complete that request. Please try again."
-        if turn.cancelled.is_set():
-            self.assistant.new_session()
-            return
-        if not answer.strip():
-            return
-        self.output("Assistant: " + answer)
-        spoken = bounded_speech(answer)
-        if not turn.cancelled.is_set():
+            self.output("You: " + turn.text)
             try:
-                self.tts.play(spoken, blocking=True)
+                answer = self.assistant.reply(turn.text, turn.cancelled.is_set)
             except Exception:
+                logger.exception("agent.turn status=failed")
                 self.assistant.new_session()
-                raise
-        if turn.cancelled.is_set():
+                answer = "I couldn't complete that request. Please try again."
+            if turn.cancelled.is_set() or not answer.strip():
+                return
+            self.output("Assistant: " + answer)
+            spoken = bounded_speech(answer)
+            if not turn.cancelled.is_set():
+                self.tts.play(spoken, blocking=True, cancelled=turn.cancelled)
+        finally:
             self.assistant.new_session()

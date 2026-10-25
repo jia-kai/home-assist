@@ -58,7 +58,7 @@ USE_TORCH=0 uv run python -m tools.prepare_llm --model functiongemma compile --d
 ```
 
 Without `--revision`, download resolves `main` to an immutable commit and records
-it in `.cache/hoast/model.json`. Authentication uses the standard Hugging Face
+it in `models/functiongemma/model.json`. Authentication uses the standard Hugging Face
 credential store. Export creates stateful OpenVINO IR with KV caching and prepares
 both SDPA and paged attention (PA) for the chosen device. INT8 is symmetric;
 experimental INT4 is symmetric, group size 128, ratio 1.0, with embedding/final
@@ -77,7 +77,7 @@ USE_TORCH=0 uv run python -m tools.prepare_llm --model lfm compile --device GPU
 Download uses anonymous access to the public
 `OpenVINO/LFM2.5-350M-int8-ov` conversion linked from LiquidAI's model card, pinned
 to `b6a4a9c42aa2dc4bacefa45717befc45acc3a1bf`. `--revision` can select another
-export commit. Provenance is recorded in `.cache/hoast/lfm/model.json`.
+export commit. Provenance is recorded in `models/lfm/model.json`.
 The publisher identifies `LiquidAI/LFM2.5-350M`, NNCF `INT8_ASYM` weights and group
 size -1, but does not identify the upstream weight commit. Pinning the export
 does not establish that missing source revision.
@@ -92,13 +92,17 @@ The preparation CLI compiles models without running a benchmark or tool handler.
 
 ### Cache and diagnostics
 
-All paths default to `.cache/hoast/` relative to the working directory. Put
-`--cache-dir /absolute/cache` before the preparation subcommand and pass the same
-root to runtime `from_cache` methods. Downloaded HF snapshots, exported XML/BIN
-IR, selection/provenance manifests, device compilation caches, and preparation
-diagnostics are retained. Export identities include model provenance, dependency
-versions and compression settings; existing completed exports reuse IR. A failed
-new export/compile does not publish an export completion manifest.
+Permanent model paths default to `models/` relative to the working directory.
+Put `--model-root /absolute/models` before the preparation subcommand and pass
+the same `model_root` to runtime `from_cache` methods. Despite their name, those
+factories read selection manifests from the permanent model root. Checkpoints,
+exported XML/BIN IR and provenance manifests are independent of `.cache`.
+`--cache-dir /absolute/cache` selects disposable Hugging Face downloads,
+device compilation caches and preparation diagnostics. Downloaded snapshots are
+materialized without symlinks before publication under the permanent root.
+Export identities include model provenance, dependency versions and compression
+settings; existing completed exports reuse IR. A failed new export/compile does
+not publish an export completion manifest.
 
 `compile` operates on existing IR without downloading or exporting. Model files
 are portable IR, not standalone executables; changing hardware, runtime or compile
@@ -147,7 +151,7 @@ from pathlib import Path
 from hoast.llm import LLMConfig
 
 cache = Path(".cache/hoast")
-manifest = json.loads((cache / "model.json").read_text())
+manifest = json.loads(Path("models/functiongemma/model.json").read_text())
 torch_config = LLMConfig(Path(manifest["path"]), backend="torch", cache_dir=cache)
 ```
 

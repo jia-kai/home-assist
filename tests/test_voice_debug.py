@@ -10,7 +10,8 @@ from aioesphomeapi.client import APIClient
 from aioesphomeapi.model import VoiceAssistantAudioSettings
 
 from hoast import voice
-from hoast.tts import TTS
+from hoast.stt2 import STT
+from hoast.tts2 import TTS
 from hoast.voice import Event, VoiceReceiver
 from hoast.voice_debug import replay_capture
 
@@ -141,7 +142,7 @@ def test_debug_replay_drains_before_stt(
 
 @pytest.mark.parametrize("debug", [False, True])
 def test_standalone_replay_owner(debug: bool, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Standalone STT owns one model-free replay engine only when debugging is enabled.
+    """Standalone STT owns one model-free cue engine, with optional debug replay.
 
     Args:
         debug:
@@ -153,19 +154,18 @@ def test_standalone_replay_owner(debug: bool, monkeypatch: pytest.MonkeyPatch) -
     """
     engine = MagicMock(spec=TTS)
     factory = MagicMock(return_value=engine)
+    stt = MagicMock(spec=STT)
     listener = AsyncMock()
     monkeypatch.setattr(voice, "TTS", factory)
-    monkeypatch.setattr(voice, "STT", MagicMock())
+    monkeypatch.setattr(voice, "STT", MagicMock(return_value=stt))
     monkeypatch.setattr(voice, "listen", listener)
     monkeypatch.setattr(voice, "configure_cpu_budget", MagicMock())
     monkeypatch.setattr(voice, "configure_logging", MagicMock())
     monkeypatch.setattr("sys.argv", ["voice", *(["--debug-audio"] if debug else [])])
     voice.main()
     listener.assert_awaited_once()
-    if debug:
-        factory.assert_called_once_with(playback_only=True)
-        assert listener.call_args.kwargs["replay_tts"] is engine
-        engine.close.assert_called_once()
-    else:
-        factory.assert_not_called()
-        assert listener.call_args.kwargs["replay_tts"] is None
+    stt.close.assert_called_once()
+    factory.assert_called_once_with(playback_only=True)
+    assert listener.call_args.kwargs["replay_tts"] is engine
+    assert listener.call_args.kwargs["debug_audio"] is debug
+    engine.close.assert_called_once()

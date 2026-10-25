@@ -1,17 +1,19 @@
-"""Streaming Silero speech endpoint using faster-whisper's bundled ONNX model."""
+"""Streaming Silero v6 speech endpoint using a prepared, local ONNX model."""
 
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 import onnxruntime as ort
-from faster_whisper.vad import get_vad_model
 from numpy.typing import NDArray
 
 FRAME_SAMPLES = 512
 FRAME_BYTES = FRAME_SAMPLES * 2
 SILENCE_SAMPLES = 8000
+DEFAULT_VAD_MODEL = Path("models/vad/silero_vad_v6.onnx")
 
 
 class FrameVAD(Protocol):
@@ -32,11 +34,43 @@ class FrameVAD(Protocol):
         ...
 
 
-def _session() -> ort.InferenceSession:
-    """Reuse the bundled single-thread CPU Silero session without sharing recurrent state."""
-    session = get_vad_model().session
-    if {item.name for item in session.get_inputs()} != {"input", "h", "c"}:
-        raise RuntimeError("Unsupported bundled Silero streaming model interface")
+@lru_cache(maxsize=1)
+def _session(model_path: Path = DEFAULT_VAD_MODEL) -> ort.InferenceSession:
+    """Cache a single-thread CPU session without state sharing or network access.
+
+    Args:
+        model_path:
+            Prepared Silero v6 ONNX file; relative paths use the working directory.
+
+    """
+    if not model_path.is_file():
+        raise FileNotFoundError(
+            f"Missing Silero VAD model: {model_path}; run python -m tools.prepare_vad"
+        )
+    options = ort.SessionOptions()
+    options.inter_op_num_threads = 1
+    options.intra_op_num_threads = 1
+    options.enable_cpu_mem_arena = False
+    options.log_severity_level = 4
+    session = ort.InferenceSession(
+        str(model_path), providers=["CPUExecutionProvider"], sess_options=options
+    )
+    inputs = session.get_inputs()
+    outputs = session.get_outputs()
+    if (
+        {item.name for item in inputs} != {"input", "h", "c"}
+        or [item.name for item in outputs] != ["speech_probs", "hn", "cn"]
+        or any(item.type != "tensor(float)" for item in [*inputs, *outputs])
+    ):
+        raise RuntimeError("Unsupported Silero v6 streaming model interface")
+    shapes = {item.name: item.shape for item in [*inputs, *outputs]}
+    if (
+        len(shapes["input"]) != 2
+        or shapes["input"][1] != 576
+        or len(shapes["speech_probs"]) != 1
+        or any(shapes[name] != [1, 1, 128] for name in ("h", "c", "hn", "cn"))
+    ):
+        raise RuntimeError("Unsupported Silero v6 streaming model shapes")
     return session
 
 
@@ -87,8 +121,12 @@ class SileroVAD:
         )
         self.h = np.asarray(h, dtype=np.float32)
         self.c = np.asarray(c, dtype=np.float32)
-        assert self.h.shape == self.c.shape == (1, 1, 128)
-        return float(np.asarray(probability).item())
+        probability = np.asarray(probability)
+        if self.h.shape != (1, 1, 128) or self.c.shape != (1, 1, 128):
+            raise RuntimeError("Silero returned invalid recurrent state shapes")
+        if probability.size != 1:
+            raise RuntimeError("Silero returned multiple frame probabilities")
+        return float(probability.item())
 
 
 @dataclass(slots=True)

@@ -56,7 +56,7 @@ It starts its own satellite and native API client, replaces the wake chime with
 the spoken reply, and rearms after playback. No STT or agent process is needed.
 Stop an existing satellite on port 6053 before starting this test. Ctrl-C closes
 the client and stops its satellite. Use `--input-device 'YOUR MICROPHONE NAME'`
-to select a microphone. The reply is synthesized once using the prepared Kokoro
+to select a microphone. The reply is synthesized once using the prepared Melo TTS2
 model and cached in `.cache/hoast/wake-test/im-here.wav`; output uses the satellite's
 default playback device. Detailed diagnostics are in
 `.cache/hoast/diagnostics/wake-test.log`.
@@ -91,7 +91,7 @@ prints the answer, and speaks at most 400 characters through system audio.
 Complete sentences/words are preferred when truncating. The native run ends only
 after playback drains, so the satellite cannot trigger another turn during TTS.
 This is half-duplex; barge-in is not enabled. Streaming Silero VAD finishes
-capture after 600 ms of detected silence following speech, rather than waiting
+capture after 500 ms of detected silence following speech, rather than waiting
 for the configured maximum duration. Initial silence does not trigger the
 endpoint, and speech resumption resets the trailing-silence counter.
 
@@ -101,6 +101,21 @@ are excluded from this context; `what_is_playing` supplies metadata for explicit
 queries and verified playback responses. Routing diagnostics distinguish the
 LLM-selected tool batch from implicit lookups inside playback handlers. Raw model
 output is retained at debug level in the agent diagnostic log.
+
+The native application and standalone receiver play host feedback tones by
+default: a faded 120-ms **880-Hz cue after the first valid nonempty audio packet**
+following wakeup, then a **440-Hz cue when the speech/silence endpoint ends
+capture**. Wake acceptance alone does not play the first cue. Initial silence,
+maximum duration, remote stop and abort do not play the silence-ended cue.
+Both host capture tones use a 0.4 full-scale peak with a Hann fade (about
+−15.2 dBFS whole-tone RMS). Opt-in debug replay's bracket tones retain a 0.12
+peak; microphone PCM and ordinary synthesized replies are not amplified.
+Output runs on an owned worker while network buffering and VAD continue; the
+first cue drains before the second, debug replay, STT or spoken replies. Abort
+and disconnect skip new output and drain accepted audio. Cue samples are never
+added to the command sent to STT. Output failures are logged and do not silently
+substitute audio or alter microphone gain. Satellite-configured wake/processing
+sounds and existing protocol events remain separate from these host tones.
 
 Use `--debug-audio` with `python -m hoast` or the standalone `python -m hoast.voice`
 to replay each captured command before transcription. Playback is a 120 ms high
@@ -112,14 +127,18 @@ between blocks, drains queued output, and suppresses STT for the cancelled comma
 Replay uses the application's existing `TTS.play_samples` and shared playback
 queue. The complete cue/command waveform is resampled from 16 to 24 kHz once,
 avoiding seams between queued blocks; the original captured PCM still goes to STT.
-The standalone STT CLI owns one playback-only TTS instance for replay without
-loading synthesis models. Linux output prefers PipeWire/PulseAudio adapters to
+The standalone STT CLI owns one playback-only TTS instance for capture cues and
+optional replay, without loading synthesis models. Linux output prefers PipeWire/PulseAudio adapters to
 avoid direct ALSA `dmix` contention with the satellite. `wait_playback` closes a
 drained queue; shared ownership does not keep the physical device open forever.
 
-Conversation reuse is based on capture timestamps: start a new session if the
-next first PCM arrives more than 30 seconds after the previous nonempty command
-capture ended. Exactly 30 seconds reuses the session. Empty STT does not extend it.
+Each accepted voice command is independent: it starts with fresh conversation
+history, even when captures are close together. Capture timestamps do not control
+conversation state. History is discarded after success, failure or cancellation,
+while loaded models and configured tools are reused. Include the full request in
+each command; voice follow-ups cannot refer to earlier commands. Empty STT does
+not invoke the agent. Text CLI conversations retain multi-turn history and support
+`/reset` to start a fresh conversation.
 The existing `[switch].ip` enables the verified `set_light(on=true/false)` tool.
 Music confirmations use actual observed track labels and mention only the first
 structured artist. Missing metadata or requested-only playback retains a cautious
@@ -186,12 +205,12 @@ uv run python -m hoast.voice --language auto --seconds 10
 ```
 
 Say **“Okay Nabu”**, wait for the chime, then speak your command. The receiver
-records until **600 ms of detected trailing silence**, then transcribes. A native
+records until **500 ms of detected trailing silence**, then transcribes. A native
 audio-end message can also end recording. `--seconds` accepts a hard maximum of
 0.1–30 seconds (default six); both elapsed time and buffered audio are bounded.
 Silence is counted in received PCM, not gaps in network delivery. Silero scores
-32 ms frames: 19 silent frames establish the threshold at 608 ms, and the retained
-buffer is trimmed to 600 ms after the last non-silent frame. Packetization adds
+32 ms frames: 16 silent frames establish the threshold at 512 ms, and the retained
+buffer is trimmed to 500 ms after the last non-silent frame. Packetization adds
 notification latency. The listener processes at most four frames before yielding
 to network control events; no audio history is rescanned or downloaded.
 
@@ -223,6 +242,11 @@ returns text. `VoiceReceiver` owns one capture at a time, rejects overlapping
 starts and server-side wake requests, and sends native run/STT/end/error events.
 `listen` supplies the streaming endpoint; direct receiver test transports can omit
 it. Recurrent state and partial frame buffers reset on every accepted wake.
+`listen(sound_cues=True)` requires a caller-owned `replay_tts` instance even when
+`debug_audio=False`; the application supplies its existing TTS, and the standalone
+CLI supplies a playback-only owner. Direct `VoiceReceiver` transports default to
+`sound_cues=False` unless explicitly enabled. Custom listeners can disable the
+host cues with `sound_cues=False`. The receiver never closes the shared owner.
 
 Capture cancellation or disconnection discards incomplete audio. If STT is already
 running, shutdown waits for it, then suppresses its transcript. Failed or empty

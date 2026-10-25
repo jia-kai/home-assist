@@ -72,9 +72,10 @@ port, and an NTP server on the IoT AP host. `arduino-cli` is not required.
    its MD5 is `b62766ccf8fbbaf924d0d13beace495b`.
 
 3. Root Docker Compose runs Hoast directly against `[satellite].host` and reads
-   `ESPHOME_API_KEY` from root `.env`. It also starts the MA reference bridge,
-   which reads `[satellite].host` and `[music].player_id` from the same config
-   and binds `/data/aec-reference/aec-reference-{player_id}.sock` in the shared
+   `ESPHOME_API_KEY` from root `.env`. The MA reference bridge service is commented
+   out in root `docker-compose.yaml`; uncomment its block to enable the AEC path.
+   When enabled, it reads `[satellite].host` and `[music].player_id` from the same
+   config and binds `/data/aec-reference/aec-reference-{player_id}.sock` in the shared
    data mount. On a first installation with a loopback satellite setting, the
    optional helper makes a private backup before changing the ignored root
    `config.toml`:

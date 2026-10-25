@@ -19,6 +19,7 @@ from pydantic import JsonValue
 from .input_text import canonical_user_messages
 from .llm import (
     DEFAULT_CACHE,
+    DEFAULT_MODELS,
     GeneratedCallError,
     Generation,
     ToolCall,
@@ -272,12 +273,14 @@ class LFMConfig:
         cache_dir: Path = DEFAULT_CACHE,
         threads: int | None = None,
         device: Literal["CPU", "GPU"] = "GPU",
+        *,
+        model_root: Path = DEFAULT_MODELS,
     ) -> Self:
         """Resolve the prepared export without network access.
 
         Args:
             cache_dir:
-                Cache root used by `tools/prepare_llm.py`.
+                Disposable compilation cache; never used to select model artifacts.
 
             threads:
                 One or two CPU workers; None selects one for GPU, two for CPU.
@@ -285,8 +288,11 @@ class LFMConfig:
             device:
                 Explicit OpenVINO execution device, GPU by default, without fallback.
 
+            model_root:
+                Permanent root containing lfm/model.json.
+
         """
-        manifest = json.loads((cache_dir / "lfm/model.json").read_text())
+        manifest = json.loads((model_root / "lfm/model.json").read_text())
         if manifest["model_id"] != "LiquidAI/LFM2.5-350M":
             raise ValueError("Unexpected model in LFM manifest")
         return cls(

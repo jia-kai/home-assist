@@ -4,9 +4,10 @@ import argparse
 import asyncio
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .agent import SYSTEM_PROMPT, LocalAgent
 from .application import Assistant, VoiceApplication
@@ -19,8 +20,10 @@ from .logging import configure_logging, get_logger
 from .music import MusicClient
 from .runtime import configure_cpu_budget
 from .session import Session
-from .stt import STT, STTConfig
-from .tts import TTS, TTSConfig
+from .stt2 import DEFAULT_MODEL as DEFAULT_STT_MODEL
+from .stt2 import STT, STTConfig
+from .tts2 import DEFAULT_MODEL as DEFAULT_TTS_MODEL
+from .tts2 import TTS, TTSConfig
 from .voice import VoiceTurn, listen
 from .weather import WeatherClient
 
@@ -28,9 +31,22 @@ logger = get_logger(__name__)
 
 
 def prepare_voice(
-    assistant: Assistant, config: SatelliteConfig, cache: Path
+    assistant: Assistant,
+    config: SatelliteConfig,
+    cache: Path,
+    *,
+    threads: int = 2,
+    stt_backend: Literal["cpu", "GPU", "ort"] = "cpu",
+    stt_model_dir: Path | None = None,
+    tts_model_dir: Path | None = None,
 ) -> VoiceApplication:
-    """Load and warm bilingual speech and LLM, then announce initialization.
+    """Load native SenseVoice/Melo, warm speech and LLM, then announce readiness.
+
+    Both speech engines receive the same one/two-thread process budget as LLM.
+    Voice synthesis uses 0.85x speed for startup speech and spoken replies;
+    standalone synthesis/benchmark defaults are unchanged.
+    Artifact overrides are explicit; missing artifacts fail without downloads or
+    backend fallback. Startup failure releases every constructed speech engine.
 
     Args:
         assistant:
@@ -40,32 +56,48 @@ def prepare_voice(
             Satellite settings supplying the transcription language.
 
         cache:
-            Prepared LLM and bilingual speech artifact root.
+            Disposable cache root retained for call compatibility; not model selection.
+
+        threads:
+            Shared STT/TTS/LLM CPU budget, one or two. The local representative
+            CPU speech measurements select two under the inclusive 1.2 ratio rule.
+
+        stt_backend:
+            Explicit SenseVoice execution backend; errors never select a fallback.
+
+        stt_model_dir:
+            Explicit prepared SenseVoice root; None selects models/stt2.
+
+        tts_model_dir:
+            Explicit prepared bilingual Melo root; None selects models/tts2.
 
     """
-    tts = TTS(
-        TTSConfig(
-            model_path=cache / "tts/kokoro-v1.0.onnx",
-            voices_path=cache / "tts/voices-v1.0.bin",
-            # The optional Snake extension crashes CPU inference with GenAI loaded.
-            activation_kernel=None,
-            chinese_model_dir=cache / "tts/chinese",
-            chinese_python=cache / "speech-env/.venv/bin/python",
-        )
-    )
-    try:
-        stt = STT(
-            STTConfig(
-                model_path=cache / "stt/small",
-                language=None if config.language == "auto" else config.language,
+    with ExitStack() as cleanup:
+        tts = TTS(
+            TTSConfig(
+                model_path=DEFAULT_TTS_MODEL
+                if tts_model_dir is None
+                else tts_model_dir,
+                threads=threads,
+                speed=0.85,
             )
         )
+        cleanup.callback(tts.close)
+        stt = STT(
+            STTConfig(
+                model_path=DEFAULT_STT_MODEL
+                if stt_model_dir is None
+                else stt_model_dir,
+                threads=threads,
+                language=None if config.language == "auto" else config.language,
+                backend=stt_backend,
+            )
+        )
+        cleanup.callback(stt.close)
         application = VoiceApplication(assistant, stt, tts)
         application.warmup()
+        cleanup.pop_all()
         return application
-    except BaseException:
-        tts.close()
-        raise
 
 
 async def run_voice(
@@ -74,6 +106,11 @@ async def run_voice(
     key: str | None,
     cache: Path,
     debug_audio: bool = False,
+    *,
+    threads: int = 2,
+    stt_backend: Literal["cpu", "GPU", "ort"] = "cpu",
+    stt_model_dir: Path | None = None,
+    tts_model_dir: Path | None = None,
 ) -> None:
     """Warm and run the native voice pipeline with one serialized inference worker.
 
@@ -88,17 +125,40 @@ async def run_voice(
             Optional Noise encryption key; never logged.
 
         cache:
-            Prepared speech/model artifact root.
+            Disposable cache root retained for call compatibility; not model selection.
 
         debug_audio:
             Replay each captured command between tones before STT when true.
+
+        threads:
+            Shared STT/TTS/LLM CPU budget, one or two, passed to both speech engines.
+
+        stt_backend:
+            Explicit SenseVoice execution backend, forwarded unchanged to startup.
+
+        stt_model_dir:
+            Explicit SenseVoice artifact root; None selects models/stt2.
+
+        tts_model_dir:
+            Explicit bilingual Melo artifact root; None selects models/tts2.
 
     """
     loop = asyncio.get_running_loop()
     with ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="voice-inference"
     ) as worker:
-        future = loop.run_in_executor(worker, prepare_voice, assistant, config, cache)
+        future = loop.run_in_executor(
+            worker,
+            lambda: prepare_voice(
+                assistant,
+                config,
+                cache,
+                threads=threads,
+                stt_backend=stt_backend,
+                stt_model_dir=stt_model_dir,
+                tts_model_dir=tts_model_dir,
+            ),
+        )
         application: VoiceApplication | None = None
         try:
             try:
@@ -142,7 +202,7 @@ async def run_voice(
             )
         finally:
             if application is not None:
-                await loop.run_in_executor(worker, application.tts.close)
+                await loop.run_in_executor(worker, application.close)
 
 
 def main() -> None:
@@ -192,13 +252,29 @@ def main() -> None:
         "--cache",
         type=Path,
         default=DEFAULT_CACHE,
-        help="Prepared-model and compiled-cache root",
+        help="Disposable compilation cache root (model selections live under models)",
+    )
+    parser.add_argument(
+        "--stt-backend",
+        choices=("cpu", "GPU", "ort"),
+        default="cpu",
+        help="Explicit SenseVoice backend; independent of --device, without fallback",
+    )
+    parser.add_argument(
+        "--stt-model-dir",
+        type=Path,
+        help="Prepared native SenseVoiceSmall artifact root (default: models/stt2)",
+    )
+    parser.add_argument(
+        "--tts-model-dir",
+        type=Path,
+        help="Prepared native bilingual MeloTTS artifact root (default: models/tts2)",
     )
     parser.add_argument(
         "--threads",
         choices=("auto", "1", "2"),
         default="auto",
-        help="LLM worker budget; auto uses one for GPU and two for CPU; voice mode reserves two CPU cores for speech",
+        help="Shared STT/TTS/LLM CPU budget; voice auto uses the measured two-thread CPU speech policy; text auto uses one for GPU and two for CPU",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -212,11 +288,11 @@ def main() -> None:
     configure_logging()
     try:
         threads = (
-            (1 if args.device == "GPU" else 2)
+            (1 if args.text and args.device == "GPU" else 2)
             if args.threads == "auto"
             else int(args.threads)
         )
-        configure_cpu_budget(threads if args.text else 2)
+        configure_cpu_budget(threads)
         config = load_config(args.config)
         if not args.text and config.satellite is None:
             raise ValueError("Configure [satellite].host for voice mode, or use --text")
@@ -267,7 +343,15 @@ def main() -> None:
                 get_logger("aioesphomeapi").setLevel("INFO")
                 asyncio.run(
                     run_voice(
-                        assistant, config.satellite, key, args.cache, args.debug_audio
+                        assistant,
+                        config.satellite,
+                        key,
+                        args.cache,
+                        args.debug_audio,
+                        threads=threads,
+                        stt_backend=args.stt_backend,
+                        stt_model_dir=args.stt_model_dir,
+                        tts_model_dir=args.tts_model_dir,
                     )
                 )
                 return

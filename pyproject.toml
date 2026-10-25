@@ -13,9 +13,6 @@ dependencies = [
     "optimum-intel[openvino,nncf]>=1.26",
     "openvino-genai>=2026.3",
     "python-dotenv>=1.1",
-    "faster-whisper>=1.2.1",
-    "ctranslate2>=4.8.2",
-    "kokoro-onnx>=0.4.9",
     "soundfile>=0.13",
     "numpy>=2.3",
     "onnxruntime>=1.24",
@@ -26,10 +23,23 @@ dependencies = [
     "soundcard>=0.4.3",
     "sounddevice>=0.5",
     "aioesphomeapi==45.3.1",
+    "sentencepiece==0.2.2",
+    "tokenizers>=0.22",
+    "inflect>=7.5",
+    "nltk>=3.9.2",
+    "cn2an>=0.5.23",
+    "jieba>=0.42.1",
+    "pypinyin>=0.55",
+    "pyyaml>=6",
 ]
 
 [dependency-groups]
-dev = ["pytest>=8", "pyright>=1.1.400", "ruff>=0.12"]
+dev = [
+    "pytest>=8",
+    "pyright>=1.1.400",
+    "ruff>=0.12",
+    "kaldi-native-fbank>=1.22",
+]
 
 [tool.uv]
 package = false
@@ -45,7 +55,7 @@ torch = { index = "pytorch-cpu" }
 [tool.pyright]
 include = ["hoast", "tools", "tests", "finetune"]
 # CUDA-only training is checked with finetune/env/pyrightconfig.json.
-exclude = ["finetune/env", "finetune/train.py", "finetune/speech_env", "finetune/speech_worker.py"]
+exclude = ["finetune/env", "finetune/train.py"]
 pythonVersion = "3.14"
 venvPath = "."
 venv = ".venv"

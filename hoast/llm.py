@@ -19,6 +19,7 @@ from .logging import get_logger
 
 logger = get_logger(__name__)
 DEFAULT_CACHE = Path(".cache/hoast")
+DEFAULT_MODELS = Path("models")
 SYSTEM_PROMPT = (
     "You are a model that can do function calling with the following functions"
 )
@@ -490,7 +491,7 @@ class LLMConfig:
     """Execution engine; loading never downloads or exports models."""
 
     cache_dir: Path = DEFAULT_CACHE
-    """Working-directory-relative persistent compilation cache root."""
+    """Working-directory-relative disposable compilation cache root."""
 
     threads: int = 4
     """CPU inference threads; torch changes its process-global thread count."""
@@ -518,12 +519,14 @@ class LLMConfig:
         threads: int = 4,
         attention_backend: Literal["PA", "SDPA"] = "PA",
         device: Literal["CPU", "GPU"] = "CPU",
+        *,
+        model_root: Path = DEFAULT_MODELS,
     ) -> Self:
         """Resolve a prepared OpenVINO artifact without network access.
 
         Args:
             cache_dir:
-                Working-directory-relative cache used by `prepare_llm.py`.
+                Disposable compilation cache; never used to select model artifacts.
 
             precision:
                 Prepared weight format whose manifest selects the export.
@@ -538,8 +541,13 @@ class LLMConfig:
             device:
                 Explicit OpenVINO execution device, without fallback.
 
+            model_root:
+                Permanent root containing functiongemma/{precision}.json.
+
         """
-        manifest = json.loads((cache_dir / f"{precision}.json").read_text())
+        manifest = json.loads(
+            (model_root / "functiongemma" / f"{precision}.json").read_text()
+        )
         return cls(
             Path(manifest["path"]),
             cache_dir=cache_dir,

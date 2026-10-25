@@ -7,32 +7,59 @@ LFM2.5-350M through OpenVINO on Intel GPU by default, with CPU execution availab
 
 This is a source-tree development project. The bootstrap installs
 [uv](https://docs.astral.sh/uv/) into user-local storage if needed, installs Python
-3.14 and the locked dependencies into `.venv`, and prepares every model used by the
-default assistant: LFM2.5, Whisper-small, and English/Chinese Kokoro.
+3.14 and the locked dependencies into `.venv`, and prepares LFM2.5 plus native
+SenseVoiceSmall STT and English/Chinese MeloTTS. All speech runtime and preparation
+use the same Python 3.14 environment; no speech worker environment is provisioned.
 
 ```sh
 ./prepare.sh
 # Also prepare the optional gated FunctionGemma model, after obtaining HF access:
 ./prepare.sh --with-functiongemma
+# No network: cached uv/Python/dependencies, prepared LFM selection and speech inputs:
+./prepare.sh --offline
 ```
 
 The script can be invoked from another directory and always prepares this checkout.
-It reuses verified downloads, prepares LFM's GPU/CPU caches, provisions Chinese's
-Python 3.12 environment, and runs the compact kernel/bilingual speech check. Model
-steps run serially with at most two CPU cores and a 4 GiB memory cap. Detailed logs
-are saved under `.cache/hoast/diagnostics/prepare/`.
+It validates pinned inputs, reuses `.cache/speech-bench/models/` and `source/` when
+available, and fetches missing speech inputs into `models/speech2-inputs/`.
+It prepares LFM's GPU/CPU caches and exports native speech graphs serially with
+at most two CPU cores and a 4 GiB memory cap. Default speech artifacts are FP32
+OpenVINO STT at `models/stt2` and decoder-only FP16 Melo at
+`models/tts2/{EN,ZH}` (BERT/encoder/flow remain FP32). The qualified default
+speech policy is CPU with two threads, independent of the LLM's `--device GPU`.
+Explicit `--tts-precision FP32` uses the separate `models/tts2-fp32` root.
+Preparation includes Melo's
+original-source numerical gates, **not** a speech latency benchmark, inference
+smoke test, or broad recognition/perceptual qualification. Missing offline inputs
+fail with durable diagnostics rather than claiming readiness.
 
-Prerequisites are Linux, Bash, a C++17 compiler, `systemd-run`/`systemctl` with a
-running user manager, `taskset`, and a working Intel OpenCL driver for UHD 630.
-The resource guard requires at least 7 GiB available memory before each model step.
-Network access is needed for missing dependencies/models; bootstrapping uv also
-needs curl or wget. System packages and configuration files are not modified.
+Existing artifact targets are **never replaced**. On a repeat run, select fresh
+`--stt-output` and `--tts-output` roots, or use already prepared roots directly in
+the application. `./prepare.sh --help` lists explicit source/resource, artifact,
+backend and precision options. Full bootstrap/stage logs are saved under
+`.cache/hoast/diagnostics/prepare/`; standalone input-fetch failures also have
+unique logs under `.cache/hoast/diagnostics/fetch-speech2/`.
+
+Prerequisites are Linux, Bash, git, `systemd-run`/`systemctl` with
+a running user manager, `taskset`, and a working Intel OpenCL driver for UHD 630
+(LFM GPU preparation). The resource guard requires at least 7 GiB available memory
+before each model step. Network access is needed for missing dependencies/models;
+bootstrapping uv also needs curl or wget. `--offline` disables uv/HF/speech input
+network access and requires uv already on PATH, plus a prior LFM
+`models/lfm/model.json` selection and its local artifacts (and
+`models/functiongemma/model.json` for optional offline FunctionGemma). The online LLM
+download commands resolve Hugging Face metadata, so offline bootstrap reuses
+these selections instead of invoking them. System packages, services,
+containers and configuration files are not modified or started.
 If uv was newly installed, add its directory (normally `$HOME/.local/bin`) to your
 shell's PATH before using the `uv` commands below. The bootstrap adjusts PATH for
 its own run without editing shell startup files.
 
-Other commands below run from the project root. Artifacts and compilation caches
-live in `.cache/hoast/`. Alternative models and backend details are covered in
+Other commands below run from the project root. Permanent models, pinned speech
+preparation inputs and selection manifests live in `models/`; disposable
+downloads, compilation caches and logs live in `.cache/hoast/`. Deleting `.cache`
+does not remove prepared runtime models.
+Alternative models and backend details are covered in
 [docs/llm.md](docs/llm.md).
 
 Copy the example configuration, then set your home coordinates in decimal degrees:
@@ -60,17 +87,31 @@ uv run python -m hoast --config config.toml --text
 
 ### Containers
 
-The root Compose file starts Music Assistant, Hoast and the reSpeaker AEC
-reference bridge. Hoast connects directly to the reSpeaker ESPHome API configured
-in root `config.toml`; the encrypted API key comes from root `.env` through
+The root Compose file starts Music Assistant and Hoast. The reSpeaker AEC
+reference bridge service is commented out; uncomment its block in
+`docker-compose.yaml` to enable it explicitly. Hoast connects directly to the
+reSpeaker ESPHome API configured in root `config.toml`; the encrypted API key comes from root `.env` through
 `satellite.key_env`. The bridge reads the device address and MA player ID from
 the same config, then binds that player's socket in the shared
 `$HOME/music-data/aec-reference/` directory. Both services use the Hoast image
 and run as UID/GID `1000:1000`. The source tree and model cache are mounted;
 PipeWire is forwarded from `/run/user/1000` for Hoast's system audio output.
+Hoast has a 5.5 GiB memory limit for native SenseVoice/Melo and the GPU LLM, and
+uses host CPUs 4–5 with bounded two-worker inference pools. Adjust `cpuset` for
+hosts with a different CPU layout. The bridge is not required for host-side
+capture cues or speech playback.
 
 ```sh
 docker compose up -d --build
+```
+
+To rebuild/recreate only Hoast without restarting Music Assistant:
+
+```sh
+# Bound build containers as well as the deployed service (classic Docker builder).
+DOCKER_BUILDKIT=0 docker build --cpuset-cpus 4,5 --memory 3g -t home-assist/hoast:latest .
+# Stop any independently running native Hoast before starting the container.
+docker compose up -d --no-build --no-deps --force-recreate hoast
 ```
 
 The root Compose configuration does not start the Linux microphone simulator.
@@ -88,15 +129,18 @@ the bridge's audio path.
 
 Voice mode connects to `[satellite].host` in `config.toml`, receives command audio,
 runs STT and the tool-based agent, then plays its bounded reply through system
-audio. Startup warms English and Chinese TTS, feeds both generated clips to STT,
+audio. Startup speech and replies use Melo's 0.85x speaking speed (about 15%
+slower than the standalone synthesizer's 1.0x default). Startup warms English and
+Chinese TTS, feeds both generated clips to STT,
 then warms LLM inference without dispatching tools. Listening starts after warm-up.
-The satellite stays busy until playback drains. A gap of **more than 30 seconds**
-between the previous recognized capture's end and the next capture's first audio
-starts a fresh LLM session. Capture ends adaptively after **600 ms of detected
+The satellite stays busy until playback drains. Every voice command starts a
+fresh LLM session and discards its history on completion; voice follow-ups do not
+reuse earlier commands. Text mode retains conversation history until `/reset`.
+Capture ends adaptively after **500 ms of detected
 silence following speech**. `satellite.capture_seconds` is the hard maximum
 (six seconds by default), not a mandatory wait. Initial silence waits for speech
 or the maximum; short pauses are tolerated. Silero uses 32 ms frames, so endpoint
-notification has frame/packet granularity while retained trailing silence is 600 ms.
+notification has frame/packet granularity while retained trailing silence is 500 ms.
 
 To hear exactly what the controller captured, run:
 
@@ -121,7 +165,7 @@ the complete agent response; the text console retains the full grounded answer.
 
 In text mode, use `/reset` to clear history and EOF to exit. Conversational output goes to
 stdout. In voice and text mode, diagnostics go to stderr without persistent log
-files by default, including the Chinese speech worker.
+files by default. Native English/Chinese speech runs in the application process.
 
 To select a custom fine-tuned OpenVINO LFM export, add this to `config.toml`:
 
@@ -131,44 +175,114 @@ model_dir = "models/openvino-int8"
 ```
 
 The path is relative to the working directory (absolute paths also work). This
-setting bypasses the LFM cache manifest; without it, LFM uses
-`<cache>/lfm/model.json`. It applies to the default LFM model; `--model functiongemma`
+setting bypasses the LFM selection manifest; without it, LFM uses
+`models/lfm/model.json`. It applies to the default LFM model; `--model functiongemma`
 uses its own prepared model. Compiled model artifacts still use `--cache`.
 
-`--help` describes options and displays defaults. The LFM CPU budget defaults to
-`--threads auto`: one core for GPU execution, two for CPU. Explicit `1` or `2`
-overrides it. GPU inference uses FP16 computation with INT8-stored weights.
+`--help` describes options and displays defaults. In text mode, the LFM CPU budget
+defaults to `--threads auto`: one core for GPU execution, two for CPU. Voice mode
+uses the qualified shared two-thread STT/TTS/LLM budget. Explicit `1` or `2`
+overrides it. LFM GPU inference uses FP16 computation with INT8-stored weights.
 
 ## Speech
 
-Local speech uses Kokoro with a CPU graph and zero-copy INT8-weight GPU decoder
-convolution for TTS, and faster-whisper small INT8 for STT. The TTS runtime targets
-Intel UHD 630; both engines default to two inference threads. Initialize and test from the
-project root:
+Application imports are `hoast.stt2.STT`/`STTConfig` and
+`hoast.tts2.TTS`/`TTSConfig`: native SenseVoiceSmall with repository-owned NumPy
+FBANK/LFR/CMVN, and native EN/ZH Melo normalization/G2P/BERT plus four resident
+OpenVINO stages. Runtime does not import FunASR, sherpa, Melo's frontend, or
+`g2p_en`; it does not execute an alternate Python interpreter. Cached package
+paths are **data locations only**. The application uses CPU speech with a shared
+two-core budget in voice mode; LFM GPU selection does not move speech to GPU.
+
+### Pinned inputs and offline preparation
+
+The input helper defaults to offline validation. Explicit `--download` fetches
+only full-revision and SHA256-pinned SenseVoice, EN/ZH Melo/BERT assets, the exact
+Melo git commit, and static frontend resources. English resources are extracted
+from the pinned `g2p_en` 2.1.0 wheel (NPZ/text only, not installed or imported).
+CMU dictionary/reference tagger ZIPs come from a pinned `nltk_data` commit, with
+archive and member hashes; NLTK's downloader is not invoked. A restricted
+primitive-only reader converts the tagger data during preparation. Existing
+mismatched inputs fail, rather than being silently replaced. These commands are
+for a separate preparation session, not while timed benchmarks are running:
 
 ```sh
-uv run python -m tools.prepare_stt
-uv run python -m tools.prepare_tts
-uv run python -m hoast.tts "The weather is sunny." --output /tmp/speech.wav
-uv run python -m hoast.stt /tmp/speech.wav
-# Compact kernel correctness and in-memory TTS-to-STT check:
-uv run python -m tools.guarded_run --threads 2 --memory-gib 4 --timeout 240 -- .venv/bin/python -m tools.check_speech
-# Prepare automatic Mandarin and mixed English/Chinese speech:
-uv run python -m tools.guarded_run --threads 2 --memory-gib 4 --timeout 900 -- .venv/bin/python -m tools.prepare_tts --chinese
-uv run python -m hoast.tts "Hello world. 你好，欢迎回家。" --output /tmp/chinese.wav
-uv run python -m hoast.stt /tmp/chinese.wav --language zh
+# Input acquisition only: no exports, installs or model inference.
+.venv/bin/python -m tools.fetch_speech2 --download
+# Offline validation of the same inputs (including available benchmark caches):
+.venv/bin/python -m tools.fetch_speech2 --offline
+
+# Entire offline bootstrap, supplying explicit data/source locations if needed:
+./prepare.sh --offline --stt-source /data/SenseVoiceSmall --melo-source /data/MeloTTS --assets-manifest /data/melo-assets.json --g2p-resource-dir /data/g2p_en --nltk-resource-dir /data/nltk_data
 ```
 
-Han-containing utterances use the official Chinese Kokoro v1.1 bilingual voice.
-The Chinese model and phonemizer initialize on first use and are cached by the
-`TTS` instance; English-only requests do not initialize them. Speech CLIs cap the
-whole process to two CPU cores. Both language models share the same GPU context
-and compiled kernel cache. Add `--chinese` to the compact check to cover bilingual
-speech after its preparation.
+Explicit local paths must contain the pinned bytes described in
+[docs/speech2-native.md](docs/speech2-native.md), not arbitrary substitutes. An
+assets manifest maps the four EN/ZH Melo/BERT repositories to `revision`, absolute
+`snapshot` path, and file records (`name`, `bytes`, `sha256`); the helper publishes
+a compatible `<output stem>.melo-assets.json` alongside its input inventory. Missing
+sources, resources or cached dependencies stop offline setup. Acquiring inputs
+does **not** make application artifacts ready; export them with `prepare.sh` or
+the explicit serial conversion commands in the native guide.
 
-See [docs/speech.md](docs/speech.md) for voice/language options, reusable Python
-engines and local artifact paths. The linked study documents preserve the tuning
-journey, rejected approaches and measured results.
+STT preparation also requires the official pinned model card and verbatim
+`MODEL_LICENSE`, `FunASR-LICENSE`, `SenseVoice-LICENSE`, and `provenance.json`.
+The helper fetches legal texts only from the audited full-commit URLs and verifies
+their pinned SHA256/byte sizes and provenance. It reuses `source/licenses` or
+`.cache/speech-bench/licenses/sensevoice`; missing offline texts fail. Supply
+`--license-dir /data/sensevoice-licenses` to either helper/bootstrap to select
+explicit local-only legal inputs. A source-license URL reference is preserved
+as such, not represented as a standalone grant; model/source/resource terms
+remain distinct. Review the legal notices before redistributing artifacts.
+
+### Artifact/backend selection
+
+FP32 OpenVINO STT and decoder-only FP16 Melo on CPU, two threads, are the measured
+qualified bootstrap defaults. Melo BERT/encoder/flow remain FP32. FP32 Melo is an
+explicit comparison option. For separate
+roots, including the qualified local development artifacts:
+
+```sh
+# New exports: refuses any existing target; choose different roots for reruns.
+./prepare.sh --offline --stt-output models/stt2-fp32 --tts-precision FP16-decoder --tts-output models/tts2-fp16-decoder
+# FP32 Melo comparison, using fresh separate speech output roots:
+./prepare.sh --offline --stt-output /new/stt2-fp32 --tts-precision FP32 --tts-output /new/tts2-fp32
+# Use existing qualified roots without preparing or overwriting them:
+.venv/bin/python -m hoast --config config.toml --stt-backend cpu --stt-model-dir models/stt2-fp32 --tts-model-dir models/tts2-fp16-decoder --threads 2
+# Optional bilingual round-trip smoke (real inference, no deployment/playback):
+.venv/bin/python -m tools.check_speech2 --stt-model-dir models/stt2-fp32 --tts-model-dir models/tts2-fp16-decoder --stt-backend cpu --tts-backend cpu --threads 2 --chinese
+
+# Opt-in community UINT8 ONNX Runtime candidate, with distinct artifacts:
+.venv/bin/python -m tools.fetch_speech2 --download --with-community --output models/speech2-inputs/community-inputs.json
+./prepare.sh --offline --stt-backend ort --stt-precision UINT8 --stt-output models/stt2-community-ort --tts-output models/tts2-ort-comparison
+```
+
+`--stt-backend ort` requires `--stt-precision UINT8` and imports the pinned
+community ONNX graph; `cpu`/`GPU` select OpenVINO artifacts without fallback.
+`--stt-precision FP16` and GPU are explicit experimental choices, not qualified
+defaults. Backend selection is recorded in the printed application command;
+setup does not infer a model to benchmark that backend. TTS application execution
+remains CPU. Source/weights are read-only and preparation publishes fresh roots.
+
+Development qualification: native STT FP32 OpenVINO CPU was faster than the
+Whisper comparison, whereas community UINT8 OpenVINO was slower. Community UINT8
+ONNX Runtime was faster in measured comparisons but remains an **opt-in**, not
+the default, because held-out recognition regressions affect transcript fidelity.
+Melo FP32 and decoder-only
+FP16 passed six EN/ZH/mixed real texts (decoder-only SNR approximately 61–69 dB).
+Storage precision is not an execution-speed or hardware-INT8 claim; these scoped
+gates do not establish broad WER/CER or perceptual quality. Consult
+[the native architecture, pins and preparation guide](docs/speech2-native.md) and
+[measured comparisons](docs/speech2-benchmarks.md) for evidence and limitations.
+SenseVoiceSmall and Melo are the supported speech engines; see the
+[speech overview](docs/speech.md). Whisper/Kokoro measurements remain historical
+comparison evidence, not runnable backends. Endpoint detection uses the pinned
+standalone Silero v6 ONNX model at `models/vad/silero_vad_v6.onnx`; bootstrap
+prepares it with `tools.prepare_vad`. Runtime never downloads model assets.
+For an existing installation, `uv run python -m tools.prepare_vad` acquires and
+verifies that model; `--offline` validates its local copy without network access.
+The container image/deployment policy is a separate integration boundary—this
+bootstrap does not rebuild containers or change their Python/system packages.
 
 For local-microphone wake-word development, see
 [Network microphone development](docs/voice-satellite.md). Its optional simulator
@@ -389,8 +503,8 @@ code-switched, and STT-confusion examples using production schemas and the offic
 LFM template. Generate the canonical dataset with `uv run python -m finetune.generate`.
 STT output and external user turns share basic-punctuation normalization in
 `hoast/input_text.py`. Structured prompts, schemas, tool results, and internal
-repair diagnostics retain their syntax. The fine-tuning guide also covers actual
-GPU TTS-to-STT augmentation with source-split and label audits.
+repair diagnostics retain their syntax. The fine-tuning guide covers canonical
+dataset generation, LoRA training, export, and held-out evaluation.
 
 `hoast.agent.LocalAgent` accepts weather plus optional complete core music tools
 (`pause_music`, `resume_music`, `play_music`, `volume_music`). The `music_next`

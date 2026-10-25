@@ -9,7 +9,8 @@ services:
     entrypoint: ["/opt/hoast/.venv/bin/python"]
     command: ["-m", "hoast", "--config", "/workspace/src/config.toml"]
     restart: "no"
-    mem_limit: 5g
+    mem_limit: 5.5g
+    cpuset: "4,5"
     network_mode: host
     user: "1000:1000"
     env_file:
@@ -17,6 +18,10 @@ services:
     environment:
       - HOME=/tmp/hoast-home
       - PYTHONDONTWRITEBYTECODE=1
+      - OPENBLAS_NUM_THREADS=1
+      - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - NUMEXPR_NUM_THREADS=1
       - XDG_RUNTIME_DIR=/run/user/1000
       - XDG_CACHE_HOME=/workspace/src/.cache
       - PULSE_SERVER=unix:/run/user/1000/pulse/native
@@ -30,21 +35,22 @@ services:
     devices:
       - /dev/dri:/dev/dri
 
-  aec-reference-bridge:
-    build: .
-    image: home-assist/hoast:latest
-    container_name: home-assist-aec-ref-br
-    restart: unless-stopped
-    network_mode: host
-    mem_limit: 128m
-    user: "1000:1000"
-    entrypoint: ["/opt/hoast/.venv/bin/python", "-m", "respeaker.core.bridge"]
-    command:
-      - --config
-      - /workspace/src/config.toml
-      - --socket-directory
-      - /data/aec-reference
-    volumes:
-      - ./:/workspace/src:ro
-      - ./.cache:/workspace/src/.cache
-      - ${USERDIR:-$HOME}/music-data:/data
+  # AEC reference bridge disabled; uncomment to enable it explicitly.
+  # aec-reference-bridge:
+  #   build: .
+  #   image: home-assist/hoast:latest
+  #   container_name: home-assist-aec-ref-br
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   mem_limit: 128m
+  #   user: "1000:1000"
+  #   entrypoint: ["/opt/hoast/.venv/bin/python", "-m", "respeaker.core.bridge"]
+  #   command:
+  #     - --config
+  #     - /workspace/src/config.toml
+  #     - --socket-directory
+  #     - /data/aec-reference
+  #   volumes:
+  #     - ./:/workspace/src:ro
+  #     - ./.cache:/workspace/src/.cache
+  #     - ${USERDIR:-$HOME}/music-data:/data

@@ -11,13 +11,6 @@ from unittest.mock import patch
 
 import pytest
 
-from tools.export_chinese_tts import (
-    REPOSITORY,
-    REVISION,
-    WEIGHT_SHA256,
-    cached,
-    publish,
-)
 from tools.guarded_run import run_guarded
 
 _BASH = shutil.which("bash")
@@ -31,14 +24,26 @@ if sys.argv[1] == "sync":
     shutil.copyfile(os.environ["FAKE_PYTHON"], destination)
     destination.chmod(0o755)
 """
-_PYTHON = """import json, os, pathlib, sys
+_PYTHON = r"""import json, os, pathlib, sys
 args = sys.argv[1:]
 with open(os.environ["TRACE"], "a") as log:
-    log.write(json.dumps({"tool": "python", "args": args, "cwd": os.getcwd()}) + "\\n")
+    log.write(json.dumps({"tool": "python", "args": args, "cwd": os.getcwd()}) + "\n")
 if os.environ.get("FAIL_STAGE") in args:
     path = pathlib.Path(args[args.index("--log-file") + 1])
-    path.write_text("simulated model failure\\n")
+    path.write_text("simulated model failure\n")
     sys.exit(7)
+if args[:2] == ["-m", "tools.guarded_run"] and "tools.fetch_speech2" in args:
+    output = pathlib.Path(args[args.index("--output") + 1])
+    output.write_text(json.dumps({
+        "stt_source": "/fixture/stt", "melo_source": "/fixture/melo",
+        "assets_manifest": "/fixture/assets.json", "g2p_resource_dir": "/fixture/g2p",
+        "nltk_resource_dir": "/fixture/nltk", "community_source": None,
+        "license_dir": "/fixture/licenses",
+    }))
+elif args[0] == "-c" and len(args) > 2:
+    inputs = json.loads(pathlib.Path(args[2]).read_text())
+    for key in ("stt_source", "melo_source", "assets_manifest", "g2p_resource_dir", "nltk_resource_dir", "community_source", "license_dir"):
+        sys.stdout.buffer.write((inputs[key] or "").encode() + b"\0")
 """
 
 
@@ -78,11 +83,11 @@ def bootstrap_fixture(tmp_path: Path, uv_present: bool) -> tuple[Path, dict[str,
     (root / ".env").write_text("FIXTURE_TOKEN=keep-this-value\n")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    for name in ("dirname", "date", "mkdir", "sh", "cp", "chmod"):
+    for name in ("dirname", "date", "mkdir", "sh", "cp", "chmod", "cat", "tee"):
         source = shutil.which(name)
         assert source is not None
         (bin_dir / name).symlink_to(source)
-    for name in ("c++", "systemd-run", "systemctl", "taskset"):
+    for name in ("c++", "systemd-run", "systemctl", "taskset", "git"):
         executable(bin_dir / name, "")
     uv = tmp_path / "uv-template"
     python = tmp_path / "python-template"
@@ -146,22 +151,76 @@ def test_bootstrap_models_and_paths(
     assert all(row["cwd"] == str(root) for row in records)
     assert records[0]["args"] == ["python", "install", "3.14"]
     assert records[1]["args"] == ["sync", "--locked", "--python", "3.14"]
-    stages = records[2:]
+    stages = [row for row in records if row["args"][:2] == ["-m", "tools.guarded_run"]]
     names = [
         Path(row["args"][row["args"].index("--log-file") + 1]).stem for row in stages
     ]
-    expected = ["gpu-check", "lfm-download", "lfm-gpu", "lfm-cpu", "stt", "tts"]
+    expected = [
+        "vad",
+        "speech-inputs",
+        "lfm-download",
+        "lfm-gpu",
+        "lfm-cpu",
+        "stt2",
+        "tts2-EN",
+        "tts2-ZH",
+    ]
     if extra:
         expected += ["functiongemma-download", "functiongemma-export"]
-    assert names == [*expected, "speech-check"]
+    assert names == expected
     for row in stages:
         args = row["args"]
         assert args[:2] == ["-m", "tools.guarded_run"]
         assert args[args.index("--threads") + 1] in ("1", "2")
         assert args[args.index("--memory-gib") + 1] == "4"
-    assert "--chinese" in stages[5]["args"] and "--chinese" in stages[-1]["args"]
+    assert "tools.prepare_vad" in stages[0]["args"]
+    assert "--offline" not in stages[0]["args"]
+    assert "--download" in stages[1]["args"]
+    assert "tools.prepare_stt2" in stages[5]["args"]
+    assert "--license-dir" in stages[5]["args"]
+    assert stages[5]["args"][stages[5]["args"].index("--output") + 1] == "models/stt2"
+    for index, language in ((6, "EN"), (7, "ZH")):
+        args = stages[index]["args"]
+        assert "tools.prepare_tts2" in args
+        assert args[args.index("--language") + 1] == language
+        assert args[args.index("--precision") + 1] == "FP16"
+        assert args[args.index("--fp16-stages") + 1] == "decoder"
+        assert args[args.index("--output") + 1] == "models/tts2"
+        assert "--verify-original" in args
+    assert "tools.check_speech2" in result.stdout
+    assert not any("tools.check_speech2" in row["args"] for row in stages)
     assert (root / "config.toml").read_text() == "keep this configuration\n"
     assert (root / ".env").read_text() == "FIXTURE_TOKEN=keep-this-value\n"
+
+
+def test_bootstrap_offline_vad(tmp_path: Path) -> None:
+    """Use the verified local VAD asset without invoking any network acquisition.
+
+    Args:
+        tmp_path:
+            Isolated script and executable fixtures.
+
+    """
+    root, environment = bootstrap_fixture(tmp_path, True)
+    selection = root / "models/lfm/model.json"
+    selection.parent.mkdir(parents=True)
+    selection.write_text("{}")
+    assert _BASH is not None
+    result = subprocess.run(
+        [_BASH, str(root / "prepare.sh"), "--offline"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    records = [
+        json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()
+    ]
+    vad = next(row for row in records if "tools.prepare_vad" in row["args"])
+    assert "--offline" in vad["args"]
+    assert not any("download" in row["args"] for row in records)
 
 
 def test_bootstrap_stops_after_failure(tmp_path: Path) -> None:
@@ -173,7 +232,7 @@ def test_bootstrap_stops_after_failure(tmp_path: Path) -> None:
 
     """
     root, environment = bootstrap_fixture(tmp_path, True)
-    environment["FAIL_STAGE"] = "tools.prepare_stt"
+    environment["FAIL_STAGE"] = "tools.prepare_stt2"
     assert _BASH is not None
     result = subprocess.run(
         [_BASH, str(root / "prepare.sh")],
@@ -187,8 +246,8 @@ def test_bootstrap_stops_after_failure(tmp_path: Path) -> None:
     records = [
         json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()
     ]
-    assert "tools.prepare_stt" in records[-1]["args"]
-    assert not any("tools.prepare_tts" in row["args"] for row in records)
+    assert "tools.prepare_stt2" in records[-1]["args"]
+    assert not any("tools.prepare_tts2" in row["args"] for row in records)
 
 
 @pytest.mark.parametrize("flag,status", [("--help", 0), ("--unknown", 2)])
@@ -218,53 +277,6 @@ def test_bootstrap_argument_handling(tmp_path: Path, flag: str, status: int) -> 
     )
     assert result.returncode == status
     assert not (tmp_path / "trace.jsonl").exists()
-
-
-def test_chinese_publication_is_verified_and_fail_closed(tmp_path: Path) -> None:
-    """Reuse verified exports and remove readiness if publication is interrupted.
-
-    Args:
-        tmp_path:
-            Minimal synthetic staged artifacts.
-
-    """
-    staging, output = tmp_path / "staging", tmp_path / "output"
-    (staging / "voices").mkdir(parents=True)
-    for name in (
-        "model.xml",
-        "model.bin",
-        "config.json",
-        "voices/zf_001.npy",
-        "validation.wav",
-    ):
-        (staging / name).write_bytes(b"fixture")
-    manifest = {
-        "repository": REPOSITORY,
-        "revision": REVISION,
-        "voice": "zf_001",
-        "checkpoint_sha256": WEIGHT_SHA256,
-        "voice_index": "phoneme_count_minus_one",
-        "g2p_version": "1.1",
-    }
-    publish(staging, output, manifest)
-    assert cached(output, "zf_001")
-    (output / "model.bin").write_bytes(b"corrupt")
-    with pytest.raises(ValueError, match="checksum mismatch"):
-        cached(output, "zf_001")
-    for name in (
-        "model.xml",
-        "model.bin",
-        "config.json",
-        "voices/zf_001.npy",
-        "validation.wav",
-    ):
-        (staging / name).write_bytes(b"replacement")
-    with (
-        patch.object(Path, "replace", side_effect=OSError("publication interrupted")),
-        pytest.raises(OSError, match="publication interrupted"),
-    ):
-        publish(staging, output, manifest)
-    assert not (output / "manifest.json").exists()
 
 
 def test_guard_interrupt_stops_owned_scope(tmp_path: Path) -> None:

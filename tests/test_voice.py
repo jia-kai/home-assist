@@ -1,13 +1,19 @@
 """Hardware-independent native voice lifecycle and bounded PCM tests."""
 
 import asyncio
+from collections.abc import Callable
+from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 from aioesphomeapi.client import APIClient
 from aioesphomeapi.model import VoiceAssistantAudioSettings
 
+from hoast import voice
 from hoast.endpoint import FrameVAD, SpeechEndpoint
-from hoast.voice import Event, VoiceReceiver
+from hoast.stt2 import STT
+from hoast.tts2 import TTS
+from hoast.voice import AudioHandler, Event, VoiceReceiver
 
 
 class Client(APIClient):
@@ -354,3 +360,132 @@ def test_deadline_during_vad_still_trims_buffered_endpoint() -> None:
         await receiver.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError, KeyboardInterrupt])
+def test_standalone_native_config_and_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: type[BaseException] | None,
+) -> None:
+    """Standalone STT preserves PCM, forwards native settings, and always cleans up.
+
+    Args:
+        monkeypatch:
+            Replaces models, CPU configuration, logging and the native listener.
+
+        tmp_path:
+            Isolated explicit SenseVoice artifact root.
+
+        failure:
+            Listener failure or interrupt; None tests ordinary completion.
+
+    """
+    stt = MagicMock(spec=STT)
+    stt.transcribe_samples.return_value = "turn on the light"
+    stt_factory = MagicMock(return_value=stt)
+    replay = MagicMock(spec=TTS)
+    budget = MagicMock()
+
+    async def listen(
+        host: str,
+        port: int,
+        key: str | None,
+        transcribe: AudioHandler,
+        seconds: float,
+        output: Callable[[str], None],
+        *,
+        debug_audio: bool,
+        replay_tts: TTS | None,
+    ) -> None:
+        """Exercise the real worker-backed transcriber with complete PCM.
+
+        Args:
+            host:
+                Satellite host, unused without a network connection.
+
+            port:
+                Native API port, unused by this listener.
+
+            key:
+                Optional fixture key, never logged.
+
+            transcribe:
+                Actual worker-backed PCM transcription callback.
+
+            seconds:
+                Capture bound in seconds, unused without capture.
+
+            output:
+                Console transcript callback, not invoked by this listener.
+
+            debug_audio:
+                Explicit replay flag.
+
+            replay_tts:
+                Playback-only owner shared by the native receiver.
+
+        """
+        assert debug_audio and replay_tts is replay
+        stt.close.assert_not_called()
+        assert await transcribe(b"\x00\x80\xff\x7f") == "turn on the light"
+        samples, rate = stt.transcribe_samples.call_args.args
+        assert rate == 16000 and samples.shape == (2,)
+        assert samples[0] == -1 and samples[1] == 32767 / 32768
+        if failure is not None:
+            raise failure("listener stopped")
+
+    monkeypatch.setattr(voice, "STT", stt_factory)
+    monkeypatch.setattr(voice, "TTS", MagicMock(return_value=replay))
+    monkeypatch.setattr(voice, "listen", listen)
+    monkeypatch.setattr(voice, "configure_cpu_budget", budget)
+    monkeypatch.setattr(voice, "configure_logging", MagicMock())
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "voice",
+            "--threads",
+            "1",
+            "--language",
+            "auto",
+            "--stt-model-dir",
+            str(tmp_path),
+            "--debug-audio",
+        ],
+    )
+    if failure is RuntimeError:
+        with pytest.raises(SystemExit) as error:
+            voice.main()
+        assert error.value.code == 1
+    else:
+        voice.main()
+    budget.assert_called_once_with(1)
+    config = stt_factory.call_args.args[0]
+    assert config.model_path == tmp_path and config.language is None
+    assert config.threads == 1
+    stt.close.assert_called_once()
+    replay.close.assert_called_once()
+
+
+def test_standalone_stt_released_when_replay_construction_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay initialization failure cannot strand a constructed recognizer.
+
+    Args:
+        monkeypatch:
+            Injects a playback-only constructor failure without native resources.
+
+    """
+    stt = MagicMock(spec=STT)
+    monkeypatch.setattr(voice, "STT", MagicMock(return_value=stt))
+    monkeypatch.setattr(
+        voice, "TTS", MagicMock(side_effect=RuntimeError("replay failed"))
+    )
+    monkeypatch.setattr(voice, "configure_cpu_budget", MagicMock())
+    monkeypatch.setattr(voice, "configure_logging", MagicMock())
+    monkeypatch.setattr("sys.argv", ["voice", "--debug-audio"])
+    with pytest.raises(SystemExit) as error:
+        voice.main()
+    assert error.value.code == 1
+    stt.close.assert_called_once()

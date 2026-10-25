@@ -296,120 +296,18 @@ Tests require no downloaded model, external dataset, service credentials, or aud
 devices. Template validation establishes format compatibility, not routing accuracy
 of the untuned model. Training and real-model evaluation are separate steps.
 
-## TTS-to-STT augmentation
+## Speech data
 
-The augmentation workflow synthesizes **clean source commands**, transcribes the
-audio, and canonicalizes the recognized user text. It does not speak the curated
-misspellings from the hand-written STT variants. Audio is shared by music-on/off
-twins and equivalent clean/noisy source records, while source IDs and split
-ownership are retained.
+Canonical generation includes reviewed STT-confusion variants without loading
+speech models. The Kokoro/Whisper CUDA augmentation worker and its separate
+Python 3.12 environment have been removed as part of the migration to STT2/TTS2.
+The toolkit does not provide a replacement speech-augmentation generator.
 
-On a CUDA-capable Linux training host, prepare the isolated speech environment
-and run from the repository root:
-
-```sh
-uv sync --locked
-uv sync --project finetune/speech_env --locked --python 3.12
-uv run python -m finetune.generate
-AUGMENT_DIR=.cache/hoast/finetune/speech-data
-uv run python -m finetune.augment --data finetune/generated --output "$AUGMENT_DIR" --device cuda --batch-size 16
-```
-
-`--device cuda` runs both native Kokoro synthesis and Whisper-small inference on
-CUDA. **Whisper processes independent utterances in real batches**. Kokoro's
-duration expansion supports one utterance per forward pass, so its synthesis is
-GPU-accelerated but sequential within each batch. Use `--device cpu` explicitly
-for the CPU alternative; there is no silent device fallback. `--batch-size` controls
-the ASR batch and can be reduced for memory limits. Low-confidence retries can use
-smaller batches.
-
-The worker downloads pinned English Kokoro v1.0 (`af_heart`), Mandarin Kokoro v1.1
-(`zf_001`), and Whisper-small assets. Han-containing text uses the Mandarin model
-with English phoneme insertions. Silent title marks are removed for synthesis,
-initialisms are spoken as letters, and English possessives on Mandarin names retain
-their spoken suffix. Returned audio is mono float32 at 24 kHz, then resampled to
-16 kHz for ASR. Language detection and decoder prompts are independent per
-utterance, without source-text hints or shared transcript history.
-
-The GPU augmentation backend uses native Torch TTS and FP16 CTranslate2 ASR;
-the edge recognizer uses CPU INT8 and its own streaming/VAD context. These are
-related synthetic robustness probes, not identical executions or estimates of
-real microphone noise. Model revisions, voices, precision, sample rates, decoding
-settings, frontend hashes, and actual batch sizes are recorded with the outputs.
-
-### Label audit and outputs
-
-Every speech observation retains its intended target, original source IDs,
-synthesis text, raw transcript, canonical transcript, and audio checksum. The raw
-transcript is never fed to the LLM. Case, spacing, and verified Chinese script
-equivalents can be accepted while copying music labels **as actually heard**.
-Known integer-volume word/digit spellings are equivalent for audit purposes;
-different numeric values are never repaired into the expected value. Existing
-reviewed command-confusion substitutions can also establish a label match.
-
-Other wording changes, changed names, missing speech, or split collisions require
-review and are excluded from automatic training augmentation. This includes
-negation or intent changes that would otherwise turn into mislabeled commands.
-Detailed review reasons are retained instead of silently correcting names or
-dropping unsuccessful cases.
-
-| Output                       | Contents                                                          |
-| ---------------------------- | ----------------------------------------------------------------- |
-| `data/train.jsonl`            | Canonical training rows plus eligible, nonduplicate speech variants |
-| `data/validation.jsonl`       | Canonical validation split                                        |
-| `data/test.jsonl`             | Canonical test split                                              |
-| `data/manifest.json`          | Source hashes, coverage, and augmentation settings                 |
-| `train-roundtrip.jsonl`       | All training speech candidates, including review-required cases    |
-| `validation-roundtrip.jsonl`  | Held-out validation speech observations                            |
-| `test-roundtrip.jsonl`        | All source-held-out intended-command speech observations            |
-| `test-roundtrip-independent.jsonl` | Speech observations without cross-split input collisions       |
-| `review.jsonl`                | Observations requiring label/transcript review                     |
-| `speech/`                    | WAV audio, per-job results, settings, and diagnostics               |
-| `augmentation.json`           | Eligibility, failures, source coverage, and added-row counts        |
-
-The roundtrip held-out files measure the full intended-command path: if STT loses
-a name, the original intent remains the end-to-end target and the row is flagged.
-Such a row is not a clean transcript-grounded extraction example. The evaluator
-reports audited eligible/review-required slices and retains failed speech inputs
-as failures without attempting LLM inference. State twins and speech variants are
-related observations, not independent real-speaker samples.
-
-Speech jobs are hash-addressed and resumable under matching settings. Use a new
-output directory when model, frontend, normalization, or decoding settings change.
-After a completed speech run, `--reuse-transcripts` rebuilds the audited dataset
-from the retained results without resynthesizing; source/schema/normalizer checks
-still apply. `--variants` selects the matching source variant bank when using a
-frozen dataset outside the default directory. Logs, audio, and detailed results
-belong in ignored output storage.
-
-When only text normalization changes, `--renormalize-from` can reuse a previous
-`speech/` directory into a **different output directory**. Raw transcripts are
-normalized again, including script-audit text, while original inference provenance
-and audio hashes are retained. A verified `worker-source.py` snapshot proves that
-the model execution and retry implementation match; caches without that snapshot
-require `--prior-worker-source` pointing to their exact recorded worker source.
-Model/voice/decoder settings, device, batch size, source text, and split must match.
-Missing jobs are synthesized/transcribed normally. No new inference is claimed
-for reused recordings. All resulting labels and split checks are rerun.
-
-```sh
-PREVIOUS_SPEECH=.cache/hoast/finetune/prior-run/speech
-AUGMENT_DIR=.cache/hoast/finetune/updated-data
-uv run python -m finetune.augment --data finetune/generated --output "$AUGMENT_DIR" --renormalize-from "$PREVIOUS_SPEECH" --device cuda --batch-size 16
-```
-
-Use the `*-roundtrip-independent.jsonl` files for text-independent held-out scores.
-The complete roundtrip files retain source-held-out observations and any collision
-flags for end-to-end accounting; they must not be presented as independent textual
-holdouts if overlaps are reported.
-
-To train on the resulting data, pass `--data "$AUGMENT_DIR/data"` to
-`finetune.train`. To evaluate speech inputs:
-
-```sh
-MODEL_DIR=.cache/hoast/finetune/run/openvino-int8
-uv run python -m finetune.evaluate --backend openvino --model "$MODEL_DIR" --data "$AUGMENT_DIR/test-roundtrip.jsonl" --batch-size 1 --threads 2 --output "$AUGMENT_DIR/eval-int8"
-```
+Existing audited round-trip datasets remain valid inputs to `finetune.evaluate`;
+retain their original model/audio provenance and split-collision flags. They are
+historical synthetic robustness probes, not measurements of the current
+SenseVoice/Melo pipeline or independent real-speaker samples. Canonical dataset
+generation, LoRA training, export and deployment are independent of that bridge.
 
 ## LoRA training and INT8 export
 
@@ -583,10 +481,10 @@ Keep the exported tokenizer JSON and chat template intact.
 The assistant accepts a custom export through `[lfm].model_dir` in `config.toml`
 (for example, `model_dir = "models/openvino-int8"`, relative to the working
 directory). If that setting is omitted, it selects the LFM artifact through
-`<cache>/lfm/model.json`.
+`models/lfm/model.json`.
 `--model lfm` selects the model family, not a checkpoint directory. When using the
-cache manifest, register the target-local absolute path with this snippet, which
-replaces the selection for the chosen cache root:
+selection manifest, register the target-local absolute path with this snippet,
+which replaces the selection under the permanent model root:
 
 ```sh
 uv run python - <<'PY'
@@ -602,7 +500,7 @@ required = (
 for name in required:
     if not (model / name).is_file():
         raise FileNotFoundError(model / name)
-manifest = Path(os.environ["CACHE_DIR"]) / "lfm" / "model.json"
+manifest = Path("models") / "lfm" / "model.json"
 manifest.parent.mkdir(parents=True, exist_ok=True)
 manifest.write_text(
     json.dumps({"model_id": "LiquidAI/LFM2.5-350M", "path": str(model)}, indent=2) + "\n",
@@ -638,9 +536,7 @@ restore its selection. The target creates its compiled cache under
 ```sh
 .venv/bin/pytest tests/test_finetune.py tests/test_finetune_evaluate.py tests/test_finetune_export.py tests/test_finetune_deploy.py tests/test_session.py -q
 finetune/env/.venv/bin/python -m pytest finetune/env/test_training.py -q
-finetune/speech_env/.venv/bin/python -m pytest finetune/speech_env/test_cache.py -q
 .venv/bin/pyright --project finetune/env/pyrightconfig.json
-.venv/bin/pyright --project finetune/speech_env/pyrightconfig.json
 .venv/bin/pyright
 .venv/bin/ruff check finetune hoast/lfm.py tests/test_finetune*.py
 ```

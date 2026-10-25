@@ -1,8 +1,0 @@
-{
-  "include": ["../speech_worker.py", "test_cache.py"],
-  "extraPaths": ["../.."],
-  "pythonVersion": "3.12",
-  "venvPath": ".",
-  "venv": ".venv",
-  "typeCheckingMode": "basic"
-}

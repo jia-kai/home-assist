@@ -5,14 +5,22 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Literal
 
 from hoast.lfm import LFM2, LFMConfig
-from hoast.llm import DEFAULT_CACHE, FunctionGemma, LLMConfig, ToolRegistry
+from hoast.llm import (
+    DEFAULT_CACHE,
+    DEFAULT_MODELS,
+    FunctionGemma,
+    LLMConfig,
+    ToolRegistry,
+)
 from hoast.logging import configure_logging, get_logger
 from hoast.runtime import configure_cpu_budget
 
@@ -58,12 +66,48 @@ def write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
-def download(cache: Path, model: Model, revision: str | None) -> Path:
+def publish_snapshot(source: Path, destination: Path) -> Path:
+    """Copy a downloaded snapshot into a permanent, symlink-free artifact tree.
+
+    Existing immutable revision directories are reused. New trees are published
+    atomically; download-cache symlinks are dereferenced so cache removal is safe.
+
+    Args:
+        source:
+            Complete downloaded Hugging Face snapshot directory.
+
+        destination:
+            Permanent artifact directory identifying an immutable revision.
+
+    """
+    if destination.exists() or destination.is_symlink():
+        if not destination.is_dir() or destination.is_symlink():
+            raise ValueError(
+                f"Artifact destination is not a real directory: {destination}"
+            )
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".download-", dir=destination.parent))
+    try:
+        shutil.copytree(source, staging, symlinks=False, dirs_exist_ok=True)
+        staging.rename(destination)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    return destination
+
+
+def download(
+    cache: Path,
+    model: Model,
+    revision: str | None,
+    model_root: Path = DEFAULT_MODELS,
+) -> Path:
     """Download an immutable checkpoint/export and record its provenance.
 
     Args:
         cache:
-            Root for downloaded artifacts and selection manifests.
+            Disposable Hugging Face download cache root.
 
         model:
             FunctionGemma source checkpoint or public LFM OpenVINO export.
@@ -71,6 +115,9 @@ def download(cache: Path, model: Model, revision: str | None) -> Path:
         revision:
             Requested commit/branch; defaults to main for FunctionGemma or the
             pinned public export commit for LFM. Branches resolve once to a SHA.
+
+        model_root:
+            Permanent root for copied checkpoints/exports and selection manifests.
 
     """
     # Initialize Hugging Face only after main configures its local caches.
@@ -89,7 +136,7 @@ def download(cache: Path, model: Model, revision: str | None) -> Path:
         else ["openvino_*.xml", "openvino_*.bin"]
     )
     logger.info("Downloading %s at %s", repository, info.sha)
-    path = Path(
+    snapshot = Path(
         snapshot_download(
             repository,
             revision=info.sha,
@@ -98,13 +145,20 @@ def download(cache: Path, model: Model, revision: str | None) -> Path:
             allow_patterns=patterns,
         )
     )
+    family_root = model_root / model
+    path = publish_snapshot(
+        snapshot,
+        family_root
+        / ("checkpoints" if model == "functiongemma" else "exports")
+        / info.sha,
+    )
     if model == "functiongemma":
         manifest = {
             "model_id": repository,
             "revision": info.sha,
             "path": str(path.resolve()),
         }
-        destination = cache / "model.json"
+        destination = family_root / "model.json"
     else:
         manifest = {
             "model_id": LFM_ID,
@@ -118,20 +172,22 @@ def download(cache: Path, model: Model, revision: str | None) -> Path:
                 "upstream weight commit not specified by export"
             ),
         }
-        destination = cache / "lfm/model.json"
+        destination = family_root / "model.json"
     write_json(destination, manifest)
     return path
 
 
-def checkpoint(cache: Path) -> tuple[Path, dict[str, Any]]:
+def checkpoint(model_root: Path = DEFAULT_MODELS) -> tuple[Path, dict[str, Any]]:
     """Read the official FunctionGemma download selection without network access.
 
     Args:
-        cache:
-            Root containing model.json and its referenced checkpoint.
+        model_root:
+            Permanent root containing functiongemma/model.json and its checkpoint.
 
     """
-    manifest = json.loads((cache / "model.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (model_root / "functiongemma/model.json").read_text(encoding="utf-8")
+    )
     if manifest["model_id"] != FUNCTIONGEMMA_ID:
         raise ValueError("Export requires the official Google checkpoint")
     path = Path(manifest["path"])
@@ -188,7 +244,13 @@ def compile_model(
     logger.info("Prepared %s on %s: %s", model, device, source)
 
 
-def export_model(cache: Path, precision: str, threads: int, device: Device) -> Path:
+def export_model(
+    cache: Path,
+    precision: str,
+    threads: int,
+    device: Device,
+    model_root: Path = DEFAULT_MODELS,
+) -> Path:
     """Export stateful FunctionGemma IR and compile the selected device pipelines.
 
     Identity includes revision, dependency versions and compression settings.
@@ -197,7 +259,7 @@ def export_model(cache: Path, precision: str, threads: int, device: Device) -> P
 
     Args:
         cache:
-            Root containing the checkpoint and generated artifacts.
+            Disposable compilation cache and diagnostic root.
 
         precision:
             Stored weight format: fp32, symmetric int8, or symmetric int4.
@@ -209,10 +271,13 @@ def export_model(cache: Path, precision: str, threads: int, device: Device) -> P
         device:
             Explicit CPU or GPU compilation target.
 
+        model_root:
+            Permanent root containing FunctionGemma checkpoints, exports and selections.
+
     """
     if precision not in ("fp32", "int8", "int4") or threads < 1:
         raise ValueError("Invalid weight precision or thread count")
-    source, model_manifest = checkpoint(cache)
+    source, model_manifest = checkpoint(model_root)
     settings: dict[str, Any] = {
         "model": model_manifest,
         "versions": versions(),
@@ -223,7 +288,7 @@ def export_model(cache: Path, precision: str, threads: int, device: Device) -> P
         "ratio": 1.0,
     }
     key = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:16]
-    output = cache / "exports" / f"{precision}-{key}"
+    output = model_root / "functiongemma/exports" / f"{precision}-{key}"
     manifest_path = output / "hoast-manifest.json"
     started = time.perf_counter()
     if not manifest_path.exists():
@@ -262,7 +327,10 @@ def export_model(cache: Path, precision: str, threads: int, device: Device) -> P
     }
     settings["preparation_seconds"] = time.perf_counter() - started
     write_json(manifest_path, settings)
-    write_json(cache / f"{precision}.json", {"path": str(output.resolve()), "key": key})
+    write_json(
+        model_root / "functiongemma" / f"{precision}.json",
+        {"path": str(output.resolve()), "key": key},
+    )
     return output
 
 
@@ -281,7 +349,13 @@ def main() -> None:
         "--cache-dir",
         type=Path,
         default=DEFAULT_CACHE,
-        help="Model and compilation cache root",
+        help="Disposable Hugging Face download and compilation cache root",
+    )
+    parser.add_argument(
+        "--model-root",
+        type=Path,
+        default=DEFAULT_MODELS,
+        help="Permanent checkpoint, export and selection manifest root",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     get = commands.add_parser(
@@ -326,6 +400,7 @@ def main() -> None:
         )
     args = parser.parse_args()
     cache = args.cache_dir.resolve()
+    model_root = args.model_root.resolve()
     diagnostics = cache / "diagnostics"
     diagnostics.mkdir(parents=True, exist_ok=True)
     log_path = diagnostics / f"prepare-{args.model}-{args.command}-{time.time_ns()}.log"
@@ -340,23 +415,23 @@ def main() -> None:
     try:
         if args.command == "download":
             configure_cpu_budget(1)
-            download(cache, args.model, args.revision)
+            download(cache, args.model, args.revision, model_root)
         elif args.command == "export":
             configure_cpu_budget(args.threads)
             if args.model != "functiongemma":
                 raise ValueError(
                     "LFM uses published INT8 IR; use download then compile"
                 )
-            export_model(cache, args.precision, args.threads, args.device)
+            export_model(cache, args.precision, args.threads, args.device, model_root)
         else:
             configure_cpu_budget(args.threads)
             if args.model == "lfm":
                 if args.precision != "int8":
                     raise ValueError("The public LFM export supports only INT8 weights")
-                source = LFMConfig.from_cache(cache).model_path
+                source = LFMConfig.from_cache(cache, model_root=model_root).model_path
             else:
                 source = LLMConfig.from_cache(
-                    cache, precision=args.precision
+                    cache, precision=args.precision, model_root=model_root
                 ).model_path
             compile_model(cache, args.model, source, args.threads, args.device)
     except BaseException:

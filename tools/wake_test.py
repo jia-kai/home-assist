@@ -3,8 +3,6 @@
 import argparse
 import asyncio
 import socket
-import subprocess
-import sys
 
 from aioesphomeapi.client import APIClient
 from aioesphomeapi.core import APIConnectionError
@@ -12,6 +10,7 @@ from aioesphomeapi.model import VoiceAssistantAudioSettings
 from aioesphomeapi.model import VoiceAssistantEventType as Event
 
 from hoast.logging import configure_logging, get_logger
+from hoast.tts2 import TTS, TTSConfig
 from tools.voice_satellite import ROOT, SATELLITE, satellite_command
 
 logger = get_logger(__name__)
@@ -161,21 +160,8 @@ def main() -> None:
             REPLY.parent.mkdir(parents=True, exist_ok=True)
             temporary = REPLY.with_suffix(".partial.wav")
             logger.info("Preparing the spoken reply.")
-            with LOG.open("a") as output:
-                subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "hoast.tts",
-                        "I'm here.",
-                        "--output",
-                        str(temporary),
-                    ],
-                    cwd=ROOT,
-                    stdout=output,
-                    stderr=output,
-                    check=True,
-                )
+            with TTS(TTSConfig(model_path=ROOT / "models/tts2")) as engine:
+                engine.write_wav("I'm here.", temporary)
             temporary.replace(REPLY)
         asyncio.run(run_test(satellite_command(args.input_device, REPLY)))
     except KeyboardInterrupt:

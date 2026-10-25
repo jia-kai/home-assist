@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,9 +25,9 @@ from aioesphomeapi.model import VoiceAssistantEventType as Event
 from .endpoint import FRAME_BYTES, SpeechEndpoint
 from .logging import configure_logging, get_logger
 from .runtime import configure_cpu_budget
-from .stt import STT, STTConfig
-from .tts import TTS
-from .voice_debug import replay_capture
+from .stt2 import DEFAULT_MODEL, LANGUAGE_IDS, STT, STTConfig
+from .tts2 import TTS
+from .voice_debug import CaptureCue, play_capture_cue, replay_capture
 
 logger = get_logger(__name__)
 type AudioHandler = Callable[[bytes], Awaitable[str]]
@@ -85,7 +86,13 @@ class VoiceReceiver:
     """Replay the captured command between cues before STT when explicitly enabled."""
 
     replay_tts: TTS | None = None
-    """Caller-owned TTS engine shared by replay and spoken replies; never closed here."""
+    """Caller-owned TTS engine shared by cues, replay and replies; never closed here."""
+
+    sound_cues: bool = False
+    """Play first-valid-PCM and silence-end tones; requires a shared replay_tts owner."""
+
+    cue_task: asyncio.Task[None] | None = field(default=None, init=False)
+    """Owned off-loop cue/replay worker, joined before playback or receiver release."""
 
     changed: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     """Signals newly buffered PCM or capture termination to the endpoint consumer."""
@@ -121,11 +128,13 @@ class VoiceReceiver:
     """Whether event responses may still be sent to the satellite."""
 
     def __post_init__(self) -> None:
-        """Reject unbounded or nonfinite capture windows."""
+        """Reject invalid capture windows and audible modes without a playback owner."""
         if not math.isfinite(self.seconds) or not 0.1 <= self.seconds <= 30:
             raise ValueError("capture seconds must be between 0.1 and 30")
         if self.debug_audio and self.replay_tts is None:
             raise ValueError("Debug replay requires a shared TTS instance")
+        if self.sound_cues and self.replay_tts is None:
+            raise ValueError("Sound cues require a shared TTS instance")
 
     def event(self, kind: Event, data: dict[str, str] | None = None) -> None:
         """Send a pipeline event only while connected.
@@ -178,7 +187,11 @@ class VoiceReceiver:
             conversation_id,
         )
         logger.debug("voice.start audio_settings=%r", audio_settings)
-        if (self.task is not None and not self.task.done()) or not self.connected:
+        if (
+            (self.task is not None and not self.task.done())
+            or (self.cue_task is not None and not self.cue_task.done())
+            or not self.connected
+        ):
             logger.warning("voice.start status=rejected reason=busy_or_disconnected")
             return None
         if flags & VoiceAssistantCommandFlag.USE_WAKE_WORD:
@@ -199,7 +212,10 @@ class VoiceReceiver:
         return 0
 
     async def receive(self, data: bytes, data2: bytes | None) -> None:
-        """Buffer primary-channel PCM for the endpoint consumer; reject partial samples.
+        """Buffer valid primary PCM and schedule its first cue without awaiting output.
+
+        Empty, malformed, expired, aborted and disconnected input cannot start a
+        cue. Only captured PCM enters the endpoint/STT buffer; tones stay separate.
 
         Args:
             data:
@@ -209,7 +225,12 @@ class VoiceReceiver:
                 Optional echo-reference channel; unused by this mono receiver.
 
         """
-        if not self.capturing:
+        if (
+            not self.capturing
+            or self.aborted
+            or not self.connected
+            or self.cancelled.is_set()
+        ):
             return
         if time.monotonic() >= self.deadline:
             self.capturing = False
@@ -217,8 +238,6 @@ class VoiceReceiver:
             self.done.set()
             self.changed.set()
             return
-        if data and self.started_at is None:
-            self.started_at = time.monotonic()
         if len(data) % 2:
             logger.warning("voice.audio status=rejected reason=partial_sample")
             self.aborted = True
@@ -229,6 +248,9 @@ class VoiceReceiver:
             return
         remaining = int(self.seconds * 16000) * 2 - len(self.audio)
         self.audio.extend(data[:remaining])
+        if data and remaining > 0 and self.started_at is None:
+            self.started_at = time.monotonic()
+            self._schedule_cue("first_pcm")
         self.changed.set()
         if len(data) >= remaining:
             self.end_reason = "maximum_audio"
@@ -254,11 +276,66 @@ class VoiceReceiver:
         self.changed.set()
 
     async def close(self) -> None:
-        """Suppress further events, cancel pending work, and await owned STT/agent work."""
+        """Cancel capture and join accepted cue/STT/agent work before owner release.
+
+        Cancellation of close is deferred until its owned workers have joined;
+        the shared playback owner is never closed by this receiver.
+        """
         self.connected = False
         await self.stop(True)
-        if self.task is not None:
-            await self.task
+        interrupted = False
+        try:
+            if self.task is not None:
+                while not self.task.done():
+                    try:
+                        await asyncio.shield(self.task)
+                    except asyncio.CancelledError:
+                        interrupted = True
+                if not self.task.cancelled():
+                    self.task.result()
+        finally:
+            await self._drain_cue()
+        if interrupted:
+            raise asyncio.CancelledError
+
+    def _schedule_cue(self, kind: CaptureCue) -> None:
+        """Own one serialized off-loop tone task, unless capture has been cancelled.
+
+        Args:
+            kind:
+                First valid PCM arrival or silence-end lifecycle boundary.
+
+        """
+        if not self.sound_cues or self.cancelled.is_set() or not self.connected:
+            return
+        assert self.replay_tts is not None
+        assert self.cue_task is None
+        self.cue_task = asyncio.create_task(
+            asyncio.to_thread(play_capture_cue, kind, self.cancelled, self.replay_tts)
+        )
+
+    async def _drain_cue(self) -> None:
+        """Join owned capture output despite cancellation, then propagate cancellation.
+
+        Shielding prevents asyncio cancellation from abandoning accepted native
+        output or its worker thread. The cancellation flag stops new samples.
+        """
+        task = self.cue_task
+        if task is None:
+            return
+        interrupted = False
+        try:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    interrupted = True
+            task.result()
+        finally:
+            self.cue_task = None
+        if interrupted:
+            raise asyncio.CancelledError
 
     async def _wait_for_endpoint(self) -> None:
         """Process at most four VAD frames per loop slice until silence, cap or stop.
@@ -307,10 +384,13 @@ class VoiceReceiver:
             await self._wait_for_endpoint()
             ended_at = time.monotonic()
             self.event(Event.VOICE_ASSISTANT_STT_VAD_END)
+            await self._drain_cue()
             processing_started = self.end_reason == "silence"
             if processing_started:
                 # Satellites use INTENT_START to play their configured processing sound.
                 self.event(Event.VOICE_ASSISTANT_INTENT_START)
+                self._schedule_cue("silence_end")
+                await self._drain_cue()
             if self.aborted or not self.audio:
                 self.event(
                     Event.VOICE_ASSISTANT_ERROR,
@@ -331,9 +411,13 @@ class VoiceReceiver:
             )
             if self.debug_audio:
                 assert self.replay_tts is not None
-                await asyncio.to_thread(
-                    replay_capture, pcm, self.cancelled, self.replay_tts
+                assert self.cue_task is None
+                self.cue_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        replay_capture, pcm, self.cancelled, self.replay_tts
+                    )
                 )
+                await self._drain_cue()
             if self.cancelled.is_set():
                 return
             text = await self.handler(pcm)
@@ -356,6 +440,10 @@ class VoiceReceiver:
                             "message": "I didn't catch that.",
                         },
                     )
+        except asyncio.CancelledError:
+            self.aborted = True
+            self.cancelled.set()
+            raise
         except Exception:
             logger.exception("voice.capture status=failed")
             self.event(
@@ -364,8 +452,11 @@ class VoiceReceiver:
             )
         finally:
             self.capturing = False
-            self.audio.clear()
-            self.event(Event.VOICE_ASSISTANT_RUN_END)
+            try:
+                await self._drain_cue()
+            finally:
+                self.audio.clear()
+                self.event(Event.VOICE_ASSISTANT_RUN_END)
 
 
 async def listen(
@@ -378,6 +469,7 @@ async def listen(
     on_turn: TurnHandler | None = None,
     debug_audio: bool = False,
     replay_tts: TTS | None = None,
+    sound_cues: bool = True,
 ) -> None:
     """Connect directly to a satellite and reconnect after native-API transport loss.
 
@@ -407,12 +499,18 @@ async def listen(
             Replay captured PCM between cues before STT, retaining satellite busy state.
 
         replay_tts:
-            Caller-owned shared TTS engine, required for debug replay. This listener
-            retains it across reconnects but does not close it.
+            Caller-owned shared TTS engine, required for sound cues or debug replay.
+            This listener retains it across reconnects but does not close it.
+
+        sound_cues:
+            Play host tones on first valid PCM and streaming silence termination.
+            Disable explicitly for detector-free or playback-free test transports.
 
     """
     if debug_audio and replay_tts is None:
         raise ValueError("Debug replay requires a shared TTS instance")
+    if sound_cues and replay_tts is None:
+        raise ValueError("Sound cues require a shared TTS instance")
     endpoint = SpeechEndpoint()
     logger.info("voice.endpoint model=silero_v6 silence_ms=500 frame_ms=32")
     while True:
@@ -426,6 +524,7 @@ async def listen(
             endpoint,
             debug_audio,
             replay_tts,
+            sound_cues,
         )
         disconnected = asyncio.Event()
 
@@ -471,13 +570,15 @@ async def listen(
         except APIConnectionError:
             logger.warning("voice.connection status=retry host=%s", host, exc_info=True)
         finally:
-            await receiver.close()
-            await client.disconnect()
+            try:
+                await receiver.close()
+            finally:
+                await client.disconnect()
         await asyncio.sleep(2)
 
 
 def main() -> None:
-    """Emit one adaptive-capture transcript per wake for piping into hoast --text."""
+    """Emit SenseVoice transcripts per wake and release native speech on shutdown."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=6053)
@@ -493,42 +594,73 @@ def main() -> None:
         help="Replay captured commands between tones before STT",
     )
     parser.add_argument("--key-env", default="ESPHOME_API_KEY")
-    parser.add_argument("--language", default="en", help="Whisper language or auto")
+    parser.add_argument(
+        "--language",
+        choices=tuple(LANGUAGE_IDS),
+        default="en",
+        help="SenseVoice language control or auto detection",
+    )
+    parser.add_argument(
+        "--stt-backend",
+        choices=("cpu", "GPU", "ort"),
+        default="cpu",
+        help="Explicit SenseVoice backend; loading errors do not select a fallback",
+    )
+    parser.add_argument(
+        "--stt-model-dir",
+        type=Path,
+        default=DEFAULT_MODEL,
+        help="Prepared native SenseVoiceSmall artifact root (default: models/stt2)",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        choices=(1, 2),
+        default=2,
+        help="Process/STT CPU budget; two pending qualified runtime policy",
+    )
     args = parser.parse_args()
     configure_logging(log_file=Path(".cache/hoast/diagnostics/voice.log"))
     get_logger("aioesphomeapi").setLevel("INFO")
     try:
         if not math.isfinite(args.seconds) or not 0.1 <= args.seconds <= 30:
             raise ValueError("capture seconds must be between 0.1 and 30")
-        configure_cpu_budget(2)
-        stt = STT(
-            STTConfig(language=None if args.language == "auto" else args.language)
-        )
+        configure_cpu_budget(args.threads)
+        with ExitStack() as cleanup:
+            stt = STT(
+                STTConfig(
+                    model_path=args.stt_model_dir,
+                    threads=args.threads,
+                    language=None if args.language == "auto" else args.language,
+                    backend=args.stt_backend,
+                )
+            )
+            cleanup.callback(stt.close)
 
-        async def transcribe(pcm: bytes) -> str:
-            """Run STT off the network loop and return the transcript.
+            async def transcribe(pcm: bytes) -> str:
+                """Run STT off the network loop and return the transcript.
 
-            Args:
-                pcm:
-                    Mono 16 kHz signed little-endian int16 PCM command audio.
+                Args:
+                    pcm:
+                        Mono 16 kHz signed little-endian int16 PCM command audio.
 
-            """
-            samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-            return await asyncio.to_thread(stt.transcribe_samples, samples, 16000)
+                """
+                samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+                return await asyncio.to_thread(stt.transcribe_samples, samples, 16000)
 
-        def output(text: str) -> None:
-            """Write one uncancelled transcript for a downstream agent process.
+            def output(text: str) -> None:
+                """Write one uncancelled transcript for a downstream agent process.
 
-            Args:
-                text:
-                    Nonempty recognized command; whitespace is collapsed to one line.
+                Args:
+                    text:
+                        Nonempty recognized command; collapsed to one output line.
 
-            """
-            sys.stdout.write(" ".join(text.split()) + "\n")
-            sys.stdout.flush()
+                """
+                sys.stdout.write(" ".join(text.split()) + "\n")
+                sys.stdout.flush()
 
-        replay_tts = TTS(playback_only=True) if args.debug_audio else None
-        try:
+            replay_tts = TTS(playback_only=True)
+            cleanup.callback(replay_tts.close)
             asyncio.run(
                 listen(
                     args.host,
@@ -541,9 +673,6 @@ def main() -> None:
                     replay_tts=replay_tts,
                 )
             )
-        finally:
-            if replay_tts is not None:
-                replay_tts.close()
     except KeyboardInterrupt:
         logger.info("voice.run status=stopped")
     except Exception:
