@@ -3,9 +3,11 @@
 import argparse
 import asyncio
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, suppress
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -17,7 +19,7 @@ from .lights import LightClient
 from .llm import DEFAULT_CACHE, FunctionGemma, LLMConfig, Tool, ToolRegistry
 from .llm import SYSTEM_PROMPT as FUNCTION_ACTIVATION
 from .logging import configure_logging, get_logger
-from .memory import log_memory_usage
+from .memory import log_memory_details, log_memory_mappings, log_memory_usage
 from .music import MusicClient
 from .runtime import configure_cpu_budget
 from .session import Session
@@ -109,15 +111,56 @@ def prepare_voice(
         return application
 
 
-async def _monitor_memory_usage() -> None:
-    """Sample counters every 60 seconds, including silence, until owner cancellation.
+def _log_memory_diagnostics(boundary: str, mappings: bool) -> None:
+    """Collect slower diagnostics on a dedicated worker, never the inference worker.
 
-    Run on the event loop: these small counter reads do not submit inference work,
-    spawn threads, retain samples, or touch models.
+    Args:
+        boundary:
+            Short phase label, without user content or credentials.
+
+        mappings:
+            Whether to include the bounded mapping breakdown in this sample.
+
     """
-    while True:
-        await asyncio.sleep(60)
-        log_memory_usage("voice.idle")
+    started = time.perf_counter()
+    try:
+        log_memory_details(boundary)
+        if mappings:
+            log_memory_mappings(boundary)
+    finally:
+        logger.info(
+            "memory.diagnostics boundary=%s mappings=%s elapsed_seconds=%.6f",
+            boundary,
+            mappings,
+            time.perf_counter() - started,
+        )
+
+
+async def _monitor_memory_usage() -> None:
+    """Observe startup and 60-second intervals, with mapping breakdowns every 15 minutes.
+
+    Cheap usage counters run on the event loop. Rollup/pressure observations and
+    bounded mapping scans use one owned diagnostic thread, independent of the
+    serialized inference worker. Cancellation joins that thread before returning.
+    The periodic label is not a guarantee that inference is idle. This observer
+    cannot capture sub-second allocation peaks or survive process death.
+    """
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="memory-diagnostics"
+    ) as worker:
+        await loop.run_in_executor(
+            worker, partial(_log_memory_diagnostics, "voice.monitor.startup", True)
+        )
+        samples = 0
+        while True:
+            await asyncio.sleep(60)
+            log_memory_usage("voice.idle")
+            samples += 1
+            await loop.run_in_executor(
+                worker,
+                partial(_log_memory_diagnostics, "voice.periodic", samples % 15 == 0),
+            )
 
 
 async def run_voice(
@@ -134,7 +177,7 @@ async def run_voice(
 ) -> None:
     """Warm and run the native voice pipeline with one serialized inference worker.
 
-    Own one periodic counter-only monitor after startup; cancel and join it before
+    Own one periodic diagnostic monitor after startup; cancel and join it before
     releasing speech resources on listener completion, failure, or cancellation.
 
     Args:

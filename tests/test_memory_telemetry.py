@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import threading
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -16,6 +17,119 @@ from hoast.config import SatelliteConfig
 from hoast.stt2 import STT
 from hoast.tts2 import TTS
 from hoast.voice import VoiceTurn
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_details_rollup_and_pressure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    missing: bool,
+) -> None:
+    """Convert rollup kB to bytes and preserve PSI units and absent fields.
+
+    Args:
+        monkeypatch:
+            Redirects proc rollup and cgroup resolution to fixtures.
+
+        tmp_path:
+            Holds a cgroup PSI fixture.
+
+        caplog:
+            Captures rollup and pressure records or optional-failure warnings.
+
+        missing:
+            Whether both optional diagnostic files are inaccessible.
+
+    """
+    rollup = (
+        "0000-ffff ---p 00000000 00:00 0 [rollup]\n"
+        "Rss: 1025 kB\nPss: 1000 kB\nAnonymous: 900 kB\n"
+        "AnonHugePages: 512 kB\nPrivate_Clean: 3 kB\nPrivate_Dirty: 4 kB\n"
+    )
+    monkeypatch.setattr(memory, "_cgroup_directory", lambda: tmp_path)
+    monkeypatch.setattr(
+        Path,
+        "open",
+        Mock(side_effect=OSError("unavailable"))
+        if missing
+        else Mock(return_value=StringIO(rollup)),
+    )
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        Mock(side_effect=OSError("unavailable"))
+        if missing
+        else Mock(
+            return_value=(
+                "some avg10=1.25 avg60=0.50 avg300=0.10 total=123456\n"
+                "full avg10=0.00 avg60=0.00 avg300=0.00 total=7\n"
+            )
+        ),
+    )
+    with caplog.at_level(logging.INFO):
+        memory.log_memory_details("test.detail")
+    if missing:
+        assert "memory.details boundary=test.detail status=unavailable" in caplog.text
+        assert "memory.pressure boundary=test.detail status=unavailable" in caplog.text
+    else:
+        assert "rss_bytes=1049600 pss_bytes=1024000" in caplog.text
+        assert "anonymous_bytes=921600 anon_huge_pages_bytes=524288" in caplog.text
+        assert (
+            "private_clean_bytes=3072 private_dirty_bytes=4096 swap_bytes=None"
+            in caplog.text
+        )
+        assert "scope=cgroup kind=some avg10_percent=1.25" in caplog.text
+        assert "avg300_percent=0.10 total_us=123456" in caplog.text
+        assert "kind=full" in caplog.text
+
+
+def test_smaps_units_and_missing_fields() -> None:
+    """Keep absent fields distinct from zero and reject unexpected size units."""
+    assert memory._smaps_sizes(["Swap: 0 kB\n", "Pss: 2 kB\n"]) == {
+        "Swap": 0,
+        "Pss": 2048,
+    }
+    with pytest.raises(ValueError, match="units"):
+        memory._smaps_sizes(["Rss: 2 MB\n"])
+
+
+def test_mappings_bounded_ranked_and_optional(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Bound mappings to eight, rank anonymous bytes and tolerate OS failures.
+
+    Args:
+        monkeypatch:
+            Supplies smaps text without opening process or mapped file contents.
+
+        caplog:
+            Captures bounded mapping records and optional diagnostics warnings.
+
+    """
+    text = "".join(
+        f"{index:08x}-{index + 1:08x} rw-p 00000000 00:00 0 /{'x' * 300}\n"
+        f"Size: 100 kB\nRss: 90 kB\nAnonymous: {index} kB\n"
+        for index in range(12)
+    )
+    opened = Mock(return_value=StringIO(text))
+    monkeypatch.setattr(Path, "open", opened)
+    with caplog.at_level(logging.INFO):
+        memory.log_memory_mappings("test.maps")
+    opened.assert_called_once_with()
+    records = [
+        r.message for r in caplog.records if r.message.startswith("memory.mapping ")
+    ]
+    assert len(records) == 8
+    assert "address=0000000b-0000000c" in records[0]
+    assert "size_bytes=102400 rss_bytes=92160 anonymous_bytes=11264" in records[0]
+    assert "anon_huge_pages_bytes=None" in records[0]
+    assert "anonymous_bytes=4096" in records[-1]
+    assert "x" * 160 not in records[0]  # The leading slash occupies one character.
+    assert "x" * 159 in records[0]
+    monkeypatch.setattr(Path, "open", Mock(side_effect=OSError("unavailable")))
+    memory.log_memory_mappings("test.missing")
+    assert "memory.mappings boundary=test.missing status=unavailable" in caplog.text
 
 
 def test_observation_is_counter_only(
@@ -51,6 +165,9 @@ def test_observation_is_counter_only(
         "memory.usage boundary=test.counter rss_bytes=1 cgroup_bytes=2 "
         "cgroup_peak_bytes=3 cgroup_limit_bytes=4 oom_events=6 oom_kills=5 "
         "anon_bytes=7 anon_thp_bytes=8 shmem_bytes=9 file_bytes=10 "
+        "max_events=None kernel_bytes=None pagetables_bytes=None slab_bytes=None "
+        "thp_fault_alloc=None thp_collapse_alloc=None pgscan=None pgsteal=None "
+        "pgscan_khugepaged=None threads=None "
         "python_allocated_blocks=11 gc_counts=(12, 13, 14) "
         "sample_elapsed_seconds=0.125000"
     )
@@ -84,18 +201,22 @@ def test_optional_cgroup_stat(
         "memory.current": "20\n",
         "memory.peak": "30\n",
         "memory.max": "max\n",
-        "memory.events": "oom 2\noom_kill 1\n",
+        "memory.events": "oom 2\noom_kill 1\nmax 9\n",
     }.items():
         (tmp_path / name).write_text(value)
     if stat_available:
         (tmp_path / "memory.stat").write_text(
             "anon 40\nfile 50\nshmem 60\nanon_thp 70\nfile_mapped 80\n"
+            "kernel 81\npagetables 82\nslab 83\nthp_fault_alloc 84\n"
+            "thp_collapse_alloc 85\npgscan 86\npgsteal 87\n"
         )
     monkeypatch.setattr(memory, "_cgroup_directory", lambda: tmp_path)
     monkeypatch.setattr(
         memory.psutil,
         "Process",
-        lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=10)),
+        lambda: SimpleNamespace(
+            memory_info=lambda: SimpleNamespace(rss=10), num_threads=lambda: 8
+        ),
     )
     result = memory._snapshot()
     assert result.rss_bytes == 10
@@ -107,7 +228,61 @@ def test_optional_cgroup_stat(
     assert result.file_bytes == (50 if stat_available else None)
     assert result.shmem_bytes == (60 if stat_available else None)
     assert result.anon_thp_bytes == (70 if stat_available else None)
+    assert result.max_events == 9
+    assert result.threads == 8
+    for name, value in {
+        "kernel_bytes": 81,
+        "pagetables_bytes": 82,
+        "slab_bytes": 83,
+        "thp_fault_alloc": 84,
+        "thp_collapse_alloc": 85,
+        "pgscan": 86,
+        "pgsteal": 87,
+    }.items():
+        assert getattr(result, name) == (value if stat_available else None)
+    assert result.pgscan_khugepaged is None
     assert ("memory.cgroup_stat status=unavailable" in caplog.text) != stat_available
+
+
+def test_sparse_counters_and_optional_khugepaged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Keep missing events/stats unknown and khugepaged counters in page units.
+
+    Args:
+        monkeypatch:
+            Replaces cgroup resolution and process counters with test data.
+
+        tmp_path:
+            Holds sparse cgroup files representative of differing kernel support.
+
+    """
+    for name, value in {
+        "memory.current": "20\n",
+        "memory.max": "1024\n",
+        "memory.events": "oom_kill 0\n",
+        "memory.stat": "pgscan_khugepaged 17\n",
+    }.items():
+        (tmp_path / name).write_text(value)
+    monkeypatch.setattr(memory, "_cgroup_directory", lambda: tmp_path)
+    monkeypatch.setattr(
+        memory.psutil,
+        "Process",
+        lambda: SimpleNamespace(
+            memory_info=lambda: SimpleNamespace(rss=10),
+            num_threads=Mock(side_effect=psutil.AccessDenied()),
+        ),
+    )
+    result = memory._snapshot()
+    assert result.rss_bytes == 10
+    assert result.threads is None
+    assert result.cgroup_peak_bytes is None
+    assert result.cgroup_limit_bytes == 1024
+    assert result.max_events is None
+    assert result.oom_events is None
+    assert result.oom_kills == 0
+    assert result.pgscan_khugepaged == 17
+    assert result.pgscan is None and result.pgsteal is None
 
 
 @pytest.mark.parametrize("error", [OSError("unavailable"), psutil.AccessDenied()])
@@ -254,6 +429,8 @@ def test_run_voice_owns_idle_monitor(
     prepare = Mock(return_value=app)
     monkeypatch.setattr(llm_cli, "prepare_voice", prepare)
     monkeypatch.setattr(llm_cli, "log_memory_usage", observe)
+    monkeypatch.setattr(llm_cli, "log_memory_details", Mock())
+    monkeypatch.setattr(llm_cli, "log_memory_mappings", Mock())
 
     async def scenario() -> None:
         """Coordinate one periodic sample then block until owner cleanup."""

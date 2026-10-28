@@ -2,9 +2,10 @@
 
 import ctypes
 import gc
+import heapq
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -49,6 +50,36 @@ class _MemorySnapshot:
 
     file_bytes: int | None = None
     """Whole-cgroup file charge in bytes, including shared memory."""
+
+    max_events: int | None = None
+    """Cumulative memory.events max counter (limit hits, not OOM kills)."""
+
+    kernel_bytes: int | None = None
+    """Whole-cgroup kernel charge in bytes; overlaps slab and page tables."""
+
+    pagetables_bytes: int | None = None
+    """Whole-cgroup page-table charge in bytes."""
+
+    slab_bytes: int | None = None
+    """Whole-cgroup reclaimable and unreclaimable slab charge in bytes."""
+
+    thp_fault_alloc: int | None = None
+    """Cumulative successful THP fault allocations, not bytes."""
+
+    thp_collapse_alloc: int | None = None
+    """Cumulative successful THP collapse allocations, not bytes."""
+
+    pgscan: int | None = None
+    """Cumulative reclaim pages scanned, not bytes."""
+
+    pgsteal: int | None = None
+    """Cumulative reclaim pages reclaimed, not bytes."""
+
+    pgscan_khugepaged: int | None = None
+    """Optional cumulative khugepaged reclaim pages scanned, not bytes."""
+
+    threads: int | None = None
+    """Current process thread count, including native worker threads."""
 
 
 @lru_cache(maxsize=1)
@@ -104,6 +135,7 @@ def _snapshot() -> _MemorySnapshot:
     limit: int | None = None
     kills: int | None = None
     oom: int | None = None
+    max_events: int | None = None
     stats: dict[str, int] = {}
     directory = _cgroup_directory()
     if directory is not None:
@@ -120,20 +152,27 @@ def _snapshot() -> _MemorySnapshot:
                     kills = int(count)
                 elif name == "oom":
                     oom = int(count)
+                elif name == "max":
+                    max_events = int(count)
         except OSError:
             logger.warning("memory.cgroup status=unavailable", exc_info=True)
         try:
             for line in (directory / "memory.stat").read_text().splitlines():
                 name, count = line.split()
-                if name in {"anon", "anon_thp", "shmem", "file"}:
-                    stats[name] = int(count)
+                stats[name] = int(count)
         except OSError:
             logger.warning("memory.cgroup_stat status=unavailable", exc_info=True)
     rss: int | None = None
+    threads: int | None = None
     try:
-        rss = psutil.Process().memory_info().rss
+        process = psutil.Process()
+        rss = process.memory_info().rss
     except psutil.Error, OSError:
         logger.warning("memory.rss status=unavailable", exc_info=True)
+    try:
+        threads = psutil.Process().num_threads()
+    except psutil.Error, OSError:
+        logger.warning("memory.threads status=unavailable", exc_info=True)
     return _MemorySnapshot(
         rss_bytes=rss,
         cgroup_bytes=current,
@@ -145,6 +184,16 @@ def _snapshot() -> _MemorySnapshot:
         anon_thp_bytes=stats.get("anon_thp"),
         shmem_bytes=stats.get("shmem"),
         file_bytes=stats.get("file"),
+        max_events=max_events,
+        kernel_bytes=stats.get("kernel"),
+        pagetables_bytes=stats.get("pagetables"),
+        slab_bytes=stats.get("slab"),
+        thp_fault_alloc=stats.get("thp_fault_alloc"),
+        thp_collapse_alloc=stats.get("thp_collapse_alloc"),
+        pgscan=stats.get("pgscan"),
+        pgsteal=stats.get("pgsteal"),
+        pgscan_khugepaged=stats.get("pgscan_khugepaged"),
+        threads=threads,
     )
 
 
@@ -170,6 +219,9 @@ def log_memory_usage(boundary: str) -> None:
         "memory.usage boundary=%s rss_bytes=%s cgroup_bytes=%s "
         "cgroup_peak_bytes=%s cgroup_limit_bytes=%s oom_events=%s oom_kills=%s "
         "anon_bytes=%s anon_thp_bytes=%s shmem_bytes=%s file_bytes=%s "
+        "max_events=%s kernel_bytes=%s pagetables_bytes=%s slab_bytes=%s "
+        "thp_fault_alloc=%s thp_collapse_alloc=%s pgscan=%s pgsteal=%s "
+        "pgscan_khugepaged=%s threads=%s "
         "python_allocated_blocks=%s gc_counts=%s sample_elapsed_seconds=%.6f",
         boundary,
         snapshot.rss_bytes,
@@ -182,10 +234,200 @@ def log_memory_usage(boundary: str) -> None:
         snapshot.anon_thp_bytes,
         snapshot.shmem_bytes,
         snapshot.file_bytes,
+        snapshot.max_events,
+        snapshot.kernel_bytes,
+        snapshot.pagetables_bytes,
+        snapshot.slab_bytes,
+        snapshot.thp_fault_alloc,
+        snapshot.thp_collapse_alloc,
+        snapshot.pgscan,
+        snapshot.pgsteal,
+        snapshot.pgscan_khugepaged,
+        snapshot.threads,
         allocated_blocks,
         gc_counts,
         time.perf_counter() - started,
     )
+
+
+def _smaps_sizes(lines: Iterable[str]) -> dict[str, int]:
+    """Parse selected proc smaps sizes as bytes; absent fields stay absent.
+
+    Args:
+        lines:
+            Kernel smaps or smaps_rollup text lines, with size values in kB.
+
+    """
+    sizes: dict[str, int] = {}
+    for line in lines:
+        parts = line.split()
+        if parts and parts[0] in {
+            "Size:",
+            "Rss:",
+            "Pss:",
+            "Anonymous:",
+            "AnonHugePages:",
+            "Private_Clean:",
+            "Private_Dirty:",
+            "Swap:",
+        }:
+            if len(parts) != 3 or parts[2] != "kB":
+                raise ValueError(f"Unexpected smaps size units: {line!r}")
+            sizes[parts[0][:-1]] = int(parts[1]) * 1024
+    return sizes
+
+
+def log_memory_details(boundary: str) -> None:
+    """Log process rollup bytes and memory PSI separately from hot-path counters.
+
+    This synchronous scan can walk process page tables; schedule periodically,
+    not per inference. PSI averages are percentages and totals are microseconds.
+    Pressure uses the process cgroup, or system PSI if no cgroup is available.
+    Optional OS failures warn without preventing the other diagnostic record.
+
+    Args:
+        boundary:
+            Short diagnostic phase label, never prompt content or credentials.
+
+    """
+    try:
+        with Path("/proc/self/smaps_rollup").open() as source:
+            sizes = _smaps_sizes(source)
+        logger.info(
+            "memory.details boundary=%s rss_bytes=%s pss_bytes=%s "
+            "anonymous_bytes=%s anon_huge_pages_bytes=%s private_clean_bytes=%s "
+            "private_dirty_bytes=%s swap_bytes=%s",
+            boundary,
+            *(
+                sizes.get(name)
+                for name in (
+                    "Rss",
+                    "Pss",
+                    "Anonymous",
+                    "AnonHugePages",
+                    "Private_Clean",
+                    "Private_Dirty",
+                    "Swap",
+                )
+            ),
+        )
+    except OSError:
+        logger.warning(
+            "memory.details boundary=%s status=unavailable", boundary, exc_info=True
+        )
+    directory = _cgroup_directory()
+    pressure = (
+        directory / "memory.pressure"
+        if directory is not None
+        else Path("/proc/pressure/memory")
+    )
+    try:
+        for line in pressure.read_text().splitlines():
+            parts = line.split()
+            if not parts or parts[0] not in {"some", "full"}:
+                continue
+            values = dict(part.split("=", 1) for part in parts[1:])
+            logger.info(
+                "memory.pressure boundary=%s scope=%s kind=%s "
+                "avg10_percent=%s avg60_percent=%s avg300_percent=%s total_us=%s",
+                boundary,
+                "cgroup" if directory is not None else "system",
+                parts[0],
+                values.get("avg10"),
+                values.get("avg60"),
+                values.get("avg300"),
+                values.get("total"),
+            )
+    except OSError:
+        logger.warning(
+            "memory.pressure boundary=%s status=unavailable", boundary, exc_info=True
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class _Mapping:
+    """Bounded mapping metadata and selected byte counts, never mapped contents."""
+
+    address: str
+    """Virtual address range, capped to 64 characters."""
+
+    path: str
+    """Mapping label or backing path, capped to 160 characters."""
+
+    sizes: dict[str, int]
+    """Selected smaps byte counts; unavailable fields are absent."""
+
+
+def _anonymous_mappings(path: Path) -> Iterator[_Mapping]:
+    """Stream mappings with anonymous resident bytes, including file-backed COW.
+
+    Args:
+        path:
+            Proc smaps file or test fixture; only metadata is read.
+
+    """
+    address = ""
+    label = ""
+    sizes: dict[str, int] = {}
+    with path.open() as source:
+        for line in source:
+            parts = line.split(maxsplit=5)
+            if len(parts) >= 5 and "-" in parts[0] and ":" not in parts[0]:
+                if sizes.get("Anonymous", 0) > 0:
+                    yield _Mapping(address, label, sizes)
+                address = parts[0][:64]
+                label = parts[5].strip()[:160] if len(parts) == 6 else "[anonymous]"
+                sizes = {}
+            else:
+                sizes.update(_smaps_sizes((line,)))
+        if sizes.get("Anonymous", 0) > 0:
+            yield _Mapping(address, label, sizes)
+
+
+def log_memory_mappings(boundary: str) -> None:
+    """Log at most eight mappings ranked by anonymous resident bytes.
+
+    Includes file-backed private/COW mappings with anonymous pages. Streams
+    smaps with bounded retained metadata; never reads mapped file contents.
+    Missing size fields log None. This is an explicit expensive diagnostic:
+    the caller schedules startup and infrequent (e.g. 15-minute) observations,
+    never inference boundaries. There is no implicit scan or growth trigger.
+
+    Args:
+        boundary:
+            Short diagnostic phase label, never prompt content or credentials.
+
+    """
+    try:
+        mappings = heapq.nlargest(
+            8,
+            _anonymous_mappings(Path("/proc/self/smaps")),
+            key=lambda mapping: mapping.sizes["Anonymous"],
+        )
+    except OSError:
+        logger.warning(
+            "memory.mappings boundary=%s status=unavailable", boundary, exc_info=True
+        )
+        return
+    logger.info("memory.mappings boundary=%s count=%s", boundary, len(mappings))
+    for rank, mapping in enumerate(mappings, 1):
+        logger.info(
+            "memory.mapping boundary=%s rank=%s address=%s path=%r "
+            "size_bytes=%s rss_bytes=%s anonymous_bytes=%s anon_huge_pages_bytes=%s",
+            boundary,
+            rank,
+            mapping.address,
+            mapping.path,
+            *(
+                mapping.sizes.get(name)
+                for name in (
+                    "Size",
+                    "Rss",
+                    "Anonymous",
+                    "AnonHugePages",
+                )
+            ),
+        )
 
 
 def reclaim_memory(boundary: str) -> None:

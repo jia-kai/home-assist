@@ -151,11 +151,11 @@ def test_missing_allocator_warns_once(
 def test_cgroup_snapshot(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, maximum: str
 ) -> None:
-    """Read complete optional cgroup counters and distinguish unlimited memory.
+    """Read optional cgroup/thread counters and distinguish unlimited memory.
 
     Args:
         monkeypatch:
-            Points cgroup lookup and process RSS at tiny independent fixtures.
+            Points cgroup lookup, process RSS and threads at independent fixtures.
 
         tmp_path:
             Temporary cgroup-like directory with text counter files.
@@ -175,7 +175,9 @@ def test_cgroup_snapshot(
     monkeypatch.setattr(
         memory.psutil,
         "Process",
-        lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=4096)),
+        lambda: SimpleNamespace(
+            memory_info=lambda: SimpleNamespace(rss=4096), num_threads=lambda: 3
+        ),
     )
     snapshot = memory._snapshot()
     assert snapshot.rss_bytes == 4096
@@ -183,6 +185,8 @@ def test_cgroup_snapshot(
     assert snapshot.cgroup_peak_bytes == 16384
     assert snapshot.cgroup_limit_bytes == (None if maximum == "max" else 65536)
     assert snapshot.oom_kills == 1
+    assert snapshot.max_events == 23
+    assert snapshot.threads == 3
 
 
 def test_unavailable_rss_does_not_disable_collection(

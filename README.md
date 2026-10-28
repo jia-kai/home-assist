@@ -222,7 +222,11 @@ journalctl --user -u hoast.service --since '1 day ago'
 
 Logs can contain spoken requests and local device details; review them before
 sharing. Memory observations are recorded at voice stages and every minute
-without forced garbage collection. Advanced budgets and optional reclamation
+without forced garbage collection. `python -m hoast` disables transparent huge
+pages for its process before loading inference libraries; host settings and other
+services are unchanged. See the [memory diagnostics guide](docs/memory-diagnostics.md)
+for policy verification, periodic mapping observations and preserving OOM evidence.
+Advanced budgets and optional reclamation
 are described in the [language model guide](docs/llm.md).
 
 ## Further reading
