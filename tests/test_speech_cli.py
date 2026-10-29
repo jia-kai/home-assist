@@ -182,6 +182,7 @@ def test_assistant_cli_backend(
     runner.assert_awaited_once()
     assert runner.call_args.kwargs == {
         "threads": 2,
+        "memory_diagnostics": False,
         "stt_backend": "cpu" if backend is None else backend,
         "stt_model_dir": None,
         "tts_model_dir": None,

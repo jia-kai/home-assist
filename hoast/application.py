@@ -194,6 +194,9 @@ class VoiceApplication:
     output: Callable[[str], None] = console_text
     """Text sink for recognized input and full grounded output."""
 
+    memory_diagnostics: bool = False
+    """Whether to sample memory counters at voice stage boundaries."""
+
     def close(self) -> None:
         """Drain playback and release both speech engines on the inference worker.
 
@@ -231,19 +234,21 @@ class VoiceApplication:
         logger.info("warmup.announcement status=completed")
 
     def transcribe(self, pcm: bytes) -> str:
-        """Recognize PCM on the inference worker, logging counters even on failure.
+        """Recognize PCM, sampling optional memory counters even on failure.
 
         Args:
             pcm:
                 Nonempty mono signed little-endian int16 PCM at 16 kHz.
 
         """
-        log_memory_usage("voice.transcribe.before")
+        if self.memory_diagnostics:
+            log_memory_usage("voice.transcribe.before")
         try:
             samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
             return self.stt.transcribe_samples(samples, 16000)
         finally:
-            log_memory_usage("voice.transcribe.after")
+            if self.memory_diagnostics:
+                log_memory_usage("voice.transcribe.after")
 
     def respond(self, turn: VoiceTurn) -> None:
         """Run one independent command, drain speech, and discard its history.
@@ -253,7 +258,7 @@ class VoiceApplication:
         error propagates to the native pipeline handler. Every accepted turn gets
         fresh state, cleaned up even on empty output or sink/playback errors;
         a turn already cancelled at entry does not run or change session state.
-        Counter-only observations bracket agent work and follow playback and reset.
+        When enabled, counter observations bracket agent work and follow reset.
 
         Args:
             turn:
@@ -267,7 +272,8 @@ class VoiceApplication:
         logger.info("agent.session status=new mode=voice")
         try:
             self.output("You: " + turn.text)
-            log_memory_usage("voice.agent.before")
+            if self.memory_diagnostics:
+                log_memory_usage("voice.agent.before")
             try:
                 answer = self.assistant.reply(turn.text, turn.cancelled.is_set)
             except Exception:
@@ -275,7 +281,8 @@ class VoiceApplication:
                 self.assistant.new_session()
                 answer = "I couldn't complete that request. Please try again."
             finally:
-                log_memory_usage("voice.agent.after")
+                if self.memory_diagnostics:
+                    log_memory_usage("voice.agent.after")
             if turn.cancelled.is_set() or not answer.strip():
                 return
             self.output("Assistant: " + answer)
@@ -284,7 +291,9 @@ class VoiceApplication:
                 try:
                     self.tts.play(spoken, blocking=True, cancelled=turn.cancelled)
                 finally:
-                    log_memory_usage("voice.tts.after")
+                    if self.memory_diagnostics:
+                        log_memory_usage("voice.tts.after")
         finally:
             self.assistant.new_session()
-            log_memory_usage("voice.turn.after")
+            if self.memory_diagnostics:
+                log_memory_usage("voice.turn.after")

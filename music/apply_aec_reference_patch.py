@@ -13,7 +13,7 @@ SESSION_PATH = Path(
 )
 HELPER_SOURCE = Path("/tmp/aec-reference/aec_reference.py")
 PATCH_SOURCE = Path("/tmp/aec-reference/aec_reference.patch")
-EXPECTED_SHA256 = "09eb3a9662309a5868c3dc550311ba9bac0fd74aef9f293896682c455e798ecc"
+EXPECTED_SHA256 = "790be861a19e9f53397db1b5dbe590b213aab985ac755057ec55185f50437097"
 
 
 def apply_patch(source: str, patch: str) -> str:
@@ -34,7 +34,10 @@ def apply_patch(source: str, patch: str) -> str:
 
     """
     lines = patch.splitlines(keepends=True)
-    if len(lines) < 3 or lines[:2] != ["--- stream_session.py\n", "+++ stream_session.py\n"]:
+    if len(lines) < 3 or lines[:2] != [
+        "--- stream_session.py\n",
+        "+++ stream_session.py\n",
+    ]:
         raise RuntimeError("AEC patch must target only stream_session.py")
     result = source
     index = 2
@@ -53,7 +56,9 @@ def apply_patch(source: str, patch: str) -> str:
         old = "".join(line[1:] for line in hunk if not line.startswith("+"))
         new = "".join(line[1:] for line in hunk if not line.startswith("-"))
         if result.count(old) != 1:
-            raise RuntimeError(f"AEC patch hunk is not a unique source match: {hunk_number}")
+            raise RuntimeError(
+                f"AEC patch hunk is not a unique source match: {hunk_number}"
+            )
         result = result.replace(old, new, 1)
     return result
 

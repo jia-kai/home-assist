@@ -3,7 +3,7 @@
 @@ -33,7 +33,8 @@
      StreamingProtocol,
  )
- from .helpers import get_final_output_format
+ from .helpers import cli_clock_time, get_final_output_format
 +from .aec_reference import AecReferenceSink
  from .stream import AirPlayStream
  
@@ -38,17 +38,19 @@
  
      async def remove_client(
          self, airplay_player: AirPlayPlayer, reason: str = "client removed"
-@@ -879,7 +886,18 @@
+@@ -879,7 +886,20 @@
                  async for chunk in audio_source:
                      if not self.sync_clients:
                          break
  
 +                    if self._aec_references and self.start_unix_ms:
++                        # The AirPlay anchor uses a raw-clock timeline; HAEC uses wall time.
++                        clock_offset_us = time.time_ns() // 1000 - int(cli_clock_time() * 1_000_000)
 +                        byte_offset = self._pcm_total_fed
-+                        start_us = self.start_unix_ms * 1000 + (
++                        start_us = self.start_unix_ms * 1000 + clock_offset_us + (
 +                            byte_offset * 1_000_000 // self._pcm_byte_rate
 +                        )
-+                        end_us = self.start_unix_ms * 1000 + (
++                        end_us = self.start_unix_ms * 1000 + clock_offset_us + (
 +                            (byte_offset + len(chunk)) * 1_000_000 // self._pcm_byte_rate
 +                        )
 +                        for reference in self._aec_references.values():
@@ -57,14 +59,16 @@
                      has_running_clients = await self._write_chunk_to_all_players(chunk)
                      if not has_running_clients:
                          self.prov.logger.debug(
-@@ -1378,7 +1396,13 @@
+@@ -1378,7 +1398,15 @@
          self.start_unix_ms = target_ms
          self.start_time = target_ms / 1000
          # the only place a session (re)gains a live timeline, so any park ends here
          self.parked = False
++        # HAEC timestamps are host Unix time, not the cliairplay raw-clock timeline.
++        clock_offset_us = time.time_ns() // 1000 - int(cli_clock_time() * 1_000_000)
 +        for reference in self._aec_references.values():
 +            reference.stream_start(
-+                target_ms * 1000, self.pcm_format.sample_rate,
++                target_ms * 1000 + clock_offset_us, self.pcm_format.sample_rate,
 +                self.pcm_format.channels, self._pcm_frame_size,
 +                self.pcm_format.content_type.value,
 +            )

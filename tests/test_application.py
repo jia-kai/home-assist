@@ -1113,12 +1113,14 @@ def test_native_run_waits_for_playback_and_disconnect_drains(
 
 @pytest.mark.parametrize("model_name", ["functiongemma", "lfm"])
 @pytest.mark.parametrize("thread_option", ["auto", "1", "2"])
+@pytest.mark.parametrize("memory_diagnostics", [False, True])
 def test_entry_point_uses_satellite_config(
     pipeline: Pipeline,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     model_name: str,
     thread_option: str,
+    memory_diagnostics: bool,
 ) -> None:
     """Use configured voice and model settings with console-only default diagnostics.
 
@@ -1137,6 +1139,9 @@ def test_entry_point_uses_satellite_config(
 
         thread_option:
             Shared CPU budget option; voice auto uses the provisional two threads.
+
+        memory_diagnostics:
+            Whether the optional voice memory monitor is requested.
 
     """
     path = tmp_path / "config.toml"
@@ -1178,7 +1183,8 @@ def test_entry_point_uses_satellite_config(
             str(tmp_path / "selected-stt"),
             "--tts-model-dir",
             str(tmp_path / "selected-tts"),
-        ],
+        ]
+        + (["--memory-diagnostics"] if memory_diagnostics else []),
     )
     llm_cli.main()
     logging_setup.assert_called_once_with()
@@ -1193,6 +1199,7 @@ def test_entry_point_uses_satellite_config(
     assert runner.call_args.args[4] is True
     assert runner.call_args.kwargs == {
         "threads": threads,
+        "memory_diagnostics": memory_diagnostics,
         "stt_model_dir": tmp_path / "selected-stt",
         "tts_model_dir": tmp_path / "selected-tts",
         "stt_backend": "cpu",

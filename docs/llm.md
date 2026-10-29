@@ -28,7 +28,7 @@ output budget. Requests outside these budgets raise rather than truncate, and
 generation reaching its token limit is rejected as potentially partial tool
 syntax. Streamed fragments remain provisional until final validation.
 
-Voice mode separately logs cheap `memory.usage` observations at transcription,
+With `--memory-diagnostics`, voice mode logs `memory.usage` observations at transcription,
 agent and synthesis boundaries, after turn history is discarded, and every
 60 seconds, including idle periods. The periodic `voice.idle` label is not a
 busy-state predicate; correlate command events before attributing idle growth.
@@ -38,7 +38,8 @@ anonymous/anonymous-huge-page/shared/file counters, OOM events and Python
 allocation counts. Sampling time is logged; cgroup numbers include charged cache
 and are not interchangeable with process RSS. The idle monitor is canceled and
 joined before speech-owner cleanup. This captures sparse multi-day growth
-without enabling the higher-latency reclamation experiment.
+without enabling the higher-latency reclamation experiment. These voice memory
+observations and the monitor are disabled by default.
 
 ### Selected bounded-CPU configuration
 
@@ -287,7 +288,9 @@ registry, optional music next/query extensions, and optional light control.
 `WeatherAgent` is a compatibility subclass with the same behavior and registry
 validation. Standalone `play` and `stop` route deterministically to `resume_music`
 and `pause_music` via `Session.request_tools`, preserving native history without
-model inference. External user turns retain basic sentence punctuation and
+model inference. Standalone `play some music` similarly routes directly to
+`play_music(playlist='daylist')`; longer requests, including multi-intent turns,
+are not captured by this shortcut. External user turns retain basic sentence punctuation and
 apostrophes while losing title brackets and decorative double quotes. Shortcut
 matching ignores case and terminal sentence punctuation. Longer requests use the model. Without configured
 music tools, these shortcuts yield “Music isn't configured.” Standalone “louder”
@@ -341,13 +344,31 @@ requests (“Pause requested.” / “Resume requested.”) from immediately obs
 states (“Music paused.” / “Music resumed.”), and describes new playback as a
 mix based on a bounded seed label and at most the first artist. Refusals use short
 actionable wording; detailed reasons and candidate lists are logged rather than
-spoken. Pause/resume use native controls on the retained source. Idle retained
-external AudioSource sessions, including Spotify Connect, resume using
-`players/cmd/play` after a read-only queue-identity check. Idle queue sources and
-missing or unsupported sources refuse fallback. Blank `play_music()` arguments
-also resume existing playback without
-searching or creating a queue. A supplied title or artist replaces the active
-queue with a recommendation mix, whose seed need not play first. Version-only
+spoken. Pause/resume delegate source and queue restoration to Music Assistant's
+native player controls, including when source metadata is missing. Blank
+`play_music()` arguments also use that behavior without searching or creating a
+queue. Neither standalone `play` nor resume automatically selects or refreshes the
+daylist: the ordered track snapshot does not preserve playlist identity, and
+missing player source metadata does not prove that no previous playback exists.
+Matching tracks would also identify unrelated playlists incorrectly. Music Assistant
+can retain a playlist container as a queue source, but its public source projection
+omits individual tracks, so a daylist source alone does not prove that the queue
+contains only daylist tracks. Also, fetching a refreshed snapshot before enqueueing
+a playlist URI is not an atomic handoff: Music Assistant writes its parsed cache in
+the background, and the playlist resolver may read an older cached result. Replacing
+the queue on this evidence could discard other playback or play stale tracks. For a
+Spotify daylist request, use
+`play_music(playlist='daylist')` without title or artist. The client requires
+exactly one available Spotify provider, requests its generic daylist tracks with
+`force_refresh=True` on every call, and replaces the active queue with the ordered
+track URI snapshot, not an Endless Mix. Empty or failed retrieval does not dispatch
+playback. The custom Music Assistant image bypasses the Spotify daylist raw-page
+cache during forced refresh; Spotify's response and other caching may still be
+stale. The spoken result reports the current song only when an immediate
+observation verifies the player, queue, and new item against a fetched track;
+otherwise it reports only the request. A supplied title
+or artist replaces the active queue with a recommendation mix, whose seed need not
+play first. Version-only
 duplicates with identical title and artist sets use the first available ranked
 match. Title-only requests also choose the first available exact-title match
 across artists, using Music Assistant's search order. An explicit artist remains

@@ -201,6 +201,87 @@ def mixed_runtime(
     return LocalAgent(Session(FunctionGemma(LLMConfig(tmp_path), tools))), state
 
 
+@pytest.mark.parametrize("text", ["Play my daylist", "PLEASE PLAY Spotify Day List!", "play the day list please", "play some music", " Play Some Music! "])
+def test_daylist_standalone_shortcut(
+    mixed_runtime: tuple[LocalAgent, Routing], text: str
+) -> None:
+    """Standalone daylist play requests bypass model routing.
+
+    Args:
+        mixed_runtime:
+            Weight-free agent and captured dispatches.
+
+        text:
+            Equivalent spoken request.
+    """
+    agent, state = mixed_runtime
+    state.failure = AssertionError("Shortcut invoked inference")
+    state.results = [{"status": "started", "mode": "daylist", "confirmation": "requested"}]
+    assert list(agent.stream(text)) == ["Requested your Spotify daylist."]
+    assert state.dispatched[0].name == "play_music"
+    assert state.dispatched[0].arguments["playlist"] == "daylist"
+    assert not state.histories
+
+
+@pytest.mark.parametrize("text", ["What is a daylist?", "play my daylist?", "play my daylist and tell me the weather", "play the daylist song by Artist", "play some music and tell me the weather", "play some music by Artist"])
+def test_daylist_does_not_shortcut_other_requests(
+    mixed_runtime: tuple[LocalAgent, Routing], text: str
+) -> None:
+    """Questions, multi-intent turns and unrelated songs remain model-routed.
+
+    Args:
+        mixed_runtime:
+            Weight-free agent and captured routing history.
+
+        text:
+            Request that must not take the single-action shortcut.
+    """
+    agent, state = mixed_runtime
+    list(agent.stream(text))
+    assert state.histories
+    assert state.dispatched[0].name == "get_weather"
+
+
+def test_daylist_model_batch_preserves_other_intents(
+    mixed_runtime: tuple[LocalAgent, Routing],
+) -> None:
+    """Normalize the model's daylist title while retaining its weather call.
+
+    Args:
+        mixed_runtime:
+            Weight-free agent and captured dispatches.
+    """
+    agent, state = mixed_runtime
+    state.calls = (ToolCall("play_music", {"title": "my Day List"}), weather_call())
+    state.results = [
+        {"status": "started", "mode": "daylist", "confirmation": "requested"},
+        current(),
+    ]
+    answers = list(agent.stream("Play my day list and tell me the weather"))
+    assert answers[0] == "Requested your Spotify daylist."
+    assert len(answers) == 2
+    assert [call.name for call in state.dispatched] == ["play_music", "get_weather"]
+    assert state.dispatched[0].arguments["playlist"] == "daylist"
+
+
+def test_play_some_music_multi_intent_uses_model_batch(
+    mixed_runtime: tuple[LocalAgent, Routing],
+) -> None:
+    """Route a combined request through inference without dropping weather.
+
+    Args:
+        mixed_runtime:
+            Weight-free agent and captured dispatches.
+    """
+    agent, state = mixed_runtime
+    state.calls = (ToolCall("play_music", {}), weather_call())
+    state.results = [{"status": "resumed", "confirmation": "observed"}, current()]
+    answers = list(agent.stream("Play some music and tell me the weather"))
+    assert len(answers) == 2
+    assert state.histories
+    assert [call.name for call in state.dispatched] == ["play_music", "get_weather"]
+
+
 @pytest.mark.parametrize("status", ["ambiguous_city", "city_not_found"])
 def test_location_clarification_is_brief(status: str) -> None:
     """Ask for an exact location without reading any geocoding candidates.
@@ -948,7 +1029,7 @@ def test_volume_word_shortcuts(
     }
 
 
-@pytest.mark.parametrize("query", ["PLAY!", "stop?", "louder", "quieter", "quiter"])
+@pytest.mark.parametrize("query", ["PLAY!", "play some music", "stop?", "louder", "quieter", "quiter"])
 def test_unconfigured_shortcut_preserves_context(
     agent_runtime: tuple[WeatherAgent, Routing], query: str
 ) -> None:
@@ -1105,6 +1186,8 @@ def test_weather_and_single_music_action(
         (ToolCall("play_music", {}), True),
         (ToolCall("play_music", {"title": "", "artist": ""}), True),
         (ToolCall("play_music", {"title": " \t", "artist": "\n"}), True),
+        (ToolCall("play_music", {"playlist": "daylist"}), True),
+        (ToolCall("play_music", {"playlist": "daylist", "title": "Song"}), False),
         (ToolCall("play_music", {"title": None}), False),
         (ToolCall("play_music", {"artist": 42}), False),
         (ToolCall("play_music", {"title": "Song", "author": "Artist"}), False),
@@ -1153,7 +1236,7 @@ def test_mixed_argument_validation(
         assert state.dispatched[-1].arguments == (
             {"period": "now", "city": ""}
             if call.name == "get_weather"
-            else {"title": "", "artist": "", **call.arguments}
+            else {"title": "", "artist": "", "playlist": "", **call.arguments}
             if call.name == "play_music"
             else {"level": 5, **call.arguments}
             if call.name == "volume_music"
@@ -1408,7 +1491,7 @@ def test_model_route_is_logged_before_tool_execution(
     caplog.set_level(logging.DEBUG)
     state.calls = (ToolCall("what_is_playing", {}),)
     state.results = [{"status": "nothing_playing", "observed_state": "idle"}]
-    assert list(agent.stream("Play some music")) == ["Nothing is playing right now."]
+    assert list(agent.stream("Play music")) == ["Nothing is playing right now."]
     assert "Agent routing mode=llm tools=['what_is_playing']" in caplog.text
     assert "tool routing status=generated raw=" in caplog.text
     assert state.text in caplog.text

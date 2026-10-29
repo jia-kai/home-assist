@@ -318,6 +318,71 @@ def test_counter_errors_are_nonfatal(
     assert "boundary=test.unavailable rss_bytes=None cgroup_bytes=None" in caplog.text
 
 
+def test_voice_boundaries_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run a voice turn without collecting default stage observations.
+
+    Args:
+        monkeypatch:
+            Spies on memory sampling without reading process counters.
+
+    """
+    observe = Mock()
+    monkeypatch.setattr(application, "log_memory_usage", observe)
+    assistant = MagicMock(spec=Assistant)
+    assistant.reply.return_value = "Done."
+    stt = MagicMock(spec=STT)
+    stt.transcribe_samples.return_value = "recognized"
+    app = VoiceApplication(assistant, stt, MagicMock(spec=TTS), Mock())
+    assert app.transcribe(b"\0\0") == "recognized"
+    app.respond(VoiceTurn("test", 0.0, 1.0, threading.Event()))
+    observe.assert_not_called()
+    assistant.reply.assert_called_once()
+
+
+def test_voice_monitor_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Start and close voice without sampling or starting a diagnostic monitor.
+
+    Args:
+        monkeypatch:
+            Replaces voice startup, listener, and diagnostic functions.
+
+        tmp_path:
+            Cache path forwarded to mocked startup.
+
+    """
+    app = MagicMock(spec=VoiceApplication)
+    monitor = Mock()
+    observe = Mock()
+    monkeypatch.setattr(llm_cli, "prepare_voice", Mock(return_value=app))
+    monkeypatch.setattr(llm_cli, "_monitor_memory_usage", monitor)
+    monkeypatch.setattr(llm_cli, "log_memory_usage", observe)
+
+    async def listen(*args: object, **kwargs: object) -> None:
+        """Return immediately without network access.
+
+        Args:
+            args:
+                Listener positional arguments.
+
+            kwargs:
+                Listener keyword arguments.
+
+        """
+
+    monkeypatch.setattr(llm_cli, "listen", listen)
+    asyncio.run(
+        llm_cli.run_voice(
+            MagicMock(spec=Assistant), SatelliteConfig("mock"), None, tmp_path
+        )
+    )
+    monitor.assert_not_called()
+    observe.assert_not_called()
+    assert app.memory_diagnostics is False
+    app.close.assert_called_once_with()
+
+
 @pytest.mark.parametrize("fail", [False, True])
 def test_transcribe_boundaries(monkeypatch: pytest.MonkeyPatch, fail: bool) -> None:
     """Bracket recognition on both return and failure without extra inference.
@@ -338,7 +403,7 @@ def test_transcribe_boundaries(monkeypatch: pytest.MonkeyPatch, fail: bool) -> N
         stt.transcribe_samples.side_effect = RuntimeError("recognition failed")
     assistant = MagicMock(spec=Assistant)
     tts = MagicMock(spec=TTS)
-    app = VoiceApplication(assistant, stt, tts)
+    app = VoiceApplication(assistant, stt, tts, memory_diagnostics=True)
     if fail:
         with pytest.raises(RuntimeError, match="recognition failed"):
             app.transcribe(b"\0\0")
@@ -388,7 +453,7 @@ def test_turn_boundaries_and_reset(
     elif outcome == "pre_cancelled":
         cancelled.set()
     stt = MagicMock(spec=STT)
-    app = VoiceApplication(assistant, stt, tts, Mock())
+    app = VoiceApplication(assistant, stt, tts, Mock(), memory_diagnostics=True)
     turn = VoiceTurn("test", 0.0, 1.0, cancelled)
     if outcome == "tts_error":
         with pytest.raises(RuntimeError, match="playback failure"):
@@ -487,7 +552,11 @@ def test_run_voice_owns_idle_monitor(
         app.close.side_effect = close
         task = asyncio.create_task(
             llm_cli.run_voice(
-                MagicMock(spec=Assistant), SatelliteConfig("mock"), None, tmp_path
+                MagicMock(spec=Assistant),
+                SatelliteConfig("mock"),
+                None,
+                tmp_path,
+                memory_diagnostics=True,
             )
         )
         await asyncio.wait_for(listener_ready.wait(), timeout=5)

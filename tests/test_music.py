@@ -701,6 +701,34 @@ def test_idle_resume_delegates_missing_source_metadata(source: str | None) -> No
     assert not client.replies
 
 
+@pytest.mark.parametrize("blank_play", [False, True])
+def test_resume_after_daylist_snapshot_never_guesses_identity(blank_play: bool) -> None:
+    """A restarted client resumes a track snapshot without inferring its origin.
+
+    Args:
+        blank_play:
+            Whether the generic request uses blank play rather than resume.
+
+    """
+    media: dict[str, JsonValue] = {"uri": "spotify://track/shared"}
+    before = player(state="paused", source="speaker", current_media=media)
+    after = player(state="playing", source="speaker", current_media=media)
+    client = FixtureClient(
+        [
+            ("players/all", [before]),
+            ("players/get", before),
+            ("players/cmd/play", None),
+            ("players/get", after),
+        ]
+    )
+    result = client.play_music() if blank_play else client.resume_music()
+    assert result_object(result)["status"] == "resumed"
+    assert [command for command, _ in client.requests] == [
+        "players/all", "players/get", "players/cmd/play", "players/get"
+    ]
+    assert not client.replies
+
+
 @pytest.mark.parametrize("resume", [False, True])
 @pytest.mark.parametrize("source", ["spotify", "speaker"])
 def test_player_controls_delegate_stream_handling(resume: bool, source: str) -> None:
@@ -1137,6 +1165,26 @@ def test_player_command_failures_never_retry_or_change_route(
         "players/all",
         "players/get",
         f"players/cmd/{command}",
+    ]
+
+
+def test_blank_play_queue_empty_does_not_assume_no_restorable_source() -> None:
+    """An empty-queue error alone cannot authorize replacement with a daylist."""
+    before = player(state="idle", source=None, source_list=[])
+    client = MusicClient(MusicConfig(player_id="speaker"), "offline-token")
+    with (
+        patch.object(
+            client,
+            "_request",
+            side_effect=[[before], before, MusicAssistantError("QueueEmpty")],
+        ) as request,
+        pytest.raises(MusicAssistantError, match="QueueEmpty"),
+    ):
+        client.play_music()
+    assert [call.args[0] for call in request.call_args_list] == [
+        "players/all",
+        "players/get",
+        "players/cmd/play",
     ]
 
 
@@ -2067,3 +2115,157 @@ def test_redaction_handles_serialized_token_spellings() -> None:
         result = client._redact(text)
         assert "[redacted]" in result
         assert "token" not in result
+
+
+def test_daylist_fetches_each_snapshot_and_plays_ordered_uris() -> None:
+    """Refresh twice and replace the real queue with each ordered snapshot."""
+    provider: JsonValue = [{"domain": "spotify", "instance_id": "spotify-id", "available": True}]
+    first: list[JsonValue] = [track("Any song", "ZICO", "spotify://track/first"), track(uri="spotify://track/second")]
+    second: list[JsonValue] = [track(uri="spotify://track/changed")]
+
+    def cycle(tracks: JsonValue) -> list[tuple[str, JsonValue]]:
+        """Build one complete request cycle.
+
+        Args:
+            tracks:
+                Playlist response returned for this cycle.
+        """
+        return [("players/all", [player()]), ("providers", provider),
+                ("music/playlists/playlist_tracks", tracks), ("players/get", player()),
+                ("player_queues/get_active_queue", queue()), ("player_queues/play_media", None),
+                ("players/get", player()), ("player_queues/get_active_queue", queue())]
+
+    client = FixtureClient(cycle(first) + cycle(second))
+    tool = client.tools()[2]
+    for expected in (["spotify://track/first", "spotify://track/second"], ["spotify://track/changed"]):
+        result = tool.handler(tool.arguments.model_validate({"playlist": "daylist"}))
+        assert render_music(result) == "Requested your Spotify daylist."
+        assert client.requests[-3] == ("player_queues/play_media", {"queue_id": "group-queue", "media": expected, "option": "replace", "shuffle": False})
+    refreshes = [args for command, args in client.requests if command == "music/playlists/playlist_tracks"]
+    assert refreshes == [{"item_id": "37i9dQZF1EP6YuccBxUcC1", "provider_instance_id_or_domain": "spotify-id", "force_refresh": True}] * 2
+    assert not client.replies
+
+
+@pytest.mark.parametrize("providers,tracks", [
+    ([], None),
+    ([{"domain": "spotify", "instance_id": "a", "available": True}, {"domain": "spotify", "instance_id": "b", "available": True}], None),
+    ([{"domain": "spotify", "instance_id": "a", "available": True}], []),
+    ([{"domain": "spotify", "instance_id": "a", "available": True}], [{"uri": ""}]),
+])
+def test_daylist_invalid_retrieval_never_dispatches(providers: JsonValue, tracks: JsonValue) -> None:
+    """Reject missing or ambiguous providers and unusable snapshots before playback.
+
+    Args:
+        providers:
+            Provider response to inspect.
+
+        tracks:
+            Playlist response or None if no retrieval is expected.
+    """
+    replies: list[tuple[str, JsonValue]] = [("players/all", [player()]), ("providers", providers)]
+    if tracks is not None:
+        replies.append(("music/playlists/playlist_tracks", tracks))
+    client = FixtureClient(replies)
+    result = client.play_music(playlist="daylist")
+    assert result_object(result)["status"] == "daylist_failed"
+    assert "couldn't load" in render_music(result)
+    assert not client.replies
+    assert all(command != "player_queues/play_media" for command, _ in client.requests)
+
+
+def test_daylist_rpc_failure_is_reported_without_playback() -> None:
+    """A failed playlist RPC produces a concise refusal without queue mutation."""
+    client = FixtureClient([("players/all", [player()]), ("providers", [{"domain": "spotify", "instance_id": "a", "available": True}])])
+    original = client._request
+
+    def fail(command: str, **args: JsonValue) -> JsonValue:
+        """Fail playlist retrieval while retaining the fixture for other commands.
+
+        Args:
+            command:
+                Requested RPC.
+
+            **args:
+                RPC arguments.
+        """
+        if command == "music/playlists/playlist_tracks":
+            raise MusicAssistantError("offline")
+        return original(command, **args)
+
+    with patch.object(client, "_request", side_effect=fail):
+        assert result_object(client.play_music(playlist="daylist"))["status"] == "daylist_failed"
+    assert all(command != "player_queues/play_media" for command, _ in client.requests)
+
+
+def test_daylist_selector_rejects_song_constraints() -> None:
+    """An explicit playlist cannot silently override a song or artist request."""
+    with pytest.raises(ValidationError):
+        PlayMusicArguments(playlist="daylist", title="daylist")
+    assert PlayMusicArguments(title="DAY list").playlist == "daylist"
+    assert PlayMusicArguments(title="daylist", artist="Artist").playlist == ""
+    assert PlayMusicArguments(title="A daylist song").playlist == ""
+
+
+@pytest.mark.parametrize("state,uri,expected", [
+    ("playing", "spotify://track/1", "Spotify daylist is playing. Now playing Song."),
+    ("paused", "spotify://track/1", "Requested your Spotify daylist."),
+    ("playing", "spotify://track/other", "Requested your Spotify daylist."),
+])
+def test_daylist_speech_requires_matching_playing_observation(
+    state: str, uri: str, expected: str
+) -> None:
+    """Only a playing track in the fetched snapshot supports a current-song claim.
+
+    Args:
+        state:
+            Post-dispatch player state.
+
+        uri:
+            Observed track identity.
+
+        expected:
+            Grounded spoken response.
+    """
+    client = FixtureClient([
+        ("players/all", [player()]),
+        ("providers", [{"domain": "spotify", "instance_id": "a", "available": True}]),
+        ("music/playlists/playlist_tracks", [track()]),
+        ("players/get", player()),
+        ("player_queues/get_active_queue", queue(current_item={"queue_item_id": "old"})),
+        ("player_queues/play_media", None),
+        ("players/get", player(state=state, source="group-queue", current_media={"title": "Song", "artist": "Artist", "uri": uri, "queue_item_id": "new"})),
+        ("player_queues/get_active_queue", queue(active=True, state="playing", current_item={"queue_item_id": "new", "media_item": {"uri": uri}})),
+    ])
+    assert render_music(client.play_music(title="my Day List")) == expected
+    assert not client.replies
+
+
+@pytest.mark.parametrize("scenario", ["preexisting", "route_drift", "wrong_queue", "wrong_source", "missing_identity", "mismatched_item"])
+def test_daylist_unproven_provenance_is_requested(scenario: str) -> None:
+    """Do not attribute an existing track or another route to the dispatch.
+
+    Args:
+        scenario:
+            Evidence gap or route mismatch in the readback.
+    """
+    before_id = "new" if scenario == "preexisting" else "old"
+    after_player = player(
+        source="other" if scenario == "wrong_source" else "group-queue",
+        current_media={"title": "Song", "artist": "Artist", "uri": "spotify://track/1", "queue_item_id": "other" if scenario == "mismatched_item" else "new"},
+        **({"active_group": "other-player"} if scenario == "route_drift" else {}),
+    )
+    replies: list[tuple[str, JsonValue]] = [
+        ("players/all", [player()]),
+        ("providers", [{"domain": "spotify", "instance_id": "a", "available": True}]),
+        ("music/playlists/playlist_tracks", [track()]),
+        ("players/get", player(current_media={"uri": "spotify://track/1", "queue_item_id": before_id})),
+        ("player_queues/get_active_queue", queue(current_item={"queue_item_id": None if scenario == "missing_identity" else before_id})),
+        ("player_queues/play_media", None),
+        ("players/get", after_player),
+    ]
+    if scenario == "route_drift":
+        replies.append(("players/get", player("other-player", source="group-queue", current_media={"title": "Song", "artist": "Artist", "uri": "spotify://track/1", "queue_item_id": "new"})))
+    replies.append(("player_queues/get_active_queue", queue(queue_id="other-queue" if scenario == "wrong_queue" else "group-queue", active=True, state="playing", current_item={"queue_item_id": "new", "media_item": {"uri": "spotify://track/1"}})))
+    client = FixtureClient(replies)
+    assert render_music(client.play_music(playlist="daylist")) == "Requested your Spotify daylist."
+    assert not client.replies

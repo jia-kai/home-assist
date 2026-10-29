@@ -187,6 +187,16 @@ def render_music(result: JsonValue) -> str:
         raise TypeError("Music result must be an object")
     data: dict[str, Any] = result
     status = data["status"]
+    if status == "daylist_failed":
+        return "I couldn't load your Spotify daylist. Please check Spotify in the music app."
+    if status == "started" and data.get("mode") == "daylist":
+        playback = data.get("playback")
+        if data.get("confirmation") == "observed" and isinstance(playback, dict):
+            playing = playback.get("now_playing")
+            if isinstance(playing, dict) and isinstance(playing.get("title"), str):
+                title = _voice_label(playing["title"], "your selection")
+                return f"Spotify daylist is playing. Now playing {title}."
+        return "Requested your Spotify daylist."
     if status == "playing":
         playing = data.get("now_playing")
         if playing is None:
@@ -337,7 +347,8 @@ class LocalAgent:
         Model routing prose is withheld. Errors and abandonment reset the session;
         errors propagate, and partially dispatched batches are never retried.
         Exhausted generated-call repairs yield a short clarification and preserve
-        prior history so the next request can proceed. Standalone play/stop and
+        prior history so the next request can proceed. Standalone "play some music"
+        requests a fresh daylist. Standalone play/stop and
         louder/quieter optionally followed by an integer percentage use direct calls.
         Bare relative-volume words use five percentage points. Next/next song/next track and
         switch song/skip song/skip track similarly dispatch music_next directly.
@@ -361,6 +372,7 @@ class LocalAgent:
         }
         shortcut = {
             "play": ToolCall("resume_music", {}),
+            "play some music": ToolCall("play_music", {"playlist": "daylist"}),
             "stop": ToolCall("pause_music", {}),
             "louder": ToolCall("volume_music", {"action": "louder", "level": 5}),
             "quieter": ToolCall("volume_music", {"action": "quieter", "level": 5}),
@@ -386,6 +398,11 @@ class LocalAgent:
             "turn off the light": ToolCall("set_light", {"on": False}),
             "turn off the lights": ToolCall("set_light", {"on": False}),
         }.get(shortcut_text)
+        if "?" not in user_text and "？" not in user_text and re.fullmatch(
+            r"(?:please )?play (?:me )?(?:(?:my|the|spotify|spotify's) )*day\s*list(?: please)?",
+            shortcut_text,
+        ):
+            shortcut = ToolCall("play_music", {"playlist": "daylist"})
         volume = re.fullmatch(
             r"(louder|quieter|quiter)\s+(\d+)(?:\s+percent)?", shortcut_text
         )

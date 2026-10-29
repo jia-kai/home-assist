@@ -29,6 +29,11 @@ sufficient. Compare end-to-end latency and memory over long sparse-command runs.
 
 ## Observations and cadence
 
+Voice memory observations are disabled by default. Pass `--memory-diagnostics`
+to `python -m hoast` to enable the following startup, periodic, and stage records.
+The default Compose command does not pass this option. This setting is separate
+from `--memory-reclaim`, which opts into GC and allocator trimming.
+
 - `memory.usage`: cheap RSS, thread, Python-block and cgroup counters at voice
   stage boundaries and every 60 seconds. Cgroup records include limit events,
   anonymous/file/shared memory, native huge-page allocation/collapse counters,

@@ -12,6 +12,7 @@ Speech runs on the CPU.
 
 - “What's the weather today?” or “Will it rain in Seattle tomorrow?”
 - “Play some music,” “stop music,” or “next song.”
+- “Play my Spotify daylist.”
 - “Play Blue in Green by Miles Davis.”
 - “Set music volume to 30 percent.”
 - “Turn on the light” or “关灯。”
@@ -151,6 +152,8 @@ this integration.
 
 “Play” resumes existing playback. A request with a song title or artist starts
 a new mix; specifying the artist helps avoid choosing a different recording.
+Say “play some music” or “play my Spotify daylist” to request a fresh daylist
+snapshot; standalone “play” resumes instead.
 “Stop” uses Music Assistant's pause control, which can stop sources that cannot
 be paused.
 

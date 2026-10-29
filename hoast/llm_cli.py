@@ -171,14 +171,14 @@ async def run_voice(
     debug_audio: bool = False,
     *,
     threads: int = 2,
+    memory_diagnostics: bool = False,
     stt_backend: Literal["cpu", "GPU", "ort"] = "cpu",
     stt_model_dir: Path | None = None,
     tts_model_dir: Path | None = None,
 ) -> None:
     """Warm and run the native voice pipeline with one serialized inference worker.
 
-    Own one periodic diagnostic monitor after startup; cancel and join it before
-    releasing speech resources on listener completion, failure, or cancellation.
+    When requested, own a diagnostic monitor and join it before speech cleanup.
 
     Args:
         assistant:
@@ -198,6 +198,9 @@ async def run_voice(
 
         threads:
             Shared STT/TTS/LLM CPU budget, one or two, passed to both speech engines.
+
+        memory_diagnostics:
+            Enable startup, periodic and voice-stage memory observations.
 
         stt_backend:
             Explicit SenseVoice execution backend, forwarded unchanged to startup.
@@ -233,10 +236,13 @@ async def run_voice(
             except asyncio.CancelledError:
                 application = await future
                 raise
-            log_memory_usage("voice.startup")
-            memory_monitor = asyncio.create_task(
-                _monitor_memory_usage(), name="voice-memory-monitor"
-            )
+            assert application is not None
+            application.memory_diagnostics = memory_diagnostics
+            if memory_diagnostics:
+                log_memory_usage("voice.startup")
+                memory_monitor = asyncio.create_task(
+                    _monitor_memory_usage(), name="voice-memory-monitor"
+                )
 
             async def transcribe(pcm: bytes) -> str:
                 """Run STT without blocking native API keepalives.
@@ -370,9 +376,16 @@ def main() -> None:
         action="store_true",
         help="Opt into full Python GC/heap trimming at LLM boundaries; adds latency",
     )
+    parser.add_argument(
+        "--memory-diagnostics",
+        action="store_true",
+        help="Enable voice startup, periodic, and per-stage memory diagnostics",
+    )
     args = parser.parse_args()
     if args.text and args.debug_audio:
         parser.error("--debug-audio requires voice mode, without --text")
+    if args.text and args.memory_diagnostics:
+        parser.error("--memory-diagnostics requires voice mode, without --text")
     configure_logging()
     try:
         threads = (
@@ -443,6 +456,7 @@ def main() -> None:
                         args.cache,
                         args.debug_audio,
                         threads=threads,
+                        memory_diagnostics=args.memory_diagnostics,
                         stt_backend=args.stt_backend,
                         stt_model_dir=args.stt_model_dir,
                         tts_model_dir=args.tts_model_dir,

@@ -5,13 +5,15 @@ its player controls do. Play may restore an idle queue or retained source; pause
 may stop playback when MA cannot pause the output. Explicit directional commands
 avoid reversing a user's play/pause intent. Commands are sent once and observations
 are not atomic with dispatch; an acknowledgement is not proof of changed playback.
-Explicit new music replaces a queue with a dynamic Endless Mix; its seed need not
+Explicit songs and artists replace a queue with a dynamic Endless Mix; its seed need not
 play first and recommendation providers determine how long it can continue.
+Spotify daylist requests instead replace the queue with a refreshed track snapshot.
 Blank play_music arguments use MA's player Play behavior without choosing new music.
 """
 
 import json
 import logging
+import re
 import unicodedata
 from collections.abc import Callable
 from dataclasses import replace
@@ -36,6 +38,7 @@ from hoast.llm import Tool, ToolArguments, declaration_only
 
 _MAX_BYTES = 4 * 1024 * 1024
 _SEARCH_LIMIT = 25
+_DAYLIST_ID = "37i9dQZF1EP6YuccBxUcC1"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -48,7 +51,7 @@ class MusicArguments(ToolArguments):
 
 
 class PlayMusicArguments(ToolArguments):
-    """Optional new-music constraints; two blank fields resume existing playback."""
+    """Song constraints or an explicit playlist; blank arguments resume playback."""
 
     title: str = Field(default="", max_length=300, description="Song title, if known")
     """Exact title constraint after Unicode, case, and whitespace normalization."""
@@ -57,6 +60,41 @@ class PlayMusicArguments(ToolArguments):
         default="", max_length=300, description="Recording artist, if known"
     )
     """Exact recording artist constraint; blank with a blank title selects MA player Play."""
+
+    playlist: Literal["", "daylist"] = Field(
+        default="",
+        description="Use daylist for the user's Spotify daylist; omit for songs or artists",
+    )
+    """Explicit playlist selection, mutually exclusive with song constraints."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_daylist(cls, value: Any) -> Any:
+        """Map an unambiguous daylist title to the explicit playlist selector.
+
+        Args:
+            value:
+                Raw argument mapping supplied to validation.
+        """
+        if not isinstance(value, dict):
+            return value
+        title = value.get("title", "")
+        artist = value.get("artist", "")
+        if (not value.get("playlist") and isinstance(title, str)
+                and isinstance(artist, str) and not artist.strip() and re.fullmatch(
+            r"(?:(?:my|the|spotify|spotify's)\s+)*day\s*list",
+            title.strip(),
+            re.IGNORECASE,
+        )):
+            return {**value, "title": "", "playlist": "daylist"}
+        return value
+
+    @model_validator(mode="after")
+    def validate_playlist(self) -> Self:
+        """Reject conflicting playlist and song or artist constraints."""
+        if self.playlist and (self.title.strip() or self.artist.strip()):
+            raise ValueError("Playlist cannot be combined with title or artist")
+        return self
 
 
 class VolumeMusicArguments(ToolArguments):
@@ -100,7 +138,7 @@ def declare_music_tools() -> list[Tool[Any]]:
         ),
         Tool(
             "play_music",
-            "No title or artist resumes existing playback; new explicit title/artist starts an endless mix.",
+            "For Spotify daylist use playlist='daylist'. No selection resumes existing playback; an explicit song title or artist starts an endless mix.",
             PlayMusicArguments,
             declaration_only,
         ),
@@ -270,6 +308,9 @@ class _QueueMedia(_Response):
     name: str | None = None
     """Actual current media title, if supplied."""
 
+    uri: str | None = None
+    """Media identity reported for the queue item."""
+
     artists: list[_ArtistName] = Field(default_factory=list)
     """Ordered artists; announcements mention only the first."""
 
@@ -279,6 +320,9 @@ class _QueueItem(_Response):
 
     media_item: _QueueMedia | None = None
     """Structured media metadata, when available."""
+
+    queue_item_id: str | None = None
+    """Queue item identity shared with the player's current media."""
 
 
 class _Queue(_Response):
@@ -703,7 +747,11 @@ class MusicClient:
         handlers: dict[str, Callable[[Any], JsonValue]] = {
             "pause_music": lambda args: self.pause_music(),
             "resume_music": lambda args: self.resume_music(),
-            "play_music": lambda args: self.play_music(args.title, args.artist),
+            "play_music": lambda args: (
+                self.play_music(args.title, args.artist, args.playlist)
+                if args.playlist
+                else self.play_music(args.title, args.artist)
+            ),
             "volume_music": lambda args: self.volume_music(args.action, args.level),
             "music_next": lambda args: self.music_next(),
             "what_is_playing": lambda args: self.what_is_playing(),
@@ -1222,8 +1270,10 @@ class MusicClient:
         )
         return list(matches.values()), choices
 
-    def play_music(self, title: str = "", artist: str = "") -> JsonValue:
-        """Resume existing playback for blank fields, otherwise start a new Endless Mix.
+    def play_music(
+        self, title: str = "", artist: str = "", playlist: Literal["", "daylist"] = ""
+    ) -> JsonValue:
+        """Resume playback, start an Endless Mix, or play a Spotify daylist snapshot.
 
         Provider duplicates and versions with identical normalized title and full
         artist set collapse to the first available ranked result; the API has no
@@ -1245,14 +1295,22 @@ class MusicClient:
                 Recording artist, matched exactly against a track's artists. Blank
                 with a blank title lets MA restore its existing playback selection.
 
+            playlist:
+                Select Spotify's daylist, without a title or artist constraint.
+
         """
+        tool_args: dict[str, JsonValue] = {"title": title, "artist": artist}
+        if playlist:
+            tool_args["playlist"] = playlist
         return self._run_tool(
             "play_music",
-            {"title": title, "artist": artist},
-            lambda: self._play_music(title, artist),
+            tool_args,
+            lambda: self._play_music(title, artist, playlist),
         )
 
-    def _play_music(self, title: str, artist: str) -> JsonValue:
+    def _play_music(
+        self, title: str, artist: str, playlist: Literal["", "daylist"]
+    ) -> JsonValue:
         """Validate play arguments and route blank requests before any search or queue RPC.
 
         Args:
@@ -1262,8 +1320,13 @@ class MusicClient:
             artist:
                 Optional exact recording artist; whitespace counts as blank.
 
+            playlist:
+                Explicit playlist selector, mutually exclusive with song constraints.
+
         """
-        args = PlayMusicArguments(title=title, artist=artist)
+        args = PlayMusicArguments(title=title, artist=artist, playlist=playlist)
+        if args.playlist:
+            return self._play_daylist()
         if not args.title.strip() and not args.artist.strip():
             return self.resume_music()
         selected = self._select()
@@ -1338,3 +1401,109 @@ class MusicClient:
             "is_dynamic": observed.is_dynamic,
             "playback": playback,
         }
+
+    def _play_daylist(self) -> JsonValue:
+        """Fetch Spotify's daylist and replace the selected queue with its ordered URIs.
+
+        Require one available Spotify provider and a nonempty valid snapshot before
+        dispatch. Confirm only when fresh player and active queue observations
+        identify the same new queue item and a track in the snapshot. Missing or
+        inconsistent provenance yields a request acknowledgement instead.
+        """
+        selected = self._select()
+        if isinstance(selected, dict):
+            return selected
+        try:
+            uris = self._daylist_uris()
+        except MusicAssistantError as error:
+            self._log_failure("daylist retrieval", error)
+            return {"status": "daylist_failed"}
+        player = self._effective(selected.player_id)
+        value = self._request(
+            "player_queues/get_active_queue", player_id=player.player_id
+        )
+        if value is None:
+            value = self._request("player_queues/get", queue_id=player.player_id)
+        if value is None:
+            raise MusicAssistantError("No existing queue is available for new music")
+        queue = _parse(_Queue, value)
+        if not queue.available:
+            raise MusicAssistantError("Music Assistant queue is unavailable")
+        self._request(
+            "player_queues/play_media",
+            queue_id=queue.queue_id,
+            media=uris,
+            option="replace",
+            shuffle=False,
+        )
+        result: dict[str, JsonValue] = {
+            "status": "started",
+            "mode": "daylist",
+            "confirmation": "requested",
+            "player_id": player.player_id,
+            "queue_id": queue.queue_id,
+        }
+        try:
+            after = self._effective(selected.player_id)
+            observed_value = self._request(
+                "player_queues/get_active_queue", player_id=after.player_id
+            )
+            observed = (
+                _parse(_Queue, observed_value) if observed_value is not None else None
+            )
+            old_item = queue.current_item
+            new_item = observed.current_item if observed is not None else None
+            media = after.current_media
+            if (
+                after.player_id == player.player_id
+                and after.active_source == queue.queue_id
+                and observed is not None
+                and observed.queue_id == queue.queue_id
+                and observed.available
+                and observed.active
+                and observed.state == "playing"
+                and old_item is not None
+                and bool(old_item.queue_item_id)
+                and new_item is not None
+                and bool(new_item.queue_item_id)
+                and old_item.queue_item_id != new_item.queue_item_id
+                and new_item.media_item is not None
+                and media is not None
+                and media.queue_item_id == new_item.queue_item_id
+                and media.uri == new_item.media_item.uri
+                and media.uri in uris
+                and media.source_id in (None, queue.queue_id)
+            ):
+                playback = self._playing(after)
+                if _object(playback).get("now_playing") is not None:
+                    result["confirmation"] = "observed"
+                    result["playback"] = playback
+        except MusicAssistantError as error:
+            self._log_failure("daylist playback observation", error)
+        return result
+
+    def _daylist_uris(self) -> list[JsonValue]:
+        """Return the freshly requested daylist's ordered URIs or raise on failure."""
+        providers = _array(self._request("providers", provider_type="music"))
+        spotify = [
+            _object(value)
+            for value in providers
+            if _object(value).get("domain") == "spotify"
+            and _boolean(_object(value).get("available"))
+        ]
+        if len(spotify) != 1:
+            raise MusicAssistantError(
+                "Spotify daylist requires exactly one available Spotify provider"
+            )
+        provider = _text(spotify[0].get("instance_id"))
+        tracks = _array(
+            self._request(
+                "music/playlists/playlist_tracks",
+                item_id=_DAYLIST_ID,
+                provider_instance_id_or_domain=provider,
+                force_refresh=True,
+            )
+        )
+        if not tracks:
+            raise MusicAssistantError("Spotify daylist returned no tracks")
+        return [_text(_object(track).get("uri")) for track in tracks]
