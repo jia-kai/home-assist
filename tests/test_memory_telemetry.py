@@ -491,6 +491,7 @@ def test_run_voice_owns_idle_monitor(
     """
     observe = Mock()
     app = MagicMock(spec=VoiceApplication)
+    app.assistant.weather_cache = None
     prepare = Mock(return_value=app)
     monkeypatch.setattr(llm_cli, "prepare_voice", prepare)
     monkeypatch.setattr(llm_cli, "log_memory_usage", observe)
@@ -615,10 +616,136 @@ def test_startup_failure_has_no_monitor(
     listener.assert_not_called()
 
 
-def test_startup_cancellation_has_no_monitor(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("outcome", ["normal", "failure", "cancelled"])
+@pytest.mark.parametrize("memory_fails", [False, True])
+def test_failed_weather_does_not_skip_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    outcome: str,
+    memory_fails: bool,
 ) -> None:
-    """Join cancelled preparation and close its application without a monitor.
+    """Join both monitors and retain the listener's failure or cancellation.
+
+    Args:
+        monkeypatch:
+            Installs model-free startup and controlled background tasks.
+
+        tmp_path:
+            Unused cache root.
+
+        caplog:
+            Captures background failure tracebacks.
+
+        outcome:
+            Listener completion, failure, or owner cancellation.
+
+        memory_fails:
+            Whether the memory monitor also fails unexpectedly.
+
+    """
+    app = MagicMock(spec=VoiceApplication)
+    app.assistant.weather_cache = SimpleNamespace(voice_mode=False)
+    monkeypatch.setattr(llm_cli, "prepare_voice", Mock(return_value=app))
+    monkeypatch.setattr(llm_cli, "log_memory_usage", Mock())
+
+    async def scenario() -> None:
+        """Synchronize failed weather, active memory, and listener shutdown."""
+        weather_done = asyncio.Event()
+        memory_started = asyncio.Event()
+        memory_stopped = threading.Event()
+        listener_ready = asyncio.Event()
+
+        async def weather(*args: object) -> None:
+            """Fail independently of the listener.
+
+            Args:
+                args:
+                    Application and worker, unused by this fixture.
+
+            """
+            weather_done.set()
+            raise RuntimeError("weather failure")
+
+        async def monitor() -> None:
+            """Block until cancelled, optionally failing while joining."""
+            memory_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                memory_stopped.set()
+                if memory_fails:
+                    raise RuntimeError("memory failure")
+
+        async def listen(*args: object, **kwargs: object) -> None:
+            """Exit only after both background tasks have started.
+
+            Args:
+                args:
+                    Listener positional options.
+
+                kwargs:
+                    Listener keyword options.
+
+            """
+            await weather_done.wait()
+            await memory_started.wait()
+            listener_ready.set()
+            if outcome == "failure":
+                raise ValueError("listener failure")
+            if outcome == "cancelled":
+                await asyncio.Future()
+
+        def close() -> None:
+            """Check the monitor is joined and weather mode is reset first."""
+            assert memory_stopped.is_set()
+            assert not app.assistant.weather_cache.voice_mode
+
+        monkeypatch.setattr(llm_cli, "_refresh_weather", weather)
+        monkeypatch.setattr(llm_cli, "_monitor_memory_usage", monitor)
+        monkeypatch.setattr(llm_cli, "listen", listen)
+        app.close.side_effect = close
+        task = asyncio.create_task(
+            llm_cli.run_voice(
+                MagicMock(spec=Assistant),
+                SatelliteConfig("mock"),
+                None,
+                tmp_path,
+                memory_diagnostics=True,
+            )
+        )
+        await asyncio.wait_for(listener_ready.wait(), 5)
+        if outcome == "cancelled":
+            task.cancel()
+        expected = {
+            "normal": RuntimeError,
+            "failure": ValueError,
+            "cancelled": asyncio.CancelledError,
+        }[outcome]
+        with pytest.raises(expected) as caught:
+            await task
+        if outcome == "normal":
+            assert str(caught.value) == "weather failure"
+        else:
+            assert any("weather failure" in note for note in caught.value.__notes__)
+        if memory_fails:
+            assert any("memory failure" in note for note in caught.value.__notes__)
+
+    asyncio.run(scenario())
+    app.close.assert_called_once_with()
+    assert "stage=weather" in caplog.text
+    if memory_fails:
+        assert "stage=memory" in caplog.text
+
+
+@pytest.mark.parametrize("startup_fails", [False, True])
+def test_startup_cancellation_has_no_monitor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    startup_fails: bool,
+) -> None:
+    """Join cancelled preparation and preserve cancellation if startup fails.
 
     Args:
         monkeypatch:
@@ -626,6 +753,12 @@ def test_startup_cancellation_has_no_monitor(
 
         tmp_path:
             Unused cache path forwarded without reading model artifacts.
+
+        caplog:
+            Captures a failure from the joined startup worker.
+
+        startup_fails:
+            Whether startup raises after cancellation is requested.
 
     """
     started = threading.Event()
@@ -647,6 +780,8 @@ def test_startup_cancellation_has_no_monitor(
         """
         started.set()
         assert release.wait(timeout=5)
+        if startup_fails:
+            raise RuntimeError("late startup failure")
         return app
 
     async def scenario() -> None:
@@ -661,8 +796,12 @@ def test_startup_cancellation_has_no_monitor(
                 await asyncio.sleep(0)
             task.cancel()
             release.set()
-            with pytest.raises(asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError) as caught:
                 await task
+            if startup_fails:
+                assert any(
+                    "late startup failure" in note for note in caught.value.__notes__
+                )
         finally:
             release.set()
 
@@ -672,4 +811,8 @@ def test_startup_cancellation_has_no_monitor(
     asyncio.run(scenario())
     monitor.assert_not_called()
     listener.assert_not_called()
-    app.close.assert_called_once_with()
+    if startup_fails:
+        app.close.assert_not_called()
+        assert "voice.startup status=failed during cancellation" in caplog.text
+    else:
+        app.close.assert_called_once_with()

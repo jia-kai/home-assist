@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "algorithm": "lfm-final-test-v1",
+  "algorithm_description": "Group test rows by ordered target batch shape (no_tool if empty), music_state, command_language and noisy/clean based on asr_errors. Sort IDs in each stratum by SHA-256 of UTF-8 lfm-final-test-v1:<id>; take at most two; sort selected IDs lexicographically. Selection uses labels and metadata only, not predictions.",
+  "benchmark_manifest_sha256": "c43a1ee25c447b93e0dbc41b2e9631bb44ca90076ed841b75ed6a68c2cd9f497",
+  "test_jsonl_sha256": "79fc1c70cd72b600eea56b7a6d78479f9a4c23995e6c36b0ba0a4d1d373928ad",
+  "schema_sha256": "347c72aa8fcf04a4f3a3e4d2cb6cce3b09c11755227c5770423f824f1058089e",
+  "source_hashes": {
+    "chat_template_sha256": "ba551d58630afa3190b1be3602e28301f3d2e9bbac978dfc49d6d825171648b6",
+    "generator_sha256": "72dfa71728dbc30fc56249cbece5af2219957b63bca677817c8f4cb0d2ef59d0",
+    "normalizer_sha256": "f639fa31a0be9023af64f23a1d6d3c4a2f079d86d99a907fa4ea6b516a4b3382",
+    "prompt_sha256": "18f4d62f45b15e653b302a407d316bb2be06d21a292f558eabd4d7db65369579",
+    "templates_sha256": "424b4463c1aa8b7fbe3640b25d725d40ae38a9ed9b8503ae2e9187870c24c24b",
+    "variants_sha256": "020c5ccb9b189a00c07f7dc0eda8fa5323096612940a9484ad6b548ef7f23a5c"
+  },
+  "count": 86,
+  "ids_sha256": "f470f98a43836859d2528864a9bf52a6e44ef0ba81913a8e470563b0228f8cb1",
+  "coverage": {
+    "batch_shapes": {"get_weather": 8, "music_next": 8, "no_tool": 8, "pause_music": 8, "play_music": 16, "resume_music": 14, "set_light": 8, "volume_music": 8, "what_is_playing": 8},
+    "command_language": {"en": 36, "mixed": 8, "zh": 42},
+    "music_state": {"off": 43, "on": 43},
+    "asr_rows": 6,
+    "multi_action_rows": 0
+  },
+  "limitation": "The source test split contains zero multi-action labels. This selection cannot assess multi-action routing.",
+  "ids": [
+    "00514e6137f06c6527da66d8", "01935d9557fe186c5e37ea99", "0346dee0b1dbad7524743874", "063b0bf74e2f0fdee58f252f",
+    "09aaeb00dbbe33dd5044acb6", "0a63ddccccc692103a6cb818", "0d4cad6db9fbab3ddf6e5468", "0e23614d55e8be3369e6497e",
+    "188517ad6eea5c5e6f2ad759", "1975f987dc7d531ca9d405bb", "24c05652fb3d2369eb4f12b4", "24c7007e0dbfb56d5968bd68",
+    "26c42cb1a5350fc56e914ebb", "2de484f18843fe84eafd3648", "3081dd9d4127e8b054842ce6", "355939f15e7c1148cf570928",
+    "3640a23fabc93bac3aed9cda", "373d89048ce38936beae303c", "387d14512dc1913eb0a62d30", "3985e6b1a4ad03b66ba7d16b",
+    "3c996cdb691ccd8c0f971475", "3f03487943725dc1c20b1a25", "3fa62aee189f7bc17aa4a18e", "40011786625c6bb733904f6a",
+    "415e85194ef098b1f465201c", "4c8203a3cdf8d9bc25d5ecbd", "4cd973c16c9d541eb84763ce", "5302d14c867931c30bbc438f",
+    "54b8a347cad2a77ff75105f9", "5ad22408a2dd1df8ef46c38b", "5b3b9109c575ceedd74d5453", "63e329b8522ac67c064ec5f0",
+    "649ef25f3bbdb823a683b097", "66c8a6cd57535e620d3e830b", "66f96bb0eba12b6f43ac5e4b", "689a1c8c5d4eae34c1b7988b",
+    "6bc3c6bacf0edf9880938d93", "6e04c4126d566cd9cef9bb46", "70c2667e89e2c48533cb0e71", "7377a0c957c5749f93b696e2",
+    "77556c48836a11380b8a8a15", "77f2e5e7871e37fb58faa3a1", "78622e65c82140b60754bf56", "7c906b3003da53a34563531b",
+    "7d1bd222908321995b28caa4", "7ef05e41b387609fd0e0d92f", "7fc76e9c0ec3e5ef0ea7c9a2", "8532931f691d74107c5ceb33",
+    "87131bfa2f90404770ffe8c5", "8741a9d04660a8503804adcf", "87cfd073319af8d3ac7ac2ab", "937b1fa96b3e532e016dc61c",
+    "971abd321db39b92972aff95", "97e7e1bf2507a04e067c8e23", "988507785754033a00ff81f4", "9ad4547941648c33ca86df03",
+    "9b15e326ae1b7bb0a022b8dd", "9d38b0958e1888250ff40d53", "a14f114324e235eead602923", "a742961fda879476a12a6e4a",
+    "a8c949ebbc430aaae7fd847e", "a94397f736f8d4e76ecd00eb", "a9f735f4b5e403668b1b2901", "ac10478216bd89fd92e85b88",
+    "ac57b5bed12200b965130300", "af250640ecd2db9209f23239", "b6065e28f6d482c0a463137a", "b70cfca3d13137f752277957",
+    "b95e1ace7dc3298c399aea5d", "bd529b971f51cc8e50c1fca9", "bf4e14925f43fae0e433fe87", "bf510e5ad68f3ad6a45ddda5",
+    "c59356d20d1282a7f0d29cad", "c839416b05372b347e173632", "c8d6076e90079bbab37103bb", "cb5b3807998e04258c0e77fa",
+    "cbc3c3306b9d16bbf0c6c359", "cfd037d8f6cbbb63df01a346", "d0ce6eb2c94f1f9a7f8215bd", "d1d853ba77ad728b3f97c97e",
+    "e38ac35042acf4402018b07e", "e6d132a15184f3c4ab41728a", "e9dc7b9a168923735ab31fb1", "ef191352449874acea4c16b0",
+    "f6b24bdca714ae81966d70dc", "fcef4f59c464cb15ddfd370d"
+  ]
+}

@@ -1,5 +1,7 @@
 # Local LLM preparation, runtime, and measured results
 
+**Application status:** The current CLI selects the experimental [OpenCL LFM adapter](lfm-gpu.md), not the OpenVINO LFM library backend described in historical measurements below. It requires one compatible GPU and an allowlisted checkpoint; CPU fallback is unavailable. Integration remains subject to end-to-end qualification. FunctionGemma continues to support CPU. OpenVINO figures and library examples below are not measurements of the live OpenCL path.
+
 ## Models and setup
 
 ### Memory boundaries and request budgets
@@ -68,9 +70,10 @@ of GenAI's rewritten execution graph. Reproducible local measurements are retain
 in `.cache/hoast/diagnostics/lfm-tuning/`. Four-thread comparisons later in this
 document are historical experiments outside the selected two-core budget.
 
-**LFM2.5 on the iGPU is the CLI default.** Preparation also defaults to LFM and
-GPU; `LFMConfig` and its `from_cache()` factory default to GPU. Select CPU
-explicitly with `--device CPU` or `device="CPU"`. FunctionGemma
+**LFM2.5 on the GPU is the CLI default.** Preparation also defaults to LFM and
+GPU; `LFMConfig` and its `from_cache()` factory default to GPU. The separate
+OpenVINO library backend supports explicit CPU selection, but the CLI's OpenCL
+LFM adapter does not. FunctionGemma
 supports raw sessions on OpenVINO CPU/GPU (and PyTorch CPU), but observed weather
 routing was poor. The backend smoke checks and historical synthetic scores below
 do not establish equal agent accuracy. Deterministic answer rendering
@@ -431,63 +434,11 @@ exits 0. Global options precede the subcommand, as shown in the README.
 
 ### Weather tool and answer contract
 
-| Field                                  | Exact semantics                                                        |
-| -------------------------------------- | ---------------------------------------------------------------------- |
-| `period` argument                      | Optional: `now` (default), `today`, `tomorrow`, or `next_week`.            |
-| `city` argument                        | Optional string, at most 200 characters; empty/whitespace selects home.  |
-| Destination and dates                  | Named cities are geocoded; dates use the destination timezone.           |
-| `next_week`                             | Next Monday through Sunday, even when the current day is Monday.        |
-| `temperature_c`, daily extrema          | Celsius; missing provider measurements remain JSON null.                |
-| Current `precipitation_mm`              | Total in the `interval_seconds` preceding `time`, not ongoing rain.      |
-| Daily `rain_mm`                         | Rain total in millimeters, excluding snow.                              |
-| Daily probability                      | Maximum precipitation probability in percent, including snow.           |
-| Weekly temperature summary             | Minimum daily low and maximum daily high across the seven days.         |
-| Weekly probability summary             | Maximum daily probability, not probability of any event during a week.  |
-| Weekly `rainy_dates`                    | Dates with `rain_mm > 0`; empty means no forecast rain.                  |
-| Missing weekly inputs                  | Each summary metric is null if any relevant daily input is null.        |
-| City resolution failure                | `ambiguous_city` returns choices; `city_not_found` requests city/country. |
-
-The daily and summary probability key is `precipitation_probability_max_pct`.
-Successful results contain `city`, `timezone`, and `period`, plus current readings
-or chronological `days`; weekly results also contain `summary`. City-resolution
-results instead contain `status`, `period`, `city_query`, and `choices`. Missing
-keys, malformed data, and provider/network errors raise. Period `now`, including
-omitted periods, returns today's `days` plus `current_temperature_c` (possibly
-null) and current observation fields; explicit `today` omits those observations.
-Period strings are case-insensitive, trimmed, and normalize spaces/hyphens to
-underscores. Unknown strings, including `current`, select `now`; non-strings fail
-validation.
-The city value `Home` (case-insensitive, trimmed) selects configured home coordinates
-without geocoding, just like an empty city. Qualified names such as `Home, Kansas`
-are geocoded as city queries.
-After region/country filtering, candidates rank by case-insensitive exact city
-name, national-capital status (`PPLC`), descending population, then great-circle
-proximity to configured home. Missing population ranks below known counts;
-complete ties retain provider order. Optional feature codes and population remain
-null when absent. No matches return `city_not_found`. Candidate metadata is logged
-at debug level; selected city, ranking tuple, criteria, and distance in kilometers
-are logged at info level. Routing instructions preserve all user-specified state,
-province, region, and country qualifiers in the single `city` argument.
-
-The renderer rounds temperatures and percentages to integers (nearest, ties to
-even) and produces compact text, without a model summarization pass:
-
-- Default: “It's light rain, 12 degrees outside now, 1 to 12 degrees, 30% chance of
-  light rain.”
-- Explicit today: “For today, it's clear, 10 to 20 degrees, no rain.”
-- Named city: “In Paris, France, it's clear, 15 degrees outside now, 10 to 20
-  degrees, no rain.”
-- City and period: “For tomorrow, in Paris, France, it's heavy rain, 10 to 18
-  degrees, 80% chance of heavy rain.”
-
-Weekly text uses “For next week”, the most frequent daily condition (earliest on
-ties), weekly temperature extrema, and the maximum daily precipitation probability.
-That percentage is neither rain-only nor a weekly occurrence probability. Rain
-intensity is heavy if any rainy day's condition says heavy, light if all rainy
-days say light or drizzle, and otherwise unspecified. Zero rain across selected
-days produces “no rain”; missing measurements produce unavailable clauses.
-Explicit `now` and `current` requests use the default current-plus-today wording.
-Weather retrieval uses the network; model inference is local.
+- Periods are `now` (default), `today`, `tomorrow`, and `next_week` (the next Monday through Sunday). Strings are normalized; unknown strings, including `current`, select `now`, while non-strings fail validation. `now` includes current observations and today's forecast; explicit `today` omits current observations.
+- City is optional and limited to 200 characters. Empty or `Home` selects configured home coordinates; qualified names such as `Home, Kansas` are geocoded. Preserve requested region and country qualifiers. Forecast dates use the destination timezone. Unresolved cities return `ambiguous_city` or `city_not_found`; provider and malformed-data errors raise.
+- Temperatures are Celsius. Current precipitation is the total over the preceding observation interval, not ongoing rain. Daily `rain_mm` excludes snow; `precipitation_probability_max_pct` includes snow. Weekly temperature extrema and maximum daily probability summarize the seven days; that probability is not the chance of any event during the week. Weekly `rainy_dates` contains dates with rain above zero. Missing measurements remain null, including a weekly metric when any relevant daily input is missing.
+- Successful results include city, timezone and period, with current readings or chronological days; weekly results also include a summary. The deterministic renderer rounds temperatures and percentages to integers, reports unavailable values rather than inventing them, and produces compact spoken text without a model summary. Weekly text uses the most frequent condition and maximum daily probability.
+- Weather retrieval requires the network; model inference is local. See [setup](../README.md#setup) for home coordinates.
 
 ## Historical measurement scope
 

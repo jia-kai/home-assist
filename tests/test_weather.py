@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
 from urllib.error import URLError
 from urllib.request import Request
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import JsonValue, ValidationError
@@ -14,6 +15,7 @@ from hoast.agent import render_weather
 from hoast.config import WeatherConfig
 from hoast.llm import ToolCall, ToolRegistry
 from hoast.weather import WeatherArguments, WeatherClient
+from hoast.weather_cache import WeatherCache
 
 
 def forecast(
@@ -83,7 +85,12 @@ class FixtureClient(WeatherClient):
 
     def __init__(self) -> None:
         """Initialize a valid home and offline responses."""
-        super().__init__(WeatherConfig(51, -1))
+        super().__init__(
+            WeatherConfig(51, -1),
+            clock=lambda: datetime(
+                2026, 12, 28, 0, 15, tzinfo=ZoneInfo("Pacific/Kiritimati")
+            ),
+        )
         self.data = forecast()
         self.geocoding = {}
         self.requests = []
@@ -128,7 +135,6 @@ def test_tool_and_current() -> None:
     assert client.requests[0][1]["forecast_days"] == "16"
     assert "weather_code" in client.requests[0][1]["daily"].split(",")
     assert {"rain_sum", "showers_sum"} <= set(client.requests[0][1]["daily"].split(","))
-    assert WeatherArguments.model_validate({"period": "week"}).period == "now"
     with pytest.raises(ValidationError):
         WeatherArguments.model_validate({"period": "today", "city": 123})
     with pytest.raises(ValidationError):
@@ -248,6 +254,9 @@ def test_dates(start: str, period: str, first: str, last: str) -> None:
     """
     client = FixtureClient()
     client.data = forecast(start)
+    client.clock = lambda: datetime.fromisoformat(start + "T00:15").replace(
+        tzinfo=ZoneInfo("Pacific/Kiritimati")
+    )
     output = client.get_weather(WeatherArguments.model_validate({"period": period}))
     assert isinstance(output, dict)
     days = output["days"]
@@ -260,7 +269,7 @@ def test_dates(start: str, period: str, first: str, last: str) -> None:
 def test_clock_destination_timezone() -> None:
     """Convert an injected UTC Sunday to destination Monday before week selection."""
     client = FixtureClient()
-    client.clock = lambda: datetime(2026, 12, 27, 12, tzinfo=UTC)
+    client.clock = lambda: datetime(2026, 12, 27, 10, 15, tzinfo=UTC)
     output = client.get_weather(WeatherArguments(period="next_week"))
     assert isinstance(output, dict)
     assert isinstance(output["days"], list)
@@ -269,6 +278,99 @@ def test_clock_destination_timezone() -> None:
     client.clock = lambda: datetime(2026, 12, 28)  # noqa: DTZ001 -- invalid clock fixture
     with pytest.raises(ValueError, match="aware"):
         client.get_weather(WeatherArguments(period="today"))
+
+
+@pytest.mark.parametrize("offset", [-3600, 301])
+def test_live_observation_age_rejected(offset: int) -> None:
+    """Reject stale or excessively future observations at the live boundary.
+
+    Args:
+        offset:
+            Seconds from the injected clock to the provider observation.
+
+    """
+    client = FixtureClient()
+    assert client.clock is not None
+    current = client.data["current"]
+    assert isinstance(current, dict)
+    current["time"] = (client.clock() + timedelta(seconds=offset)).isoformat()
+    with pytest.raises(ValueError, match="stale or in the future"):
+        client.get_weather(WeatherArguments())
+    output = WeatherCache(client).get_weather(WeatherArguments())
+    assert output == {"status": "unavailable"}
+    assert render_weather(output) == "Weather is unavailable. Please try again."
+
+
+@pytest.mark.parametrize(
+    ("clock", "expected"),
+    [
+        (
+            datetime(2026, 11, 1, 5, 35, tzinfo=UTC),
+            datetime(2026, 11, 1, 5, 30, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 11, 1, 6, 30, tzinfo=UTC),
+            datetime(2026, 11, 1, 6, 30, tzinfo=UTC),
+        ),
+    ],
+)
+def test_dst_fall_unique_observation(clock: datetime, expected: datetime) -> None:
+    """Resolve either repeated local hour when exactly one instant is fresh.
+
+    Args:
+        clock:
+            Current UTC time.
+
+        expected:
+            Unique fresh observation instant.
+
+    """
+    assert (
+        weather.observation_instant(
+            "2026-11-01T01:30", ZoneInfo("America/New_York"), clock
+        )
+        == expected
+    )
+
+
+def test_dst_reject_unresolved_and_nonexistent() -> None:
+    """Reject two fresh folds, a sole future fold, stale folds, and spring gaps."""
+    zone = ZoneInfo("America/New_York")
+    for clock in (
+        datetime(2026, 11, 1, 6, 27, tzinfo=UTC),
+        datetime(2026, 11, 1, 5, 27, tzinfo=UTC),
+        datetime(2026, 11, 1, 8, 30, tzinfo=UTC),
+    ):
+        with pytest.raises(ValueError, match="Ambiguous"):
+            weather.observation_instant("2026-11-01T01:30", zone, clock)
+    with pytest.raises(ValueError, match="Nonexistent"):
+        weather.observation_instant(
+            "2026-03-08T02:30", zone, datetime(2026, 3, 8, 7, 30, tzinfo=UTC)
+        )
+
+
+def test_dst_offset_identifies_observation() -> None:
+    """An explicit offset disambiguates a repeated fall-back observation."""
+    now = datetime(2026, 11, 1, 6, 30, tzinfo=UTC)
+    assert (
+        weather.observation_instant(
+            "2026-11-01T01:30-05:00", ZoneInfo("America/New_York"), now
+        )
+        == now
+    )
+
+
+def test_midnight_selects_current_local_date() -> None:
+    """A recent observation before midnight must not select yesterday's forecast."""
+    client = FixtureClient()
+    client.clock = lambda: datetime(2026, 12, 28, 10, 5, tzinfo=UTC)
+    current = client.data["current"]
+    assert isinstance(current, dict)
+    current["time"] = "2026-12-28T23:45"
+    output = client.get_weather(WeatherArguments(period="today"))
+    assert isinstance(output, dict) and isinstance(output["days"], list)
+    assert isinstance(output["days"][0], dict)
+    assert output["days"][0]["date"] == "2026-12-29"
 
 
 def test_daily_surface() -> None:
@@ -300,7 +402,7 @@ def test_default_period_rendering() -> None:
     assert output["current_temperature_c"] == 12
     assert render_weather(output) == (
         "It's light rain, 12 degrees outside now, 1 to 12 degrees, "
-        "30% chance of light rain."
+        "today, 30% chance of light rain."
     )
     explicit = client.get_weather(WeatherArguments(period="today"))
     assert isinstance(explicit, dict)
@@ -313,6 +415,23 @@ def test_default_period_rendering() -> None:
     assert render_weather(output).startswith(
         "In Paris, France, it's light rain, current temperature unavailable, "
     )
+
+
+def test_now_condition_is_current_and_rain_is_daily() -> None:
+    """Keep distinct current and daily conditions, including missing observations."""
+    client = FixtureClient()
+    current = client.data["current"]
+    assert isinstance(current, dict)
+    current["weather_code"] = 0
+    result = client.get_weather(WeatherArguments())
+    assert isinstance(result, dict)
+    assert render_weather(result) == (
+        "It's clear, 12 degrees outside now, 1 to 12 degrees, "
+        "today, 30% chance of light rain."
+    )
+    current["weather_code"] = None
+    result = client.get_weather(WeatherArguments())
+    assert render_weather(result).startswith("It's conditions unavailable, ")
 
 
 @pytest.mark.parametrize("city", ["Home", "home", "HOME", "  HoMe  "])
@@ -338,9 +457,9 @@ def test_home_alias(city: str) -> None:
     assert params["longitude"] == str(client.config.longitude)
 
 
-@pytest.mark.parametrize("period", ["now", "current", "whenever", "", " NOW "])
+@pytest.mark.parametrize("period", ["now", "current", " CURRENT ", " NOW "])
 def test_now_period_dispatch(period: str) -> None:
-    """Route explicit now and unknown strings through real validation to defaults.
+    """Route explicit now aliases through validation to current weather.
 
     Args:
         period:
@@ -352,6 +471,22 @@ def test_now_period_dispatch(period: str) -> None:
     result = registry.dispatch([ToolCall("get_weather", {"period": period})])[0]
     assert result == client.get_weather(WeatherArguments())
     assert "12 degrees outside now, 1 to 12 degrees" in render_weather(result)
+
+
+@pytest.mark.parametrize("period", ["week", "whenever", "", "   ", "next month"])
+def test_unsupported_period_rejected_before_dispatch(period: str) -> None:
+    """Reject unsupported periods without making a weather request.
+
+    Args:
+        period:
+            Unsupported model-provided period string.
+
+    """
+    client = FixtureClient()
+    registry = ToolRegistry([client.tool()])
+    with pytest.raises(ValidationError):
+        registry.dispatch([ToolCall("get_weather", {"period": period})])
+    assert client.requests == []
 
 
 @pytest.mark.parametrize(
@@ -742,6 +877,9 @@ def test_missing_and_uncovered() -> None:
         client.get_weather(WeatherArguments(period="now"))
     client.data = forecast()
     client.clock = lambda: datetime(2030, 1, 1, tzinfo=UTC)
+    current = client.data["current"]
+    assert isinstance(current, dict)
+    current["time"] = "2030-01-01T00:00:00+00:00"
     with pytest.raises(ValueError, match="cover"):
         client.get_weather(WeatherArguments(period="today"))
 

@@ -413,10 +413,11 @@ unseen-entity, real-STT, or unavailable-service generalization.
 
 ### Portable model versus device cache
 
-The exported OpenVINO IR (`.xml` graph and `.bin` weights) is not tied to the
-training host or its CUDA GPUs. Deploy it on an OS/architecture and inference
-device supported by the installed OpenVINO and OpenVINO GenAI versions. INT8 here
-describes stored weights; execution precision depends on the target plugin.
+The exported OpenVINO IR is portable across supported OpenVINO/GenAI targets;
+INT8 describes stored weights, not necessarily execution precision. See the
+[language model guide](../docs/llm.md#cache-and-diagnostics) for model preparation
+and caches. The application's [OpenCL LFM adapter](../docs/lfm-gpu.md) accepts only
+allowlisted artifacts, so a new fine-tuned export cannot be assumed to work there.
 
 Copy the model, tokenizer, and configuration files together. The export directory
 contains `openvino_model.xml`, `openvino_model.bin`, tokenizer/detokenizer XML/BIN
@@ -478,10 +479,10 @@ The application accepts upstream `TokenizersBackend` metadata and the
 `PreTrainedTokenizerFast` metadata saved with merged fine-tuned checkpoints.
 Keep the exported tokenizer JSON and chat template intact.
 
-The assistant accepts a custom export through `[lfm].model_dir` in `config.toml`
+The assistant selects an LFM path through `[lfm].model_dir` in `config.toml`
 (for example, `model_dir = "models/openvino-int8"`, relative to the working
-directory). If that setting is omitted, it selects the LFM artifact through
-`models/lfm/model.json`.
+directory), or through `models/lfm/model.json` if omitted. Selection does not
+bypass the OpenCL adapter's artifact allowlist.
 `--model lfm` selects the model family, not a checkpoint directory. When using the
 selection manifest, register the target-local absolute path with this snippet,
 which replaces the selection under the permanent model root:
@@ -509,27 +510,18 @@ manifest.write_text(
 PY
 ```
 
-Configure the assistant's services as described in the [project setup](../README.md#setup),
-then start text mode. Use the same tool schemas as training: the reference
-evaluation includes all eight tools, while the assistant registers tools for
-its configured services.
-
-```sh
-uv run python -m hoast --config config.toml --model lfm --cache "$CACHE_DIR" --device CPU --threads 2 --max-new-tokens 128 --text
-```
-
-For a supported Intel GPU, use `--device GPU --threads 1`. Execution is explicit;
-a device-loading error does not trigger CPU fallback. Unlike the evaluator, the
-assistant can execute configured tools. See [RESULTS.md](RESULTS.md) for known
-routing limitations. Voice mode additionally requires speech models and satellite
-configuration from the main README; omit `--text` after preparing those resources.
+The current application uses the experimental OpenCL LFM adapter, which requires
+`--device GPU` and an allowlisted checkpoint; `--device CPU` and an arbitrary
+fine-tuned export do not work with that adapter. The reference evaluation includes
+all eight tools, while the assistant registers tools for its configured services. Unlike the
+non-dispatching evaluator, the assistant can execute configured tools. See
+[RESULTS.md](RESULTS.md) for routing limitations and the [OpenCL guide](../docs/lfm-gpu.md)
+for supported artifacts and qualification status.
 
 Model preparation commands can replace the selection manifest with the upstream
-model. Register the fine-tuned export after completing model preparation. To
-switch checkpoints, stop the assistant, change the manifest to the new local
-export directory, and restart. Preserve the previous manifest if you need to
-restore its selection. The target creates its compiled cache under
-`<cache>/lfm/compiled/` when loading the model.
+model. Preserve the previous manifest if you need to restore its selection. The
+OpenVINO library backend creates its target-specific compiled cache under
+`<cache>/lfm/compiled/`; this does not describe the OpenCL adapter.
 
 ## Training and deployment checks
 

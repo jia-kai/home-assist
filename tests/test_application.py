@@ -1158,7 +1158,7 @@ def test_entry_point_uses_satellite_config(
     runner = AsyncMock()
     monkeypatch.setattr(
         llm_cli,
-        "FunctionGemma" if model_name == "functiongemma" else "LFM2",
+        "FunctionGemma" if model_name == "functiongemma" else "LiveLFM2",
         model_factory,
     )
     monkeypatch.setattr(llm_cli, "run_voice", runner)

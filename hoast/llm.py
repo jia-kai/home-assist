@@ -15,7 +15,11 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, JsonValue
 
-from .input_text import canonical_user_messages
+from .input_text import (
+    REPAIR_FEEDBACK_KEY,
+    canonical_user_messages,
+    reject_repair_feedback,
+)
 from .logging import get_logger
 from .memory import reclaim_memory
 
@@ -872,11 +876,53 @@ class FunctionGemma:
         Args:
             messages:
                 Nonempty user/assistant/tool history; user language is canonicalized
-                with basic punctuation retained and the developer prompt is inserted. Structured
-                tool data and internal repair feedback retain their syntax.
+                with basic punctuation retained and the developer prompt is inserted.
+                Structured tool data retains its syntax. Internal repair metadata is
+                rejected.
 
             on_text:
                 Optional decoded-token callback including protocol. Exceptions propagate.
+
+        """
+        reject_repair_feedback(messages)
+        return self._run_messages(messages, on_text)
+
+    def _generate_repair(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        feedback: str,
+        on_text: Callable[[str], None] | None = None,
+    ) -> Generation:
+        """Generate with trusted feedback after checking caller-owned base history.
+
+        Args:
+            messages:
+                Untrusted base history without internal repair metadata.
+
+            feedback:
+                Session-generated diagnostic text preserving structured syntax.
+
+            on_text:
+                Optional synchronous raw-text callback; exceptions propagate.
+
+        """
+        reject_repair_feedback(messages)
+        repair = {"role": "user", "content": feedback, REPAIR_FEEDBACK_KEY: True}
+        return self._run_messages([*messages, repair], on_text)
+
+    def _run_messages(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        on_text: Callable[[str], None] | None,
+    ) -> Generation:
+        """Serialize inference and cleanup for public or trusted repair history.
+
+        Args:
+            messages:
+                Base history and optional internally constructed repair feedback.
+
+            on_text:
+                Optional synchronous raw-text callback; exceptions propagate.
 
         """
         with self._lock:

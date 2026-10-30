@@ -1,7 +1,7 @@
 """Offline grounded rendering and transactional weather/music agent integration."""
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,7 +83,7 @@ class Routing:
 def agent_runtime(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> tuple[WeatherAgent, Routing]:
-    """Replace inference only; retain real session transactions and strict tools.
+    """Replace backend execution; retain session, repair boundaries and strict tools.
 
     Args:
         monkeypatch:
@@ -111,9 +111,8 @@ def agent_runtime(
 
     def generate(
         model: FunctionGemma,
-        messages: Sequence[dict[str, Any]],
-        *,
-        on_text: Callable[[str], None] | None = None,
+        messages: Sequence[Mapping[str, Any]],
+        on_text: Callable[[str], None] | None,
     ) -> Generation:
         """Emit untrusted prose and validate proposals without loading a backend.
 
@@ -128,7 +127,7 @@ def agent_runtime(
                 Incremental raw-text callback used by Session's worker.
 
         """
-        state.histories.append(deepcopy(list(messages)))
+        state.histories.append(deepcopy([dict(message) for message in messages]))
         if on_text is not None:
             on_text(state.text)
         if state.failure is not None:
@@ -136,7 +135,7 @@ def agent_runtime(
         model.tools.validate(state.calls)
         return Generation(state.text, state.calls, state.text, 1, 1, 0.01, 0.001)
 
-    monkeypatch.setattr(FunctionGemma, "generate_messages", generate)
+    monkeypatch.setattr(FunctionGemma, "_run_messages", generate)
     tools = ToolRegistry(
         [Tool("get_weather", "Fixture weather", WeatherArguments, handler)]
     )
@@ -201,7 +200,16 @@ def mixed_runtime(
     return LocalAgent(Session(FunctionGemma(LLMConfig(tmp_path), tools))), state
 
 
-@pytest.mark.parametrize("text", ["Play my daylist", "PLEASE PLAY Spotify Day List!", "play the day list please", "play some music", " Play Some Music! "])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Play my daylist",
+        "PLEASE PLAY Spotify Day List!",
+        "play the day list please",
+        "play some music",
+        " Play Some Music! ",
+    ],
+)
 def test_daylist_standalone_shortcut(
     mixed_runtime: tuple[LocalAgent, Routing], text: str
 ) -> None:
@@ -216,14 +224,26 @@ def test_daylist_standalone_shortcut(
     """
     agent, state = mixed_runtime
     state.failure = AssertionError("Shortcut invoked inference")
-    state.results = [{"status": "started", "mode": "daylist", "confirmation": "requested"}]
+    state.results = [
+        {"status": "started", "mode": "daylist", "confirmation": "requested"}
+    ]
     assert list(agent.stream(text)) == ["Requested your Spotify daylist."]
     assert state.dispatched[0].name == "play_music"
     assert state.dispatched[0].arguments["playlist"] == "daylist"
     assert not state.histories
 
 
-@pytest.mark.parametrize("text", ["What is a daylist?", "play my daylist?", "play my daylist and tell me the weather", "play the daylist song by Artist", "play some music and tell me the weather", "play some music by Artist"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What is a daylist?",
+        "play my daylist?",
+        "play my daylist and tell me the weather",
+        "play the daylist song by Artist",
+        "play some music and tell me the weather",
+        "play some music by Artist",
+    ],
+)
 def test_daylist_does_not_shortcut_other_requests(
     mixed_runtime: tuple[LocalAgent, Routing], text: str
 ) -> None:
@@ -361,14 +381,13 @@ def test_invalid_call_repair(
 
     """
     agent, state = agent_runtime
-    original = FunctionGemma.generate_messages
+    original = FunctionGemma._run_messages
     state.calls = (weather_call(), invalid)
 
     def generate(
         model: FunctionGemma,
-        messages: Sequence[dict[str, Any]],
-        *,
-        on_text: Callable[[str], None] | None = None,
+        messages: Sequence[Mapping[str, Any]],
+        on_text: Callable[[str], None] | None,
     ) -> Generation:
         """Reject the first batch and accept corrected arguments on retry.
 
@@ -388,18 +407,107 @@ def test_invalid_call_repair(
             assert "No tools ran" in messages[-1]["content"]
             assert "Validation error:" in messages[-1]["content"]
             assert "Rejected output:" in messages[-1]["content"]
+            assert messages[-1]["_hoast_repair_feedback"] is True
             state.calls = (weather_call(),)
         try:
             return original(model, messages, on_text=on_text)
         except ValueError as error:
             raise GeneratedCallError(str(error), repr(state.calls)) from error
 
-    monkeypatch.setattr(FunctionGemma, "generate_messages", generate)
-    assert list(agent.stream("How's the weather?")) == [render_weather(current())]
+    monkeypatch.setattr(FunctionGemma, "_run_messages", generate)
+    assert list(agent.stream("Could you check the weather?")) == [
+        render_weather(current())
+    ]
     assert len(state.histories) == 2
+    assert "_hoast_repair_feedback" not in state.histories[0][-1]
     assert len(state.seen) == 1
     assert "Validation error:" not in str(agent.session.history)
     assert "unknown_tool" not in str(agent.session.history)
+
+
+@pytest.mark.parametrize(
+    ("text", "period"),
+    [
+        ("What's the weather?", "now"),
+        ("What's the weather like today?", "today"),
+        ("What's the temperature now?", "now"),
+        ("WHAT IS THE WEATHER TODAY!", "today"),
+        ("How's the weather at home tomorrow?", "tomorrow"),
+        ("How is the weather next week?", "next_week"),
+    ],
+)
+def test_home_weather_shortcut(
+    agent_runtime: tuple[WeatherAgent, Routing], text: str, period: str
+) -> None:
+    """Route clear home weather questions directly through the normal transaction.
+
+    Args:
+        agent_runtime:
+            Offline session and captured calls.
+
+        text:
+            Standalone weather question.
+
+        period:
+            Expected provider period.
+    """
+    agent, state = agent_runtime
+    state.failure = AssertionError("Shortcut invoked inference")
+    assert list(agent.stream(text)) == [render_weather(current())]
+    assert not state.histories
+    assert state.seen[0].period == period
+    assert state.seen[0].city == ""
+    assert agent.session.history[-1]["content"] == render_weather(current())
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What's the weather in London?",
+        "What's the temperature now in London?",
+        "What's the weather tomorrow in Paris?",
+        "What's the weather and play music?",
+        "What is the weather like for my trip?",
+        "How about tomorrow?",
+    ],
+)
+def test_weather_shortcut_leaves_other_requests_to_model(
+    agent_runtime: tuple[WeatherAgent, Routing], text: str
+) -> None:
+    """Keep location, multi-intent and contextual requests on model routing.
+
+    Args:
+        agent_runtime:
+            Offline session and captured routing history.
+
+        text:
+            Request not eligible for direct routing.
+    """
+    agent, state = agent_runtime
+    list(agent.stream(text))
+    assert len(state.histories) == 1
+
+
+def test_weather_shortcut_respects_conversation_location(
+    agent_runtime: tuple[WeatherAgent, Routing],
+) -> None:
+    """Implicit location after a prior turn is routed; explicit home is direct.
+
+    Args:
+        agent_runtime:
+            Offline session and captured routing history.
+    """
+    agent, state = agent_runtime
+    state.calls = (weather_call("London"),)
+    list(agent.stream("Weather in London"))
+    state.results = [current(), current()]
+    list(agent.stream("What's the weather tomorrow?"))
+    assert len(state.histories) == 2
+    assert state.seen[-1].city == "London"
+    list(agent.stream("What's the weather at home today?"))
+    assert len(state.histories) == 2
+    assert state.seen[-1].city == ""
+    assert state.seen[-1].period == "today"
 
 
 def test_exhausted_repair_preserves_session(
@@ -1029,7 +1137,9 @@ def test_volume_word_shortcuts(
     }
 
 
-@pytest.mark.parametrize("query", ["PLAY!", "play some music", "stop?", "louder", "quieter", "quiter"])
+@pytest.mark.parametrize(
+    "query", ["PLAY!", "play some music", "stop?", "louder", "quieter", "quiter"]
+)
 def test_unconfigured_shortcut_preserves_context(
     agent_runtime: tuple[WeatherAgent, Routing], query: str
 ) -> None:

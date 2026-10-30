@@ -5,8 +5,9 @@ import asyncio
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 from dataclasses import replace
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal
@@ -15,6 +16,7 @@ from .agent import SYSTEM_PROMPT, LocalAgent
 from .application import Assistant, VoiceApplication
 from .config import SatelliteConfig, load_config, music_token, satellite_key
 from .lfm import LFM2, LFMConfig
+from .lfm_gpu.live import LiveLFM2
 from .lights import LightClient
 from .llm import DEFAULT_CACHE, FunctionGemma, LLMConfig, Tool, ToolRegistry
 from .llm import SYSTEM_PROMPT as FUNCTION_ACTIVATION
@@ -29,6 +31,7 @@ from .tts2 import DEFAULT_MODEL as DEFAULT_TTS_MODEL
 from .tts2 import TTS, TTSConfig
 from .voice import VoiceTurn, listen
 from .weather import WeatherClient
+from .weather_cache import WeatherCache
 
 logger = get_logger(__name__)
 
@@ -163,6 +166,72 @@ async def _monitor_memory_usage() -> None:
             )
 
 
+async def _refresh_weather(
+    application: VoiceApplication, worker: ThreadPoolExecutor
+) -> None:
+    """Fetch on a dedicated worker and synthesize on the inference worker.
+
+    Args:
+        application:
+            Live voice application and its optional weather cache.
+
+        worker:
+            Single inference executor, joined before engine cleanup.
+
+    """
+    cache = application.assistant.weather_cache
+    if cache is None:
+        return
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="weather-network"
+    ) as network:
+        while True:
+            shared = None
+            for period in ("now", "today"):
+                entry = cache.valid(period)
+                # Poll often enough to react to midnight and retry failures; refresh
+                # before expiration to avoid a full-hour unavailability window.
+                if (
+                    entry is not None
+                    and time.monotonic() - entry.started < 3000
+                    and (datetime.now(UTC) - entry.observation).total_seconds() < 3000
+                ):
+                    continue
+                try:
+                    if shared is None:
+                        future = loop.run_in_executor(network, cache.fetch, "now")
+                        try:
+                            shared = await asyncio.shield(future)
+                        except asyncio.CancelledError:
+                            try:
+                                await future
+                            except Exception:
+                                logger.exception(
+                                    "weather.fetch status=failed period=%s", period
+                                )
+                            raise
+                    fetched = (
+                        shared if period == "now" else cache.today_from_now(shared)
+                    )
+                    future_prepare = loop.run_in_executor(
+                        worker, cache.prepare, application.tts, fetched
+                    )
+                    try:
+                        await asyncio.shield(future_prepare)
+                    except asyncio.CancelledError:
+                        try:
+                            await future_prepare
+                        except Exception:
+                            logger.exception(
+                                "weather.prepare status=failed period=%s", period
+                            )
+                        raise
+                except Exception:
+                    logger.exception("weather.prepare status=failed period=%s", period)
+            await asyncio.sleep(60)
+
+
 async def run_voice(
     assistant: Assistant,
     config: SatelliteConfig,
@@ -230,14 +299,24 @@ async def run_voice(
         )
         application: VoiceApplication | None = None
         memory_monitor: asyncio.Task[None] | None = None
+        weather_monitor: asyncio.Task[None] | None = None
         try:
             try:
                 application = await asyncio.shield(future)
-            except asyncio.CancelledError:
-                application = await future
+            except asyncio.CancelledError as cancelled:
+                try:
+                    application = await future
+                except Exception as error:
+                    logger.exception("voice.startup status=failed during cancellation")
+                    cancelled.add_note(f"Voice startup also failed: {error!r}")
                 raise
             assert application is not None
             application.memory_diagnostics = memory_diagnostics
+            if application.assistant.weather_cache is not None:
+                application.assistant.weather_cache.voice_mode = True
+            weather_monitor = asyncio.create_task(
+                _refresh_weather(application, worker), name="voice-weather-refresh"
+            )
             if memory_diagnostics:
                 log_memory_usage("voice.startup")
                 memory_monitor = asyncio.create_task(
@@ -278,14 +357,58 @@ async def run_voice(
                 replay_tts=application.tts,
             )
         finally:
-            try:
-                if memory_monitor is not None:
-                    memory_monitor.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await memory_monitor
-            finally:
-                if application is not None:
+            primary = sys.exception()
+
+            def record_failure(stage: str, error: BaseException) -> None:
+                """Retain the first failure and annotate it with later cleanup failures.
+
+                Args:
+                    stage:
+                        Cleanup operation that failed.
+
+                    error:
+                        Exception raised by that operation.
+
+                """
+                nonlocal primary
+                logger.exception("voice.cleanup status=failed stage=%s", stage)
+                if primary is None:
+                    primary = error
+                elif error is not primary:
+                    primary.add_note(f"Voice cleanup {stage} failed: {error!r}")
+
+            monitors = (("weather", weather_monitor), ("memory", memory_monitor))
+            for _, monitor in monitors:
+                if monitor is not None:
+                    monitor.cancel()
+            owner = asyncio.current_task()
+            for stage, monitor in monitors:
+                if monitor is None:
+                    continue
+                cancellation_count = owner.cancelling() if owner is not None else 0
+                try:
+                    await monitor
+                except asyncio.CancelledError as error:
+                    if (
+                        owner is not None and owner.cancelling() > cancellation_count
+                    ) or not monitor.cancelled():
+                        record_failure(stage, error)
+                # Capture all failures so remaining cleanup runs before propagation.
+                except BaseException as error:  # noqa: BLE001
+                    record_failure(stage, error)
+            if application is not None:
+                # Preserve any BaseException while attempting every cleanup stage.
+                try:
+                    if application.assistant.weather_cache is not None:
+                        application.assistant.weather_cache.voice_mode = False
+                except BaseException as error:  # noqa: BLE001
+                    record_failure("weather mode", error)
+                try:
                     await loop.run_in_executor(worker, application.close)
+                except BaseException as error:  # noqa: BLE001
+                    record_failure("engine close", error)
+            if primary is not None and primary is not sys.exception():
+                raise primary
 
 
 def main() -> None:
@@ -329,7 +452,7 @@ def main() -> None:
         "--device",
         choices=("CPU", "GPU"),
         default="GPU",
-        help="Explicit OpenVINO device; loading errors do not select another device",
+        help="Inference device; LFM requires the OpenCL GPU, without fallback",
     )
     parser.add_argument(
         "--cache",
@@ -382,6 +505,8 @@ def main() -> None:
         help="Enable voice startup, periodic, and per-stage memory diagnostics",
     )
     args = parser.parse_args()
+    if args.model == "lfm" and args.device != "GPU":
+        parser.error("LFM requires --device GPU for the OpenCL runner")
     if args.text and args.debug_audio:
         parser.error("--debug-audio requires voice mode, without --text")
     if args.text and args.memory_diagnostics:
@@ -402,7 +527,8 @@ def main() -> None:
             if not args.text and config.satellite is not None
             else None
         )
-        registered: list[Tool[Any]] = [WeatherClient(config.weather).tool()]
+        weather_cache = WeatherCache(WeatherClient(config.weather))
+        registered: list[Tool[Any]] = [weather_cache.tool()]
         music: MusicClient | None = None
         if config.music is not None:
             music = MusicClient(config.music, music_token(config.music, args.env_file))
@@ -442,9 +568,9 @@ def main() -> None:
                 max_output_chars=4096,
                 reclaim_after_call=args.memory_reclaim,
             )
-            model = LFM2(settings_lfm, tools)
+            model = LiveLFM2(settings_lfm, tools)
         with model:
-            assistant = Assistant(LocalAgent(Session(model)), music)
+            assistant = Assistant(LocalAgent(Session(model)), music, weather_cache)
             if not args.text:
                 assert config.satellite is not None
                 get_logger("aioesphomeapi").setLevel("INFO")

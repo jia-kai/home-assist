@@ -11,8 +11,9 @@ from typing import Any
 
 from pydantic import JsonValue
 
-from .input_text import REPAIR_FEEDBACK_KEY, canonicalize_text
+from .input_text import canonicalize_text
 from .lfm import LFM2
+from .lfm_gpu.live import LiveLFM2
 from .llm import FunctionGemma, GeneratedCallError, Generation, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ class Session:
     Concurrent operations on one session raise rather than interleave turns.
     """
 
-    model: FunctionGemma | LFM2
+    model: FunctionGemma | LFM2 | LiveLFM2
     """Externally loaded model, with registered tools and configured system prompt."""
 
     _messages: list[dict[str, Any]] = field(default_factory=list, init=False)
@@ -190,14 +191,19 @@ class Session:
             def generate() -> None:
                 """Repair only generated-call failures and transfer the final outcome."""
                 try:
-                    attempt_messages = messages
+                    feedback: str | None = None
                     for attempt in range(max_repair_attempts + 1):
                         if cancelled.is_set():
                             raise _Cancelled()
                         try:
-                            result = self.model.generate_messages(
-                                attempt_messages, on_text=receive
-                            )
+                            if feedback is not None:
+                                result = self.model._generate_repair(
+                                    messages, feedback, on_text=receive
+                                )
+                            else:
+                                result = self.model.generate_messages(
+                                    messages, on_text=receive
+                                )
                         except GeneratedCallError as error:
                             logger.warning(
                                 "tool routing status=invalid attempt=%d repair_limit=%d reason=%s",
@@ -221,14 +227,6 @@ class Session:
                                 f"Validation error: {str(error)[:400]}\n"
                                 f"Rejected output: {error.raw[:400]!r}"
                             )
-                            attempt_messages = [
-                                *messages,
-                                {
-                                    "role": "user",
-                                    "content": feedback,
-                                    REPAIR_FEEDBACK_KEY: True,
-                                },
-                            ]
                             continue
                         events.put(result)
                         break

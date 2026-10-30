@@ -15,6 +15,18 @@ _UNSUPPORTED_NUMBER = re.compile(
 _APOSTROPHE = re.compile(r"(?<=\w)[’‘ʼ](?=\w)|(?<=[sS])[’ʼ](?!\w)")
 
 
+def reject_repair_feedback(messages: Sequence[Mapping[str, Any]]) -> None:
+    """Reject trusted repair metadata in caller-owned history.
+
+    Args:
+        messages:
+            Untrusted native message mappings, including the base of a retry.
+
+    """
+    if any(message.get(REPAIR_FEEDBACK_KEY) is True for message in messages):
+        raise ValueError("Internal repair feedback is not accepted from callers")
+
+
 def canonicalize_text(text: str) -> str:
     """Preserve basic punctuation while removing title delimiters and decorative symbols.
 

@@ -16,7 +16,11 @@ from typing import Any, Literal, Self
 
 from pydantic import JsonValue
 
-from .input_text import canonical_user_messages
+from .input_text import (
+    REPAIR_FEEDBACK_KEY,
+    canonical_user_messages,
+    reject_repair_feedback,
+)
 from .llm import (
     DEFAULT_CACHE,
     DEFAULT_MODELS,
@@ -479,12 +483,53 @@ class LFM2:
                 rejected because the configured system prompt is inserted here.
                 Tool calls use function name/argument mappings; tool results may
                 contain JSON-compatible mappings or strings. External user text is
-                canonicalized with basic punctuation retained; structured history is preserved. No history
-                is retained.
+                canonicalized with basic punctuation retained; structured history is
+                preserved. Internal repair metadata is rejected. No history is retained.
 
             on_text:
                 Optional incremental raw-text callback preserving native protocol.
                 Callback exceptions abort generation and propagate.
+
+        """
+        reject_repair_feedback(messages)
+        return self._run_messages(messages, on_text)
+
+    def _generate_repair(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        feedback: str,
+        on_text: Callable[[str], None] | None = None,
+    ) -> Generation:
+        """Generate with trusted feedback after checking caller-owned base history.
+
+        Args:
+            messages:
+                Untrusted base history without internal repair metadata.
+
+            feedback:
+                Session-generated diagnostic text preserving structured syntax.
+
+            on_text:
+                Optional synchronous raw-text callback; exceptions propagate.
+
+        """
+        reject_repair_feedback(messages)
+        repair = {"role": "user", "content": feedback, REPAIR_FEEDBACK_KEY: True}
+        return self._run_messages([*messages, repair], on_text)
+
+    def _run_messages(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        on_text: Callable[[str], None] | None,
+    ) -> Generation:
+        """Serialize inference and cleanup for public or trusted repair history.
+
+        Args:
+            messages:
+                Base history and optional internally constructed repair feedback.
+
+            on_text:
+                Optional synchronous raw-text callback; exceptions propagate.
 
         """
         with self._lock:

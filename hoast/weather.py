@@ -5,7 +5,7 @@ import logging
 import math
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Literal
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -91,7 +91,7 @@ class WeatherArguments(ToolArguments):
     @field_validator("period", mode="before")
     @classmethod
     def normalize_period(cls, value: object) -> object:
-        """Normalize period strings; unknown strings select now, other types fail.
+        """Normalize period strings and let the literal field reject unsupported values.
 
         Args:
             value:
@@ -102,7 +102,7 @@ class WeatherArguments(ToolArguments):
         if not isinstance(value, str):
             return value
         normalized = "_".join(value.strip().casefold().replace("-", " ").split())
-        return normalized if normalized in {"today", "tomorrow", "next_week"} else "now"
+        return "now" if normalized == "current" else normalized
 
 
 def declare_weather_tool() -> Tool[WeatherArguments]:
@@ -275,6 +275,56 @@ def _units(data: dict[str, JsonValue], expected: dict[str, str]) -> None:
             raise ValueError(f"Unexpected provider unit for {key}")
 
 
+def observation_instant(raw: str, zone: ZoneInfo, now: datetime) -> datetime:
+    """Validate a recent provider timestamp and return its UTC instant.
+
+    Offset-free repeated times require exactly one candidate in the freshness
+    window, and that candidate must not be in the future. Nonexistent local
+    times are rejected by round-tripping both folds through UTC.
+
+    Args:
+        raw:
+            ISO observation timestamp, possibly destination-local without offset.
+
+        zone:
+            Destination timezone for offset-free timestamps.
+
+        now:
+            Aware current instant used to enforce freshness.
+
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Weather clock must be timezone-aware")
+    moment = datetime.fromisoformat(raw)
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        candidates = {
+            instant
+            for fold in (0, 1)
+            if (instant := moment.replace(tzinfo=zone, fold=fold).astimezone(UTC))
+            .astimezone(zone)
+            .replace(tzinfo=None)
+            == moment
+        }
+        if not candidates:
+            raise ValueError("Nonexistent observation time")
+        if len(candidates) > 1:
+            current = now.astimezone(UTC)
+            fresh = [
+                instant
+                for instant in candidates
+                if timedelta(minutes=-5) <= current - instant < timedelta(hours=1)
+            ]
+            if len(fresh) != 1 or fresh[0] > current:
+                raise ValueError("Ambiguous observation time or stale or in the future")
+            moment = fresh[0]
+        else:
+            moment = candidates.pop()
+    moment = moment.astimezone(UTC)
+    if not timedelta(minutes=-5) <= now.astimezone(UTC) - moment < timedelta(hours=1):
+        raise ValueError("Weather observation is stale or in the future")
+    return moment
+
+
 class WeatherClient:
     """Synchronous client with at most one geocoding and one forecast request."""
 
@@ -282,7 +332,7 @@ class WeatherClient:
     """Validated home coordinates."""
 
     clock: Callable[[], datetime] | None
-    """Optional aware clock; otherwise use provider current.time for local dates."""
+    """Optional aware clock; otherwise use the system UTC clock."""
 
     def __init__(
         self, config: WeatherConfig, *, clock: Callable[[], datetime] | None = None
@@ -553,15 +603,9 @@ class WeatherClient:
         interval = _number(current["interval"], 0)
         if interval is None or interval <= 0:
             raise ValueError("Current interval must be positive seconds")
-        moment = datetime.fromisoformat(_text(current["time"]))
-        local_date = (
-            moment.date() if moment.tzinfo is None else moment.astimezone(zone).date()
-        )
-        if self.clock is not None:
-            now = self.clock()
-            if now.tzinfo is None or now.utcoffset() is None:
-                raise ValueError("Injected weather clock must be timezone-aware")
-            local_date = now.astimezone(zone).date()
+        now = self.clock() if self.clock is not None else datetime.now(UTC)
+        observation_instant(_text(current["time"]), zone, now)
+        local_date = now.astimezone(zone).date()
         temperature = _number(current["temperature_2m"])
         precipitation = _number(current["precipitation"], 0)
         condition = _condition(current["weather_code"])

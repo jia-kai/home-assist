@@ -4,6 +4,7 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
@@ -18,6 +19,9 @@ from .session import Session
 from .stt2 import STT
 from .tts2 import TTS
 from .voice import VoiceTurn
+
+if TYPE_CHECKING:
+    from .weather_cache import WeatherCache
 
 logger = get_logger(__name__)
 
@@ -121,6 +125,9 @@ class Assistant:
 
     music: MusicClient | None = None
     """Optional live music status source; absence is explicitly stated in the prompt."""
+
+    weather_cache: WeatherCache | None = None
+    """Optional prepared weather cache shared with the registered handler."""
 
     base_prompt: str = field(init=False)
     """Stable routing prompt without the per-request external-data snapshot."""
@@ -270,30 +277,117 @@ class VoiceApplication:
             return
         self.assistant.new_session()
         logger.info("agent.session status=new mode=voice")
+        cache = self.assistant.weather_cache
+        previous_voice_mode = cache.voice_mode if cache is not None else False
+        if cache is not None:
+            cache.voice_mode = True
         try:
             self.output("You: " + turn.text)
             if self.memory_diagnostics:
                 log_memory_usage("voice.agent.before")
+            cache = self.assistant.weather_cache
+            if cache is not None:
+                cache.last_hit = None
+                cache.turn_hits.clear()
+                cache.turn_weather.clear()
             try:
                 answer = self.assistant.reply(turn.text, turn.cancelled.is_set)
             except Exception:
                 logger.exception("agent.turn status=failed")
                 self.assistant.new_session()
+                if cache is not None:
+                    cache.last_hit = None
+                    cache.turn_hits.clear()
+                    cache.turn_weather.clear()
                 answer = "I couldn't complete that request. Please try again."
             finally:
                 if self.memory_diagnostics:
                     log_memory_usage("voice.agent.after")
             if turn.cancelled.is_set() or not answer.strip():
                 return
-            self.output("Assistant: " + answer)
-            spoken = bounded_speech(answer)
             if not turn.cancelled.is_set():
                 try:
-                    self.tts.play(spoken, blocking=True, cancelled=turn.cancelled)
+                    calls = self.assistant.agent.last_calls
+                    hit = cache.last_hit if cache is not None else None
+                    parts = list(self.assistant.agent.last_answers)
+                    provenance = iter(cache.turn_weather if cache is not None else ())
+                    indexed_hits = (
+                        {
+                            index: next(provenance)
+                            for index, call in enumerate(calls)
+                            if call.name == "get_weather" and cache is not None
+                        }
+                        if cache is not None and cache.turn_hits
+                        else {}
+                    )
+                    if indexed_hits and (
+                        len(parts) != len(calls) or " ".join(parts) != answer
+                    ):
+                        raise RuntimeError("Weather answer provenance mismatch")
+                    spoken = bounded_speech(answer)
+                    if (
+                        hit is not None
+                        and len(calls) == 1
+                        and calls[0].name == "get_weather"
+                        and cache is not None
+                        and cache.valid(str(hit.result["period"])) is hit
+                        and spoken == hit.text
+                    ):
+                        self.tts.play_samples(
+                            hit.samples,
+                            hit.rate,
+                            blocking=True,
+                            cancelled=turn.cancelled,
+                        )
+                        self.output("Assistant: " + answer)
+                    elif indexed_hits:
+                        # Synthesis can cross an expiry boundary. Replace only the
+                        # affected weather segments, then resynthesize until every
+                        # remaining cached segment is fresh at the playback boundary.
+                        while True:
+                            assert cache is not None
+                            expired = [
+                                i
+                                for i, item in indexed_hits.items()
+                                if item is not None and not cache.is_fresh(item)
+                            ]
+                            for index in expired:
+                                logger.warning(
+                                    "weather.cache status=expired_before_speech"
+                                )
+                                parts[index] = (
+                                    "Weather information expired. Please try again."
+                                )
+                                indexed_hits[index] = None
+                            answer = " ".join(parts)
+                            spoken = bounded_speech(answer)
+                            if turn.cancelled.is_set():
+                                return
+                            samples, rate = self.tts.synthesize(spoken)
+                            if turn.cancelled.is_set():
+                                return
+                            if any(
+                                item is not None and not cache.is_fresh(item)
+                                for item in indexed_hits.values()
+                            ):
+                                continue
+                            self.tts.play_samples(
+                                samples, rate, blocking=True, cancelled=turn.cancelled
+                            )
+                            self.output("Assistant: " + answer)
+                            break
+                    else:
+                        self.output("Assistant: " + answer)
+                        self.tts.play(spoken, blocking=True, cancelled=turn.cancelled)
                 finally:
                     if self.memory_diagnostics:
                         log_memory_usage("voice.tts.after")
         finally:
+            if cache is not None:
+                cache.last_hit = None
+                cache.turn_hits.clear()
+                cache.turn_weather.clear()
+                cache.voice_mode = previous_voice_mode
             self.assistant.new_session()
             if self.memory_diagnostics:
                 log_memory_usage("voice.turn.after")

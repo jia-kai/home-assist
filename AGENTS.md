@@ -65,9 +65,16 @@ A new project for a home assistant.
 
 ## Error Handling and Validation
 
-- **Fail loudly:** do not silently ignore errors or supply defaults for required
-  inputs. Missing keys and invalid inputs must raise appropriate exceptions.
-  Only catch exceptions you genuinely expect and intend to handle.
+- **Guard internal invariants:** raise early for impossible states, violated
+  design contracts, and unsupported internal configurations. Do not silently
+  ignore failures or invent values for required internal data. Only catch
+  exceptions you genuinely expect and intend to handle.
+- **Handle noisy interaction:** user input and speech recognition can be
+  incomplete, malformed, or ambiguous. Normalize or repair them when the
+  intended meaning is clear; otherwise ask a concise clarification or report a
+  recoverable failure. Do not guess an action, location, or required argument,
+  or expose internal diagnostics to the user. Preserve validation at external
+  and tool boundaries.
 - **Program defensively:** when information has multiple local representations,
   assert the invariants tying them together. Prefer cheap checks that catch
   inconsistencies early.

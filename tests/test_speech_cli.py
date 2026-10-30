@@ -11,6 +11,7 @@ import pytest
 from hoast import llm_cli, voice
 from hoast.application import Assistant, VoiceApplication
 from hoast.config import SatelliteConfig
+from hoast.weather import declare_weather_tool
 
 type Backend = Literal["cpu", "GPU", "ort"]
 
@@ -165,9 +166,13 @@ def test_assistant_cli_backend(
     function_factory = MagicMock()
     runner = AsyncMock()
     budget = MagicMock()
-    monkeypatch.setattr(llm_cli, "LFM2", model_factory)
+    monkeypatch.setattr(llm_cli, "LiveLFM2", model_factory)
     monkeypatch.setattr(llm_cli, "FunctionGemma", function_factory)
-    monkeypatch.setattr(llm_cli, "WeatherClient", MagicMock())
+    weather_client = MagicMock()
+    weather_client.tool.return_value = declare_weather_tool()
+    monkeypatch.setattr(
+        llm_cli, "WeatherClient", MagicMock(return_value=weather_client)
+    )
     monkeypatch.setattr(llm_cli, "LocalAgent", MagicMock())
     monkeypatch.setattr(llm_cli, "run_voice", runner)
     monkeypatch.setattr(llm_cli, "configure_cpu_budget", budget)
@@ -260,7 +265,7 @@ def test_cli_rejects_invalid_backend(
     model = MagicMock()
     monkeypatch.setattr(llm_cli, "STT", speech)
     monkeypatch.setattr(voice, "STT", speech)
-    monkeypatch.setattr(llm_cli, "LFM2", model)
+    monkeypatch.setattr(llm_cli, "LiveLFM2", model)
     monkeypatch.setattr("sys.argv", ["hoast", "--stt-backend", "CPU"])
     with pytest.raises(SystemExit) as error:
         entry_point()

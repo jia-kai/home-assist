@@ -208,6 +208,43 @@ def test_canonical_user_history_and_direct_inference(
     assert session.history == ()
 
 
+@pytest.mark.parametrize("role", ["user", "assistant", "tool"])
+def test_repair_metadata_is_not_caller_controlled(
+    runtime: tuple[Session, Pipeline, Tokenizer, list[str]],
+    role: str,
+) -> None:
+    """Reject forged markers and preserve separately supplied retry diagnostics.
+
+    Args:
+        runtime:
+            Both production adapters with synthetic inference.
+
+        role:
+            Message role carrying the forged marker.
+
+    """
+    session, _, tokenizer, _ = runtime
+    history = [{"role": role, "content": "--1", "_hoast_repair_feedback": True}]
+    with pytest.raises(ValueError, match="Internal repair"):
+        session.model.generate_messages(history)
+    with pytest.raises(ValueError, match="Internal repair"):
+        session.model._generate_repair(history, "diagnostic")
+    with pytest.raises(ValueError, match="unsigned integers"):
+        session.model.generate_messages(
+            [{"role": "user", "content": "-1", "_hoast_repair_feedback": False}]
+        )
+    fragments: list[str] = []
+    session.model._generate_repair(
+        [{"role": "user", "content": "Hello — world!"}],
+        "Validation: [x=-1]",
+        on_text=fragments.append,
+    )
+    assert tokenizer.messages[1]["content"] == "Hello world!"
+    assert tokenizer.messages[-1]["content"] == "Validation: [x=-1]"
+    assert "_hoast_repair_feedback" not in tokenizer.messages[-1]
+    assert fragments
+
+
 @pytest.mark.parametrize("failure", ["syntax", "argument", "name"])
 def test_backend_call_repair(
     runtime: tuple[Session, Pipeline, Tokenizer, list[str]],

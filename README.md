@@ -5,8 +5,8 @@ Chinese voice support. Language and speech models run on your machine; weather
 requests and music services still need network access.
 
 Hoast uses LFM2.5 for language, SenseVoiceSmall for recognition, and MeloTTS for
-speech. The language model uses an Intel GPU by default, with a CPU option.
-Speech runs on the CPU.
+speech. The default LFM application uses an OpenCL GPU; speech runs on the CPU.
+The LFM live integration is experimental and requires further end-to-end qualification.
 
 ## What you can ask
 
@@ -19,16 +19,18 @@ Speech runs on the CPU.
 
 Music requires Music Assistant; light control requires a compatible Kasa relay.
 These integrations are optional. Weather uses Celsius and defaults to your home
-location. Small local models can misunderstand requests, so check the result of
-important actions.
+location; see the [weather contract](docs/llm.md#weather-tool-and-answer-contract)
+for periods and unavailable data. Small local models can misunderstand requests,
+so check the result of important actions. See the [LFM OpenCL guide](docs/lfm-gpu.md)
+for supported checkpoints and experimental limitations.
 
 ## Setup
 
 Run commands from the project root. The current bootstrap targets Linux with:
 
 - Bash, Git, `taskset`, and a running systemd user manager.
-- An Intel GPU with a working OpenCL driver. Preparation compiles GPU models even
-  if you intend to use CPU inference afterward.
+- An Intel GPU with a working OpenCL driver. The LFM application requires exactly
+  one compatible OpenCL GPU; see [requirements and supported checkpoints](docs/lfm-gpu.md#setup).
 - At least **7 GiB of available RAM** during model preparation, plus disk space
   for dependencies and models.
 - Internet access for the initial downloads, and curl or wget if uv is missing.
@@ -74,12 +76,9 @@ are gitignored; never put access tokens or API keys in the TOML file.
 .venv/bin/python -m hoast --config config.toml --text
 ```
 
-Use `/reset` to clear the conversation and Ctrl+D to exit. To run the language
-model on CPU instead:
-
-```sh
-.venv/bin/python -m hoast --config config.toml --text --device CPU
-```
+Use `/reset` to clear the conversation and Ctrl+D to exit. LFM does not fall
+back to CPU. FunctionGemma supports CPU when explicitly selected and prepared,
+but its observed weather routing was poor; see the [language model guide](docs/llm.md).
 
 ## Voice mode
 

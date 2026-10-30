@@ -1,0 +1,1617 @@
+{
+  "fusion_dev": {
+    "batch_shapes": {
+      "get_weather": 8,
+      "music_next": 8,
+      "no_tool": 8,
+      "pause_music": 8,
+      "play_music": 16,
+      "resume_music": 14,
+      "set_light": 8,
+      "volume_music": 8,
+      "what_is_playing": 8
+    },
+    "count": 86,
+    "ids": [
+      "00d1963167aa855947b101eb",
+      "01c3eda925d1ff9d916ad4a9",
+      "0233e3bfd0abe60f00823a8f",
+      "0d0044db4d9d62ef103392af",
+      "11c3706f3a2ed70ddee8e05b",
+      "20538a028afdbe0586f3d625",
+      "21ff0de774e9dd173fb47d26",
+      "22833bbe5d929a3e4854e1ee",
+      "2312588875c1e81eecf0aadc",
+      "239cd634c0c7149e89176ad3",
+      "26c7b2cf4765fe8f842ac198",
+      "2a4b9ba211f89d2724edea01",
+      "2d4c00cca6ec6cbe29d515a1",
+      "2e88ee24d009a67dfe4e0bf1",
+      "3348d4695e83d9fac8cf4998",
+      "348c725a80129ad604f502db",
+      "3ab5e3edc5a7b53fe81fddb3",
+      "3b6a6781197be0a3a66bd8e7",
+      "418a8576cdc1100f2f40e2ae",
+      "433015f544b34868ab211349",
+      "480a95ad57f3766ab2d4f5d7",
+      "4f03aa56e9315b62946a33ea",
+      "538ec368697b25d3a608ef73",
+      "5888f63c8def6552ac5dc7c4",
+      "5d18178c689b1970cae8a962",
+      "5f73111e84f81260f61ab202",
+      "64b2e817c711b8066c228bc7",
+      "66c256545e381cf59243e488",
+      "6bd1a9169a0023e2dc07e930",
+      "6fd33e6c94876767deac9815",
+      "70a3c32f655336fff4aa2537",
+      "70c9e032f8fc1c85f61c33d5",
+      "72e0c07f527ec0940ada2aaa",
+      "73cc4efb6a085c7e96bb5fbf",
+      "74228b259f1628ccc3568ab5",
+      "7603aa0c154c7f2efd3c0fd2",
+      "7707a994ae2325696868f0e6",
+      "7921d598807b8d6dc8b512ed",
+      "79b0f4a1c6bde49b8173d864",
+      "7b7e4d61a2514f5ae3b61e56",
+      "7db0bb50c59483d90bc62399",
+      "81891a420274c46fe7118c18",
+      "8379b8cf606e07daab8718e3",
+      "847e37157c6e997b341367c1",
+      "8495625e9347b1a0cd2d1b22",
+      "84ccd593e99b632f6e5c25a2",
+      "87d172f023369119b495c334",
+      "88943d0d4e24f2232468bd2e",
+      "89d837c8bf7fe4d49c479872",
+      "8ab33a43f9fe75d6ccb9d8ee",
+      "8ae07b98f47fc298bb63ebc3",
+      "8ebdf78c287c58947d11626e",
+      "8fdeb5744b9c3d6bdc564407",
+      "93343d4eef49c544b65c5799",
+      "95e582994e356d79cb907736",
+      "99b40fca1f73f761fce914b8",
+      "9addb772d4c6de2d8a0d615d",
+      "9e3501c57cb6d1406cbf1bb0",
+      "9f508a89d8a63dcc007fc019",
+      "a44a5c5897a3a66a81e347ca",
+      "a55fcd81d46512692a4a0e3c",
+      "ab2f3ead4bb880e1378ffc9d",
+      "abe6fe690c0b6e467ab49d82",
+      "b15429edb7d0089dd8cd8d1b",
+      "b39e439cb07f62c6c82ad027",
+      "b43e1ba7e7f68e7e3b4d235f",
+      "b6221a4800d1bac599c96a8e",
+      "b7a8a5ed5b0da1cb9839fe61",
+      "b82345dc030cf74799ffccfe",
+      "be65fe0c635da29b40eba7eb",
+      "befc5aecafb610f31483185d",
+      "c8b57c51798d896485beaebe",
+      "c984cb7775f09d71e15849ac",
+      "ca339f27979721f83ddfa832",
+      "ca9d741707513633b5972c77",
+      "ce1311b22a1b745ddb82ee5a",
+      "ceaf7817cd3594425d2757dd",
+      "d2681796ad9f84245f6597a6",
+      "d36ac9dd3c088978fda834ba",
+      "d42db318746c3be610b9113e",
+      "ed8ee2dd21bc7e964ca46367",
+      "eef9b895633465ea380e7166",
+      "f259b3ab9a468d671bac240f",
+      "fa2294efa58b9dcdd3a09cc4",
+      "fa84c31d421d0af99f4d1f75",
+      "fff4ddd4403e292e732c69e0"
+    ],
+    "jsonl_sha256": "2ad43a9541acb46f201cde6369027d64ba7b19bef367e0a38e3699ce79d77fb6",
+    "strata": 44
+  },
+  "generation_command": ".venv/bin/python -m finetune.generate --seed 42 --max-per-family 128 --max-rows 100000 --output /tmp/ttc/1000/lfm-current-corpus",
+  "previous_schema_sha256": "9f04a002020c81b6a9e8afe9c1407aa5c51497ac55769b2a27c4dc196a2ed031",
+  "purpose": "Validation-only development subset for fusion tuning; test split is held out and must not guide tuning.",
+  "schema_sha256": "347c72aa8fcf04a4f3a3e4d2cb6cce3b09c11755227c5770423f824f1058089e",
+  "selection_algorithm": "Group validation rows by ordered target batch shape (no_tool if empty), music_state, command_language, and noisy/clean (asr_errors nonempty). Within each group sort by SHA-256 of UTF-8 lfm-fusion-dev-v1:<id>, take at most two. Sort selected by id. Use full validation JSONL rows for the selected IDs.",
+  "source_manifest": {
+    "chat_template_sha256": "ba551d58630afa3190b1be3602e28301f3d2e9bbac978dfc49d6d825171648b6",
+    "coverage": {
+      "test": {
+        "asr_error_kinds": {
+          "homophone": 2,
+          "near_homophone": 144
+        },
+        "asr_rows": 146,
+        "batch_shapes": {
+          "get_weather": 64,
+          "music_next": 8,
+          "no_tool": 12,
+          "pause_music": 8,
+          "play_music": 644,
+          "resume_music": 14,
+          "set_light": 8,
+          "volume_music": 128,
+          "what_is_playing": 8
+        },
+        "command_languages": {
+          "en": 300,
+          "mixed": 148,
+          "zh": 446
+        },
+        "entity_compositions": {
+          "{\"artist\": \"en\", \"title\": \"en\"}": 160,
+          "{\"artist\": \"en\", \"title\": \"mixed\"}": 40,
+          "{\"artist\": \"en\", \"title\": \"zh\"}": 160,
+          "{\"artist\": \"en\"}": 20,
+          "{\"artist\": \"zh\", \"title\": \"en\"}": 96,
+          "{\"artist\": \"zh\", \"title\": \"mixed\"}": 24,
+          "{\"artist\": \"zh\", \"title\": \"zh\"}": 96,
+          "{\"artist\": \"zh\"}": 12,
+          "{\"title\": \"en\"}": 16,
+          "{\"title\": \"mixed\"}": 4,
+          "{\"title\": \"zh\"}": 16
+        },
+        "no_tool_rows": 12,
+        "rows": 894,
+        "surface_languages": {
+          "en": 166,
+          "mixed": 556,
+          "zh": 172
+        },
+        "tools": {
+          "get_weather": 64,
+          "music_next": 8,
+          "pause_music": 8,
+          "play_music": 644,
+          "resume_music": 14,
+          "set_light": 8,
+          "volume_music": 128,
+          "what_is_playing": 8
+        }
+      },
+      "train": {
+        "asr_error_kinds": {
+          "homophone": 524,
+          "latin_asr": 256,
+          "near_homophone": 288
+        },
+        "asr_rows": 1068,
+        "batch_shapes": {
+          "get_weather": 772,
+          "music_next": 344,
+          "no_tool": 382,
+          "pause_music": 344,
+          "play_music": 2560,
+          "resume_music": 520,
+          "set_light": 256,
+          "set_light+get_weather": 128,
+          "volume_music": 1800,
+          "what_is_playing": 404
+        },
+        "command_languages": {
+          "en": 2704,
+          "mixed": 1828,
+          "zh": 2978
+        },
+        "entity_compositions": {
+          "{\"artist\": \"en\", \"title\": \"en\"}": 308,
+          "{\"artist\": \"en\", \"title\": \"mixed\"}": 50,
+          "{\"artist\": \"en\", \"title\": \"zh\"}": 290,
+          "{\"artist\": \"en\"}": 480,
+          "{\"artist\": \"zh\", \"title\": \"en\"}": 154,
+          "{\"artist\": \"zh\", \"title\": \"mixed\"}": 36,
+          "{\"artist\": \"zh\", \"title\": \"zh\"}": 186,
+          "{\"artist\": \"zh\"}": 288,
+          "{\"title\": \"en\"}": 336,
+          "{\"title\": \"mixed\"}": 88,
+          "{\"title\": \"zh\"}": 344
+        },
+        "no_tool_rows": 382,
+        "rows": 7510,
+        "surface_languages": {
+          "en": 2132,
+          "mixed": 3090,
+          "zh": 2288
+        },
+        "tools": {
+          "get_weather": 900,
+          "music_next": 344,
+          "pause_music": 344,
+          "play_music": 2560,
+          "resume_music": 520,
+          "set_light": 384,
+          "volume_music": 1800,
+          "what_is_playing": 404
+        }
+      },
+      "validation": {
+        "asr_error_kinds": {
+          "homophone": 2,
+          "near_homophone": 144
+        },
+        "asr_rows": 146,
+        "batch_shapes": {
+          "get_weather": 64,
+          "music_next": 8,
+          "no_tool": 12,
+          "pause_music": 8,
+          "play_music": 644,
+          "resume_music": 14,
+          "set_light": 8,
+          "volume_music": 124,
+          "what_is_playing": 8
+        },
+        "command_languages": {
+          "en": 298,
+          "mixed": 148,
+          "zh": 444
+        },
+        "entity_compositions": {
+          "{\"artist\": \"en\", \"title\": \"en\"}": 160,
+          "{\"artist\": \"en\", \"title\": \"mixed\"}": 40,
+          "{\"artist\": \"en\", \"title\": \"zh\"}": 160,
+          "{\"artist\": \"en\"}": 20,
+          "{\"artist\": \"zh\", \"title\": \"en\"}": 96,
+          "{\"artist\": \"zh\", \"title\": \"mixed\"}": 24,
+          "{\"artist\": \"zh\", \"title\": \"zh\"}": 96,
+          "{\"artist\": \"zh\"}": 12,
+          "{\"title\": \"en\"}": 16,
+          "{\"title\": \"mixed\"}": 4,
+          "{\"title\": \"zh\"}": 16
+        },
+        "no_tool_rows": 12,
+        "rows": 890,
+        "surface_languages": {
+          "en": 164,
+          "mixed": 556,
+          "zh": 170
+        },
+        "tools": {
+          "get_weather": 64,
+          "music_next": 8,
+          "pause_music": 8,
+          "play_music": 644,
+          "resume_music": 14,
+          "set_light": 8,
+          "volume_music": 124,
+          "what_is_playing": 8
+        }
+      }
+    },
+    "duplicate_commands_removed": 2,
+    "families": {
+      "abstain.en.direct": {
+        "split": "train",
+        "written_rows": 8
+      },
+      "abstain.en.unknown": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "abstain.en.unsupported": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "abstain.zh.direct": {
+        "split": "train",
+        "written_rows": 8
+      },
+      "abstain.zh.unknown": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "abstain.zh.unsupported": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "artist.en.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "artist.en.hear": {
+        "split": "validation",
+        "written_rows": 16
+      },
+      "artist.en.selection": {
+        "split": "test",
+        "written_rows": 16
+      },
+      "artist.mixed.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "artist.zh.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "artist.zh.hear": {
+        "split": "validation",
+        "written_rows": 16
+      },
+      "artist.zh.selection": {
+        "split": "test",
+        "written_rows": 16
+      },
+      "combined.en.direct": {
+        "split": "train",
+        "written_rows": 64
+      },
+      "combined.zh.direct": {
+        "split": "train",
+        "written_rows": 64
+      },
+      "light.en.direct": {
+        "split": "train",
+        "written_rows": 64
+      },
+      "light.en.request": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "light.en.state": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "light.mixed.direct": {
+        "split": "train",
+        "written_rows": 64
+      },
+      "light.zh.asr": {
+        "split": "train",
+        "written_rows": 64
+      },
+      "light.zh.direct": {
+        "split": "train",
+        "written_rows": 64
+      },
+      "light.zh.request": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "light.zh.state": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "named.en.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "named.en.hear": {
+        "split": "validation",
+        "written_rows": 144
+      },
+      "named.en.selection": {
+        "split": "test",
+        "written_rows": 144
+      },
+      "named.mixed.asr": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "named.mixed.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "named.mixed.hear": {
+        "split": "validation",
+        "written_rows": 144
+      },
+      "named.mixed.selection": {
+        "split": "test",
+        "written_rows": 144
+      },
+      "named.zh.asr_hear": {
+        "split": "validation",
+        "written_rows": 144
+      },
+      "named.zh.asr_selection": {
+        "split": "test",
+        "written_rows": 144
+      },
+      "named.zh.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "named.zh.hear": {
+        "split": "validation",
+        "written_rows": 144
+      },
+      "named.zh.selection": {
+        "split": "test",
+        "written_rows": 144
+      },
+      "negated.en.combinations": {
+        "split": "train",
+        "written_rows": 160
+      },
+      "negated.en.direct": {
+        "split": "train",
+        "written_rows": 4
+      },
+      "negated.en.hypothetical": {
+        "split": "validation",
+        "written_rows": 2
+      },
+      "negated.en.refrain": {
+        "split": "test",
+        "written_rows": 2
+      },
+      "negated.mixed.direct": {
+        "split": "train",
+        "written_rows": 32
+      },
+      "negated.zh.combinations": {
+        "split": "train",
+        "written_rows": 158
+      },
+      "negated.zh.direct": {
+        "split": "train",
+        "written_rows": 4
+      },
+      "negated.zh.hypothetical": {
+        "split": "validation",
+        "written_rows": 2
+      },
+      "negated.zh.refrain": {
+        "split": "test",
+        "written_rows": 2
+      },
+      "next.en.advance": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "next.en.direct": {
+        "split": "train",
+        "written_rows": 128
+      },
+      "next.en.following": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "next.mixed.direct": {
+        "split": "train",
+        "written_rows": 24
+      },
+      "next.zh.advance": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "next.zh.asr": {
+        "split": "train",
+        "written_rows": 64
+      },
+      "next.zh.direct": {
+        "split": "train",
+        "written_rows": 128
+      },
+      "next.zh.following": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "pause.en.break": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "pause.en.direct": {
+        "split": "train",
+        "written_rows": 128
+      },
+      "pause.en.hold": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "pause.mixed.direct": {
+        "split": "train",
+        "written_rows": 24
+      },
+      "pause.zh.asr": {
+        "split": "train",
+        "written_rows": 64
+      },
+      "pause.zh.break": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "pause.zh.direct": {
+        "split": "train",
+        "written_rows": 128
+      },
+      "pause.zh.hold": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "query.en.details": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "query.en.direct": {
+        "split": "train",
+        "written_rows": 144
+      },
+      "query.en.identify": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "query.mixed.direct": {
+        "split": "train",
+        "written_rows": 108
+      },
+      "query.zh.asr": {
+        "split": "train",
+        "written_rows": 8
+      },
+      "query.zh.details": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "query.zh.direct": {
+        "split": "train",
+        "written_rows": 144
+      },
+      "query.zh.identify": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "resume.en.direct": {
+        "split": "train",
+        "written_rows": 192
+      },
+      "resume.en.listening": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "resume.en.lively": {
+        "split": "train",
+        "written_rows": 14
+      },
+      "resume.en.soundtrack": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "resume.mixed.direct": {
+        "split": "train",
+        "written_rows": 40
+      },
+      "resume.mixed.listening": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "resume.mixed.soundtrack": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "resume.zh.asr": {
+        "split": "train",
+        "written_rows": 96
+      },
+      "resume.zh.asr_listening": {
+        "split": "validation",
+        "written_rows": 2
+      },
+      "resume.zh.asr_soundtrack": {
+        "split": "test",
+        "written_rows": 2
+      },
+      "resume.zh.direct": {
+        "split": "train",
+        "written_rows": 160
+      },
+      "resume.zh.listening": {
+        "split": "validation",
+        "written_rows": 4
+      },
+      "resume.zh.lively": {
+        "split": "train",
+        "written_rows": 18
+      },
+      "resume.zh.soundtrack": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "title.en.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "title.en.hear": {
+        "split": "validation",
+        "written_rows": 18
+      },
+      "title.en.selection": {
+        "split": "test",
+        "written_rows": 18
+      },
+      "title.mixed.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "title.zh.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "title.zh.hear": {
+        "split": "validation",
+        "written_rows": 18
+      },
+      "title.zh.selection": {
+        "split": "test",
+        "written_rows": 18
+      },
+      "uncertain_name.zh.asr": {
+        "split": "train",
+        "written_rows": 4
+      },
+      "volume.en.asr": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "volume.en.default": {
+        "split": "train",
+        "written_rows": 4
+      },
+      "volume.en.default_level": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "volume.en.default_request": {
+        "split": "validation",
+        "written_rows": 2
+      },
+      "volume.en.level": {
+        "split": "test",
+        "written_rows": 20
+      },
+      "volume.en.missing_set": {
+        "split": "train",
+        "written_rows": 2
+      },
+      "volume.en.relative": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "volume.en.relative_level": {
+        "split": "test",
+        "written_rows": 40
+      },
+      "volume.en.relative_request": {
+        "split": "validation",
+        "written_rows": 40
+      },
+      "volume.en.set": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "volume.en.target": {
+        "split": "validation",
+        "written_rows": 20
+      },
+      "volume.mixed.set": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "volume.zh.asr": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "volume.zh.default": {
+        "split": "train",
+        "written_rows": 4
+      },
+      "volume.zh.default_level": {
+        "split": "test",
+        "written_rows": 4
+      },
+      "volume.zh.default_request": {
+        "split": "validation",
+        "written_rows": 2
+      },
+      "volume.zh.level": {
+        "split": "test",
+        "written_rows": 20
+      },
+      "volume.zh.missing_set": {
+        "split": "train",
+        "written_rows": 2
+      },
+      "volume.zh.relative": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "volume.zh.relative_level": {
+        "split": "test",
+        "written_rows": 40
+      },
+      "volume.zh.relative_request": {
+        "split": "validation",
+        "written_rows": 40
+      },
+      "volume.zh.set": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "volume.zh.target": {
+        "split": "validation",
+        "written_rows": 20
+      },
+      "weather.en.conditions": {
+        "split": "test",
+        "written_rows": 32
+      },
+      "weather.en.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "weather.en.report": {
+        "split": "validation",
+        "written_rows": 32
+      },
+      "weather.mixed.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "weather.zh.asr": {
+        "split": "train",
+        "written_rows": 4
+      },
+      "weather.zh.conditions": {
+        "split": "test",
+        "written_rows": 32
+      },
+      "weather.zh.direct": {
+        "split": "train",
+        "written_rows": 256
+      },
+      "weather.zh.report": {
+        "split": "validation",
+        "written_rows": 32
+      }
+    },
+    "files": {
+      "test.jsonl": "79fc1c70cd72b600eea56b7a6d78479f9a4c23995e6c36b0ba0a4d1d373928ad",
+      "train.jsonl": "6883185fb4d001c3affd97657aa462322cb3eae406be180a89600ba4c242802b",
+      "validation.jsonl": "8922d6d50f0f9c1d11e9ee59472ef4fdb247dba26a5fdefe76ff3d0dbe279627"
+    },
+    "format": "lfm_conversational_tool_routing",
+    "generator_sha256": "72dfa71728dbc30fc56249cbece5af2219957b63bca677817c8f4cb0d2ef59d0",
+    "groups": {
+      "abstain.direct": "train",
+      "abstain.unknown": "test",
+      "abstain.unsupported": "validation",
+      "artist.direct": "train",
+      "artist.hear": "validation",
+      "artist.selection": "test",
+      "combined.direct": "train",
+      "light.direct": "train",
+      "light.request": "validation",
+      "light.state": "test",
+      "named.direct": "train",
+      "named.hear": "validation",
+      "named.selection": "test",
+      "negated.direct": "train",
+      "negated.hypothetical": "validation",
+      "negated.refrain": "test",
+      "next.advance": "test",
+      "next.direct": "train",
+      "next.following": "validation",
+      "pause.break": "test",
+      "pause.direct": "train",
+      "pause.hold": "validation",
+      "query.details": "test",
+      "query.direct": "train",
+      "query.identify": "validation",
+      "resume.direct": "train",
+      "resume.listening": "validation",
+      "resume.lively": "train",
+      "resume.soundtrack": "test",
+      "title.direct": "train",
+      "title.hear": "validation",
+      "title.selection": "test",
+      "uncertain_name.direct": "train",
+      "volume.default_direct": "train",
+      "volume.default_level": "test",
+      "volume.default_request": "validation",
+      "volume.direct": "train",
+      "volume.level": "test",
+      "volume.missing_set_direct": "train",
+      "volume.relative_direct": "train",
+      "volume.relative_level": "test",
+      "volume.relative_request": "validation",
+      "volume.target": "validation",
+      "weather.conditions": "test",
+      "weather.direct": "train",
+      "weather.report": "validation"
+    },
+    "max_per_family": 128,
+    "max_rows": 100000,
+    "music_states": [
+      "on",
+      "off"
+    ],
+    "normalization": {
+      "canonical_rows": {
+        "test": 894,
+        "train": 7510,
+        "validation": 890
+      },
+      "normalizer_sha256": "f639fa31a0be9023af64f23a1d6d3c4a2f079d86d99a907fa4ea6b516a4b3382",
+      "policy": "basic_punctuation",
+      "source_rows": {
+        "test": 894,
+        "train": 7510,
+        "validation": 890
+      },
+      "version": 2
+    },
+    "prompt_sha256": "18f4d62f45b15e653b302a407d316bb2be06d21a292f558eabd4d7db65369579",
+    "schema_sha256": "347c72aa8fcf04a4f3a3e4d2cb6cce3b09c11755227c5770423f824f1058089e",
+    "seed": 42,
+    "source_coverage": {
+      "test": {
+        "asr_error_kinds": {
+          "homophone": 2,
+          "near_homophone": 144
+        },
+        "asr_rows": 146,
+        "batch_shapes": {
+          "get_weather": 64,
+          "music_next": 8,
+          "no_tool": 12,
+          "pause_music": 8,
+          "play_music": 644,
+          "resume_music": 14,
+          "set_light": 8,
+          "volume_music": 128,
+          "what_is_playing": 8
+        },
+        "command_languages": {
+          "en": 300,
+          "mixed": 148,
+          "zh": 446
+        },
+        "entity_compositions": {
+          "{\"artist\": \"en\", \"title\": \"en\"}": 160,
+          "{\"artist\": \"en\", \"title\": \"mixed\"}": 40,
+          "{\"artist\": \"en\", \"title\": \"zh\"}": 160,
+          "{\"artist\": \"en\"}": 20,
+          "{\"artist\": \"zh\", \"title\": \"en\"}": 96,
+          "{\"artist\": \"zh\", \"title\": \"mixed\"}": 24,
+          "{\"artist\": \"zh\", \"title\": \"zh\"}": 96,
+          "{\"artist\": \"zh\"}": 12,
+          "{\"title\": \"en\"}": 16,
+          "{\"title\": \"mixed\"}": 4,
+          "{\"title\": \"zh\"}": 16
+        },
+        "no_tool_rows": 12,
+        "rows": 894,
+        "surface_languages": {
+          "en": 166,
+          "mixed": 556,
+          "zh": 172
+        },
+        "tools": {
+          "get_weather": 64,
+          "music_next": 8,
+          "pause_music": 8,
+          "play_music": 644,
+          "resume_music": 14,
+          "set_light": 8,
+          "volume_music": 128,
+          "what_is_playing": 8
+        }
+      },
+      "train": {
+        "asr_error_kinds": {
+          "homophone": 524,
+          "latin_asr": 256,
+          "near_homophone": 288
+        },
+        "asr_rows": 1068,
+        "batch_shapes": {
+          "get_weather": 772,
+          "music_next": 344,
+          "no_tool": 382,
+          "pause_music": 344,
+          "play_music": 2560,
+          "resume_music": 520,
+          "set_light": 256,
+          "set_light+get_weather": 128,
+          "volume_music": 1800,
+          "what_is_playing": 404
+        },
+        "command_languages": {
+          "en": 2704,
+          "mixed": 1828,
+          "zh": 2978
+        },
+        "entity_compositions": {
+          "{\"artist\": \"en\", \"title\": \"en\"}": 308,
+          "{\"artist\": \"en\", \"title\": \"mixed\"}": 50,
+          "{\"artist\": \"en\", \"title\": \"zh\"}": 290,
+          "{\"artist\": \"en\"}": 480,
+          "{\"artist\": \"zh\", \"title\": \"en\"}": 154,
+          "{\"artist\": \"zh\", \"title\": \"mixed\"}": 36,
+          "{\"artist\": \"zh\", \"title\": \"zh\"}": 186,
+          "{\"artist\": \"zh\"}": 288,
+          "{\"title\": \"en\"}": 336,
+          "{\"title\": \"mixed\"}": 88,
+          "{\"title\": \"zh\"}": 344
+        },
+        "no_tool_rows": 382,
+        "rows": 7510,
+        "surface_languages": {
+          "en": 2132,
+          "mixed": 3090,
+          "zh": 2288
+        },
+        "tools": {
+          "get_weather": 900,
+          "music_next": 344,
+          "pause_music": 344,
+          "play_music": 2560,
+          "resume_music": 520,
+          "set_light": 384,
+          "volume_music": 1800,
+          "what_is_playing": 404
+        }
+      },
+      "validation": {
+        "asr_error_kinds": {
+          "homophone": 2,
+          "near_homophone": 144
+        },
+        "asr_rows": 146,
+        "batch_shapes": {
+          "get_weather": 64,
+          "music_next": 8,
+          "no_tool": 12,
+          "pause_music": 8,
+          "play_music": 644,
+          "resume_music": 14,
+          "set_light": 8,
+          "volume_music": 124,
+          "what_is_playing": 8
+        },
+        "command_languages": {
+          "en": 298,
+          "mixed": 148,
+          "zh": 444
+        },
+        "entity_compositions": {
+          "{\"artist\": \"en\", \"title\": \"en\"}": 160,
+          "{\"artist\": \"en\", \"title\": \"mixed\"}": 40,
+          "{\"artist\": \"en\", \"title\": \"zh\"}": 160,
+          "{\"artist\": \"en\"}": 20,
+          "{\"artist\": \"zh\", \"title\": \"en\"}": 96,
+          "{\"artist\": \"zh\", \"title\": \"mixed\"}": 24,
+          "{\"artist\": \"zh\", \"title\": \"zh\"}": 96,
+          "{\"artist\": \"zh\"}": 12,
+          "{\"title\": \"en\"}": 16,
+          "{\"title\": \"mixed\"}": 4,
+          "{\"title\": \"zh\"}": 16
+        },
+        "no_tool_rows": 12,
+        "rows": 890,
+        "surface_languages": {
+          "en": 164,
+          "mixed": 556,
+          "zh": 170
+        },
+        "tools": {
+          "get_weather": 64,
+          "music_next": 8,
+          "pause_music": 8,
+          "play_music": 644,
+          "resume_music": 14,
+          "set_light": 8,
+          "volume_music": 124,
+          "what_is_playing": 8
+        }
+      }
+    },
+    "source_families": {
+      "abstain.en.direct": {
+        "cartesian_commands": 4,
+        "sampled_commands": 4,
+        "written_rows": 8
+      },
+      "abstain.en.unknown": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "abstain.en.unsupported": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "abstain.zh.direct": {
+        "cartesian_commands": 4,
+        "sampled_commands": 4,
+        "written_rows": 8
+      },
+      "abstain.zh.unknown": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "abstain.zh.unsupported": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "artist.en.direct": {
+        "cartesian_commands": 128,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "artist.en.hear": {
+        "cartesian_commands": 8,
+        "sampled_commands": 8,
+        "written_rows": 16
+      },
+      "artist.en.selection": {
+        "cartesian_commands": 8,
+        "sampled_commands": 8,
+        "written_rows": 16
+      },
+      "artist.mixed.direct": {
+        "cartesian_commands": 128,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "artist.zh.direct": {
+        "cartesian_commands": 128,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "artist.zh.hear": {
+        "cartesian_commands": 8,
+        "sampled_commands": 8,
+        "written_rows": 16
+      },
+      "artist.zh.selection": {
+        "cartesian_commands": 8,
+        "sampled_commands": 8,
+        "written_rows": 16
+      },
+      "combined.en.direct": {
+        "cartesian_commands": 32,
+        "sampled_commands": 32,
+        "written_rows": 64
+      },
+      "combined.zh.direct": {
+        "cartesian_commands": 32,
+        "sampled_commands": 32,
+        "written_rows": 64
+      },
+      "light.en.direct": {
+        "cartesian_commands": 32,
+        "sampled_commands": 32,
+        "written_rows": 64
+      },
+      "light.en.request": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "light.en.state": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "light.mixed.direct": {
+        "cartesian_commands": 32,
+        "sampled_commands": 32,
+        "written_rows": 64
+      },
+      "light.zh.asr": {
+        "cartesian_commands": 32,
+        "sampled_commands": 32,
+        "written_rows": 64
+      },
+      "light.zh.direct": {
+        "cartesian_commands": 32,
+        "sampled_commands": 32,
+        "written_rows": 64
+      },
+      "light.zh.request": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "light.zh.state": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "named.en.direct": {
+        "cartesian_commands": 1152,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "named.en.hear": {
+        "cartesian_commands": 72,
+        "sampled_commands": 72,
+        "written_rows": 144
+      },
+      "named.en.selection": {
+        "cartesian_commands": 72,
+        "sampled_commands": 72,
+        "written_rows": 144
+      },
+      "named.mixed.asr": {
+        "cartesian_commands": 1152,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "named.mixed.direct": {
+        "cartesian_commands": 2304,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "named.mixed.hear": {
+        "cartesian_commands": 72,
+        "sampled_commands": 72,
+        "written_rows": 144
+      },
+      "named.mixed.selection": {
+        "cartesian_commands": 72,
+        "sampled_commands": 72,
+        "written_rows": 144
+      },
+      "named.zh.asr_hear": {
+        "cartesian_commands": 72,
+        "sampled_commands": 72,
+        "written_rows": 144
+      },
+      "named.zh.asr_selection": {
+        "cartesian_commands": 72,
+        "sampled_commands": 72,
+        "written_rows": 144
+      },
+      "named.zh.direct": {
+        "cartesian_commands": 1152,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "named.zh.hear": {
+        "cartesian_commands": 72,
+        "sampled_commands": 72,
+        "written_rows": 144
+      },
+      "named.zh.selection": {
+        "cartesian_commands": 72,
+        "sampled_commands": 72,
+        "written_rows": 144
+      },
+      "negated.en.combinations": {
+        "cartesian_commands": 80,
+        "sampled_commands": 80,
+        "written_rows": 160
+      },
+      "negated.en.direct": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "negated.en.hypothetical": {
+        "cartesian_commands": 1,
+        "sampled_commands": 1,
+        "written_rows": 2
+      },
+      "negated.en.refrain": {
+        "cartesian_commands": 1,
+        "sampled_commands": 1,
+        "written_rows": 2
+      },
+      "negated.mixed.direct": {
+        "cartesian_commands": 16,
+        "sampled_commands": 16,
+        "written_rows": 32
+      },
+      "negated.zh.combinations": {
+        "cartesian_commands": 80,
+        "sampled_commands": 80,
+        "written_rows": 158
+      },
+      "negated.zh.direct": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "negated.zh.hypothetical": {
+        "cartesian_commands": 1,
+        "sampled_commands": 1,
+        "written_rows": 2
+      },
+      "negated.zh.refrain": {
+        "cartesian_commands": 1,
+        "sampled_commands": 1,
+        "written_rows": 2
+      },
+      "next.en.advance": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "next.en.direct": {
+        "cartesian_commands": 64,
+        "sampled_commands": 64,
+        "written_rows": 128
+      },
+      "next.en.following": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "next.mixed.direct": {
+        "cartesian_commands": 12,
+        "sampled_commands": 12,
+        "written_rows": 24
+      },
+      "next.zh.advance": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "next.zh.asr": {
+        "cartesian_commands": 32,
+        "sampled_commands": 32,
+        "written_rows": 64
+      },
+      "next.zh.direct": {
+        "cartesian_commands": 64,
+        "sampled_commands": 64,
+        "written_rows": 128
+      },
+      "next.zh.following": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "pause.en.break": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "pause.en.direct": {
+        "cartesian_commands": 64,
+        "sampled_commands": 64,
+        "written_rows": 128
+      },
+      "pause.en.hold": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "pause.mixed.direct": {
+        "cartesian_commands": 12,
+        "sampled_commands": 12,
+        "written_rows": 24
+      },
+      "pause.zh.asr": {
+        "cartesian_commands": 32,
+        "sampled_commands": 32,
+        "written_rows": 64
+      },
+      "pause.zh.break": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "pause.zh.direct": {
+        "cartesian_commands": 64,
+        "sampled_commands": 64,
+        "written_rows": 128
+      },
+      "pause.zh.hold": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "query.en.details": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "query.en.direct": {
+        "cartesian_commands": 72,
+        "sampled_commands": 72,
+        "written_rows": 144
+      },
+      "query.en.identify": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "query.mixed.direct": {
+        "cartesian_commands": 54,
+        "sampled_commands": 54,
+        "written_rows": 108
+      },
+      "query.zh.asr": {
+        "cartesian_commands": 4,
+        "sampled_commands": 4,
+        "written_rows": 8
+      },
+      "query.zh.details": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "query.zh.direct": {
+        "cartesian_commands": 72,
+        "sampled_commands": 72,
+        "written_rows": 144
+      },
+      "query.zh.identify": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "resume.en.direct": {
+        "cartesian_commands": 96,
+        "sampled_commands": 96,
+        "written_rows": 192
+      },
+      "resume.en.listening": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "resume.en.lively": {
+        "cartesian_commands": 7,
+        "sampled_commands": 7,
+        "written_rows": 14
+      },
+      "resume.en.soundtrack": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "resume.mixed.direct": {
+        "cartesian_commands": 20,
+        "sampled_commands": 20,
+        "written_rows": 40
+      },
+      "resume.mixed.listening": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "resume.mixed.soundtrack": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "resume.zh.asr": {
+        "cartesian_commands": 48,
+        "sampled_commands": 48,
+        "written_rows": 96
+      },
+      "resume.zh.asr_listening": {
+        "cartesian_commands": 1,
+        "sampled_commands": 1,
+        "written_rows": 2
+      },
+      "resume.zh.asr_soundtrack": {
+        "cartesian_commands": 1,
+        "sampled_commands": 1,
+        "written_rows": 2
+      },
+      "resume.zh.direct": {
+        "cartesian_commands": 80,
+        "sampled_commands": 80,
+        "written_rows": 160
+      },
+      "resume.zh.listening": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "resume.zh.lively": {
+        "cartesian_commands": 10,
+        "sampled_commands": 10,
+        "written_rows": 18
+      },
+      "resume.zh.soundtrack": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "title.en.direct": {
+        "cartesian_commands": 144,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "title.en.hear": {
+        "cartesian_commands": 9,
+        "sampled_commands": 9,
+        "written_rows": 18
+      },
+      "title.en.selection": {
+        "cartesian_commands": 9,
+        "sampled_commands": 9,
+        "written_rows": 18
+      },
+      "title.mixed.direct": {
+        "cartesian_commands": 144,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "title.zh.direct": {
+        "cartesian_commands": 144,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "title.zh.hear": {
+        "cartesian_commands": 9,
+        "sampled_commands": 9,
+        "written_rows": 18
+      },
+      "title.zh.selection": {
+        "cartesian_commands": 9,
+        "sampled_commands": 9,
+        "written_rows": 18
+      },
+      "uncertain_name.zh.asr": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "volume.en.asr": {
+        "cartesian_commands": 320,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "volume.en.default": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "volume.en.default_level": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "volume.en.default_request": {
+        "cartesian_commands": 1,
+        "sampled_commands": 1,
+        "written_rows": 2
+      },
+      "volume.en.level": {
+        "cartesian_commands": 10,
+        "sampled_commands": 10,
+        "written_rows": 20
+      },
+      "volume.en.missing_set": {
+        "cartesian_commands": 1,
+        "sampled_commands": 1,
+        "written_rows": 2
+      },
+      "volume.en.relative": {
+        "cartesian_commands": 320,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "volume.en.relative_level": {
+        "cartesian_commands": 20,
+        "sampled_commands": 20,
+        "written_rows": 40
+      },
+      "volume.en.relative_request": {
+        "cartesian_commands": 20,
+        "sampled_commands": 20,
+        "written_rows": 40
+      },
+      "volume.en.set": {
+        "cartesian_commands": 160,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "volume.en.target": {
+        "cartesian_commands": 10,
+        "sampled_commands": 10,
+        "written_rows": 20
+      },
+      "volume.mixed.set": {
+        "cartesian_commands": 160,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "volume.zh.asr": {
+        "cartesian_commands": 320,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "volume.zh.default": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "volume.zh.default_level": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "volume.zh.default_request": {
+        "cartesian_commands": 1,
+        "sampled_commands": 1,
+        "written_rows": 2
+      },
+      "volume.zh.level": {
+        "cartesian_commands": 10,
+        "sampled_commands": 10,
+        "written_rows": 20
+      },
+      "volume.zh.missing_set": {
+        "cartesian_commands": 1,
+        "sampled_commands": 1,
+        "written_rows": 2
+      },
+      "volume.zh.relative": {
+        "cartesian_commands": 320,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "volume.zh.relative_level": {
+        "cartesian_commands": 20,
+        "sampled_commands": 20,
+        "written_rows": 40
+      },
+      "volume.zh.relative_request": {
+        "cartesian_commands": 20,
+        "sampled_commands": 20,
+        "written_rows": 40
+      },
+      "volume.zh.set": {
+        "cartesian_commands": 160,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "volume.zh.target": {
+        "cartesian_commands": 10,
+        "sampled_commands": 10,
+        "written_rows": 20
+      },
+      "weather.en.conditions": {
+        "cartesian_commands": 16,
+        "sampled_commands": 16,
+        "written_rows": 32
+      },
+      "weather.en.direct": {
+        "cartesian_commands": 256,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "weather.en.report": {
+        "cartesian_commands": 16,
+        "sampled_commands": 16,
+        "written_rows": 32
+      },
+      "weather.mixed.direct": {
+        "cartesian_commands": 256,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "weather.zh.asr": {
+        "cartesian_commands": 2,
+        "sampled_commands": 2,
+        "written_rows": 4
+      },
+      "weather.zh.conditions": {
+        "cartesian_commands": 16,
+        "sampled_commands": 16,
+        "written_rows": 32
+      },
+      "weather.zh.direct": {
+        "cartesian_commands": 256,
+        "sampled_commands": 128,
+        "written_rows": 256
+      },
+      "weather.zh.report": {
+        "cartesian_commands": 16,
+        "sampled_commands": 16,
+        "written_rows": 32
+      }
+    },
+    "templates_sha256": "424b4463c1aa8b7fbe3640b25d725d40ae38a9ed9b8503ae2e9187870c24c24b",
+    "variants_sha256": "020c5ccb9b189a00c07f7dc0eda8fa5323096612940a9484ad6b548ef7f23a5c",
+    "version": 1
+  },
+  "test_policy": "Use all test.jsonl rows once for held-out final evaluation after fusion choices are frozen."
+}

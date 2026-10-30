@@ -117,9 +117,11 @@ def render_weather(result: JsonValue) -> str:
     """Render one verified WeatherClient result without model-authored weather facts.
 
     Temperatures and percentages round to integers. Now forecasts
-    include current temperature before today's range. Weekly conditions use the
+    use current conditions and temperature before today's range and rain forecast.
+    Weekly conditions use the
     most frequent daily label (earliest on ties); probability is a daily maximum.
-    Location failures ask for an exact location without reading candidate lists.
+    Location failures ask for an exact location without reading candidate lists;
+    unavailable provider results request a retry without inventing conditions.
     Long location labels are replaced with a short spoken reference.
 
     Args:
@@ -130,6 +132,8 @@ def render_weather(result: JsonValue) -> str:
     if not isinstance(result, dict):
         raise TypeError("Weather result must be an object")
     data: dict[str, Any] = result
+    if data.get("status") == "unavailable":
+        return "Weather is unavailable. Please try again."
     if data.get("status") in ("ambiguous_city", "city_not_found"):
         query = _voice_label(data["city_query"], "that location")
         reference = f'"{query}"' if query != "that location" else query
@@ -161,6 +165,7 @@ def render_weather(result: JsonValue) -> str:
     prefix = f"For {data['period'].replace('_', ' ')}, "
     if "current_temperature_c" in data:
         prefix = ""
+        condition = data["condition"] or "conditions unavailable"
         temperature = data["current_temperature_c"]
         current = (
             "current temperature unavailable"
@@ -168,7 +173,10 @@ def render_weather(result: JsonValue) -> str:
             else f"{temperature:.0f} degrees outside now"
         )
         span = f"{current}, {span}"
-    answer = f"{prefix}{city}it's {condition}, {span}, {_rain(days, probability)}."
+    rain = _rain(days, probability)
+    if data["period"] == "now":
+        rain = f"today, {rain}"
+    answer = f"{prefix}{city}it's {condition}, {span}, {rain}."
     return answer[0].upper() + answer[1:]
 
 
@@ -305,8 +313,8 @@ def render_light(result: JsonValue) -> str:
 class LocalAgent:
     """Route each request locally; render verified results in ordinary speech text.
 
-    Standalone music controls bypass inference. Otherwise the model proposes one bounded
-    tool batch per turn, with up to two repairs
+    Standalone music controls and clear home-weather requests bypass inference.
+    Otherwise the model proposes one bounded tool batch per turn, with up to two repairs
     for invalid generated calls before dispatch. Application-rendered
     answers replace detailed tool results in native history for follow-ups. Tool-free model text
     is restricted to a neutral clarification rather than spoken as verified facts.
@@ -314,6 +322,12 @@ class LocalAgent:
 
     session: Session
     """Conversation with weather, optional music/light tools and routing instructions."""
+
+    last_calls: tuple[ToolCall, ...] = ()
+    """Validated calls dispatched by the latest completed turn."""
+
+    last_answers: tuple[str, ...] = ()
+    """Grounded rendered answers corresponding to the latest completed calls."""
 
     def __post_init__(self) -> None:
         """Validate renderer-compatible weather/core music and optional next/query/light.
@@ -352,6 +366,8 @@ class LocalAgent:
         louder/quieter optionally followed by an integer percentage use direct calls.
         Bare relative-volume words use five percentage points. Next/next song/next track and
         switch song/skip song/skip track similarly dispatch music_next directly.
+        Explicit home weather questions use direct calls; questions without a location
+        do so only in a fresh conversation, where home is the default.
 
         Args:
             user_text:
@@ -362,6 +378,8 @@ class LocalAgent:
                 before the tool batch, and after dispatch. Dispatched effects persist.
 
         """
+        self.last_calls = ()
+        self.last_answers = ()
         if cancelled is not None and cancelled():
             self.session.reset()
             return
@@ -398,9 +416,28 @@ class LocalAgent:
             "turn off the light": ToolCall("set_light", {"on": False}),
             "turn off the lights": ToolCall("set_light", {"on": False}),
         }.get(shortcut_text)
-        if "?" not in user_text and "？" not in user_text and re.fullmatch(
-            r"(?:please )?play (?:me )?(?:(?:my|the|spotify|spotify's) )*day\s*list(?: please)?",
+        weather = re.fullmatch(
+            r"(?:what is|what's|how is|how's) the weather(?: like)?"
+            r"(?P<home> at home)?(?: (?P<period>now|today|tomorrow|next week))?",
             shortcut_text,
+        )
+        if weather and (weather["home"] or not self.session.history):
+            shortcut = ToolCall(
+                "get_weather",
+                {"period": (weather["period"] or "now").replace(" ", "_"), "city": ""},
+            )
+        if not self.session.history and shortcut_text in (
+            "what is the temperature now",
+            "what's the temperature now",
+        ):
+            shortcut = ToolCall("get_weather", {"period": "now", "city": ""})
+        if (
+            "?" not in user_text
+            and "？" not in user_text
+            and re.fullmatch(
+                r"(?:please )?play (?:me )?(?:(?:my|the|spotify|spotify's) )*day\s*list(?: please)?",
+                shortcut_text,
+            )
         ):
             shortcut = ToolCall("play_music", {"playlist": "daylist"})
         volume = re.fullmatch(
@@ -496,6 +533,8 @@ class LocalAgent:
                 self.session.reset()
                 return
             self.session.complete(" ".join(answers))
+            self.last_calls = calls
+            self.last_answers = tuple(answers)
             for index, answer in enumerate(answers):
                 yield (" " if index else "") + answer
         except BaseException:
