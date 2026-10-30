@@ -337,7 +337,7 @@ def test_prefix_buffer_copy_mapping() -> None:
     """Copy all hybrid states in the right direction and only the valid KV length."""
     runner = Runner.__new__(Runner)
     runner.workspace = Workspace.__new__(Workspace)
-    spec = WorkspaceSpec(8, 4, prefix_cache=True)
+    spec = WorkspaceSpec(8, 4, prefix_cache=True, prefix_slots=2)
     runner.workspace.buffers = {name: name for name in spec.buffer_sizes}
     queue = SimpleNamespace(finish=lambda: None)
     runner.workspace.queue = queue
@@ -371,6 +371,82 @@ def test_prefix_buffer_copy_mapping() -> None:
     assert len(copies) == 22
     assert ("key_2", "prefix_key_2", 3 * 512 * 4) in copies
     assert ("conv_0", "prefix_conv_0", 1024 * 3 * 4) in copies
+    copies.clear()
+    runner._copy_prefix_state(3, restore=False, slot=1)
+    assert len(copies) == 22
+    assert ("prefix1_key_2", "key_2", 3 * 512 * 4) in copies
+    assert ("prefix1_conv_0", "conv_0", 1024 * 3 * 4) in copies
+    copies.clear()
+    runner._copy_prefix_state(3, restore=True, slot=1)
+    assert ("key_2", "prefix1_key_2", 3 * 512 * 4) in copies
+    assert ("conv_0", "prefix1_conv_0", 1024 * 3 * 4) in copies
+
+
+def test_two_prefix_slots_independent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Capture and restore two independent states, logits, and positions."""
+    runner = Runner.__new__(Runner)
+    runner.workspace = Workspace.__new__(Workspace)
+    runner.workspace.spec = WorkspaceSpec(16, 4, prefix_cache=True, prefix_slots=2)
+    runner.workspace.position = 0
+    runner.valid = True
+    runner._lock = threading.Lock()
+    runner._prefix_tokens = runner._extra_prefix_tokens = None
+    runner._prefix_logits = np.empty(65536, dtype=np.float32)
+    runner._extra_prefix_logits = np.empty(65536, dtype=np.float32)
+    state: dict[str, Any] = {"live": [], "snapshots": {}}
+
+    def execute(self: Runner, tokens: list[int]) -> np.ndarray:
+        """Append token IDs to simulated live state and produce state-dependent logits.
+
+        Args:
+            self: Runner with simulated state.
+
+            tokens: IDs appended to that state.
+        """
+        state["live"].extend(tokens)
+        self.workspace.position += len(tokens)
+        return np.full(65536, sum(state["live"]), dtype=np.float32)
+
+    def copy(self: Runner, length: int, *, restore: bool, slot: int = 0) -> None:
+        """Copy the simulated hybrid state to or from a selected snapshot.
+
+        Args:
+            self: Runner whose state is copied.
+
+            length: Captured token count.
+
+            restore: Whether to restore rather than capture.
+
+            slot: Snapshot index.
+        """
+        if restore:
+            state["live"] = list(state["snapshots"][slot])
+        else:
+            assert len(state["live"]) == length
+            state["snapshots"][slot] = list(state["live"])
+
+    monkeypatch.setattr(Runner, "_execute", execute)
+    monkeypatch.setattr(Runner, "_copy_prefix_state", copy)
+    runner.cache_prefix([1, 2])
+    runner.workspace.position = 0
+    state["live"] = []
+    runner.cache_prefix([8, 9, 10], slot=1)
+    for slot, prefix, expected in ((0, [1, 2], 3), (1, [8, 9, 10], 27)):
+        runner.workspace.position = 0
+        state["live"] = []
+        assert runner.prefill_cached(prefix, slot=slot)[0] == expected
+        assert runner.workspace.position == len(prefix)
+        runner.workspace.position = 0
+        state["live"] = []
+        assert runner.prefill_cached(prefix + [4], slot=slot)[0] == expected + 4
+        assert runner.workspace.position == len(prefix) + 1
+    runner.workspace.position = 0
+    before = list(state["live"])
+    with pytest.raises(ValueError, match="does not match"):
+        runner.prefill_cached([1, 2], slot=1)
+    assert state["live"] == before
+    assert runner._prefix_tokens == (1, 2)
+    assert runner._extra_prefix_tokens == (8, 9, 10)
 
 
 def test_prefix_identity_independence_and_failure(

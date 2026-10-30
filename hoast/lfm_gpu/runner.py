@@ -187,7 +187,7 @@ class WorkspaceSpec:
     """Enable the 9 MiB prepared-weight scratch path for chunks of at least 128 tokens."""
 
     prefix_cache: bool = False
-    """Preallocate one prefix snapshot with capacity equal to the sequence capacity."""
+    """Preallocate prefix snapshots with capacity equal to the sequence capacity."""
 
     prepared_kn: bool = False
     """Use K-major blocked GEMM for prepared prefill; requires prepared_prefill."""
@@ -203,6 +203,9 @@ class WorkspaceSpec:
 
     persistent_kn_budget_bytes: int = 0
     """Explicit upper bound in bytes for all retained K-major projections."""
+
+    prefix_slots: int = 1
+    """Number of independent snapshot slots when prefix caching is enabled."""
 
     def __post_init__(self) -> None:
         """Reject invalid dimensions before allocating device memory."""
@@ -220,6 +223,10 @@ class WorkspaceSpec:
             raise TypeError("prepared_prefill must be a boolean")
         if type(self.prefix_cache) is not bool:
             raise TypeError("prefix_cache must be a boolean")
+        if type(self.prefix_slots) is not int or self.prefix_slots not in (1, 2):
+            raise ValueError("prefix_slots must be 1 or 2")
+        if self.prefix_slots != 1 and not self.prefix_cache:
+            raise ValueError("Multiple prefix slots require prefix caching")
         if type(self.prepared_kn) is not bool:
             raise TypeError("prepared_kn must be a boolean")
         if self.prepared_kn and not self.prepared_prefill:
@@ -280,10 +287,15 @@ class WorkspaceSpec:
                 if self.prefix_cache:
                     sizes[f"prefix_key_{layer}"] = self.capacity * 512 * f32
                     sizes[f"prefix_value_{layer}"] = self.capacity * 512 * f32
+                    if self.prefix_slots == 2:
+                        sizes[f"prefix1_key_{layer}"] = self.capacity * 512 * f32
+                        sizes[f"prefix1_value_{layer}"] = self.capacity * 512 * f32
             else:
                 sizes[f"conv_{layer}"] = 1024 * 3 * f32
                 if self.prefix_cache:
                     sizes[f"prefix_conv_{layer}"] = 1024 * 3 * f32
+                    if self.prefix_slots == 2:
+                        sizes[f"prefix1_conv_{layer}"] = 1024 * 3 * f32
         return sizes
 
 
@@ -354,7 +366,7 @@ class Runner:
     kernel; the existing attention application consumes the same workspace.
     Persistent K-major mode preallocates layer projection buffers and prepares
     their contents lazily, within the explicitly supplied 548 MiB minimum budget.
-    Optional single-prefix snapshots survive reset and are never applied unless
+    Optional prefix snapshots survive reset and are never applied unless
     the complete input begins with the exact stored token sequence.
     """
 
@@ -393,6 +405,12 @@ class Runner:
 
     _prefix_logits: np.ndarray
     """Private FP32 last-prefix logits, shape [vocabulary size]."""
+
+    _extra_prefix_tokens: tuple[int, ...] | None
+    """Token IDs for the second snapshot, when allocated."""
+
+    _extra_prefix_logits: np.ndarray
+    """Second snapshot's FP32 final logits, shape [vocabulary size]."""
 
     _prepared_weights: dict[str, Any]
     """Preallocated device FP16 K-major buffers keyed by projection name."""
@@ -447,6 +465,8 @@ class Runner:
         self._logits_host = np.empty(65536, dtype=np.float32)
         self._prefix_logits = np.empty(65536, dtype=np.float32)
         self._prefix_tokens = None
+        self._extra_prefix_tokens = None
+        self._extra_prefix_logits = np.empty(65536, dtype=np.float32)
         source = "\n".join(
             (Path(__file__).parent / n).read_text()
             for n in ("lfm_gpu_kernels.cl", "lfm_gpu_ops.cl", "lfm_gpu_runner.cl")
@@ -641,6 +661,7 @@ class Runner:
                 self.workspace.reset()
             except BaseException:
                 self._prefix_tokens = None
+                self._extra_prefix_tokens = None
                 if hasattr(self, "_prepared_ready"):
                     self._prepared_ready.clear()
                 LOGGER.exception("LFM GPU reset failed; prefix snapshot invalidated")
@@ -1060,7 +1081,7 @@ class Runner:
                 raise TypeError("Expected a list of integer vocabulary IDs")
             return self._execute(token_ids.copy())
 
-    def _copy_prefix_state(self, length: int, *, restore: bool) -> None:
+    def _copy_prefix_state(self, length: int, *, restore: bool, slot: int = 0) -> None:
         """Copy prefix KV and convolution state between live and snapshot buffers.
 
         Args:
@@ -1069,6 +1090,9 @@ class Runner:
 
             restore:
                 If true, restore the snapshot; otherwise capture live state.
+
+            slot:
+                Snapshot index, zero or one.
         """
         buffers = self.workspace.buffers
         for layer in range(16):
@@ -1080,20 +1104,24 @@ class Runner:
             else:
                 entries = ((f"conv_{layer}", 1024 * 3 * 4),)
             for name, size in entries:
-                live, snapshot = buffers[name], buffers[f"prefix_{name}"]
+                label = "prefix" if slot == 0 else "prefix1"
+                live, snapshot = buffers[name], buffers[f"{label}_{name}"]
                 dest, src = (live, snapshot) if restore else (snapshot, live)
                 self.cl.enqueue_copy(self.workspace.queue, dest, src, byte_count=size)
         self.workspace.queue.finish()
 
-    def cache_prefix(self, token_ids: list[int]) -> np.ndarray:
+    def cache_prefix(self, token_ids: list[int], *, slot: int = 0) -> np.ndarray:
         """Prefill and snapshot a nonempty prefix from an empty sequence.
 
-        The snapshot replaces any prior prefix. Reset preserves a completed
-        snapshot; failure invalidates it and requires reset of live state.
+        Capture replaces only the selected slot. Reset preserves completed
+        snapshots; device failure invalidates all and requires reset of live state.
 
         Args:
             token_ids:
                 Nonempty prefix IDs, bounded by the configured capacity.
+
+            slot:
+                Allocated snapshot index.
 
         Returns:
             Independent FP32 logits for the last prefix token, shape [65536].
@@ -1101,6 +1129,8 @@ class Runner:
         with self._lock:
             if not self.workspace.spec.prefix_cache:
                 raise RuntimeError("Prefix caching was not enabled at construction")
+            if type(slot) is not int or not 0 <= slot < self.workspace.spec.prefix_slots:
+                raise ValueError("Invalid prefix slot")
             if self.workspace.position != 0 or not self.valid:
                 raise RuntimeError("Reset is required before caching a prefix")
             if not isinstance(token_ids, list):
@@ -1112,22 +1142,31 @@ class Runner:
                 raise ValueError("Expected nonempty integer vocabulary IDs")
             if len(tokens) > self.workspace.spec.capacity:
                 raise ValueError("Sequence exceeds workspace capacity")
-            self._prefix_tokens = None
+            if slot == 0:
+                self._prefix_tokens = None
+            else:
+                self._extra_prefix_tokens = None
             try:
                 logits = self._execute(tokens)
-                self._copy_prefix_state(len(tokens), restore=False)
-                self._prefix_logits[:] = logits
-                self._prefix_tokens = tuple(tokens)
+                if slot == 0:
+                    self._copy_prefix_state(len(tokens), restore=False)
+                    self._prefix_logits[:] = logits
+                    self._prefix_tokens = tuple(tokens)
+                else:
+                    self._copy_prefix_state(len(tokens), restore=False, slot=slot)
+                    self._extra_prefix_logits[:] = logits
+                    self._extra_prefix_tokens = tuple(tokens)
                 return logits
             except BaseException:
                 self.valid = False
                 self._prefix_tokens = None
+                self._extra_prefix_tokens = None
                 if hasattr(self, "_prepared_ready"):
                     self._prepared_ready.clear()
                 LOGGER.exception("LFM GPU prefix capture failed; reset is required")
                 raise
 
-    def prefill_cached(self, token_ids: list[int]) -> np.ndarray:
+    def prefill_cached(self, token_ids: list[int], *, slot: int = 0) -> np.ndarray:
         """Restore a matching snapshot and prefill any remaining token suffix.
 
         A mismatch raises without modifying live or snapshot state. Reset is
@@ -1138,12 +1177,17 @@ class Runner:
             token_ids:
                 Full nonempty prompt, starting with the exact cached prefix.
 
+            slot:
+                Allocated snapshot index.
+
         Returns:
             Independent FP32 final-token logits, shape [65536].
         """
         with self._lock:
             if not self.workspace.spec.prefix_cache:
                 raise RuntimeError("Prefix caching was not enabled at construction")
+            if type(slot) is not int or not 0 <= slot < self.workspace.spec.prefix_slots:
+                raise ValueError("Invalid prefix slot")
             if self.workspace.position != 0 or not self.valid:
                 raise RuntimeError("Reset is required before cached prefill")
             if not isinstance(token_ids, list):
@@ -1155,28 +1199,34 @@ class Runner:
                 raise ValueError("Expected nonempty integer vocabulary IDs")
             if len(tokens) > self.workspace.spec.capacity:
                 raise ValueError("Sequence exceeds workspace capacity")
-            prefix = self._prefix_tokens
+            prefix = self._prefix_tokens if slot == 0 else self._extra_prefix_tokens
             if prefix is None:
                 raise RuntimeError("No valid prefix snapshot")
             if len(tokens) < len(prefix) or tuple(tokens[: len(prefix)]) != prefix:
                 raise ValueError("Prompt does not match cached prefix")
             try:
-                self._copy_prefix_state(len(prefix), restore=True)
+                if slot == 0:
+                    self._copy_prefix_state(len(prefix), restore=True)
+                else:
+                    self._copy_prefix_state(len(prefix), restore=True, slot=slot)
                 self.workspace.position = len(prefix)
                 suffix = tokens[len(prefix) :]
-                return self._execute(suffix) if suffix else self._prefix_logits.copy()
+                logits = self._prefix_logits if slot == 0 else self._extra_prefix_logits
+                return self._execute(suffix) if suffix else logits.copy()
             except BaseException:
                 self.valid = False
                 self._prefix_tokens = None
+                self._extra_prefix_tokens = None
                 if hasattr(self, "_prepared_ready"):
                     self._prepared_ready.clear()
                 LOGGER.exception("LFM GPU cached prefill failed; reset is required")
                 raise
 
     def invalidate_prefix(self) -> None:
-        """Invalidate the saved prefix without changing the live sequence."""
+        """Invalidate all saved prefixes without changing the live sequence."""
         with self._lock:
             self._prefix_tokens = None
+            self._extra_prefix_tokens = None
 
     def decode(self, token_id: int) -> np.ndarray:
         """Append one token and return its logits.
@@ -1211,6 +1261,7 @@ class Runner:
         except BaseException:
             self.valid = False
             self._prefix_tokens = None
+            self._extra_prefix_tokens = None
             if hasattr(self, "_prepared_ready"):
                 self._prepared_ready.clear()
             LOGGER.exception("LFM GPU execution failed; reset is required")

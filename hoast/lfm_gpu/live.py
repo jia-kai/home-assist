@@ -2,43 +2,49 @@
 
 import json
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any, Self
 
 from ..lfm import LFM2, tool_declarations
 from ..llm import Generation, _clear_exception_frames, _reclaim_after_generation
 from ..memory import reclaim_memory
+from ..prompts import build_system_prompt
 from .generation import GenerationConfig, GPUGeneration
 
 
 def stable_prefix(tokenizer: Any, system_prompt: str, tools: Any) -> tuple[int, ...]:
-    """Derive a token prefix before variable system suffix and conversation history.
+    """Derive a token prefix covering the complete rendered system and tool definitions.
 
     Args:
         tokenizer:
             Native tokenizer and chat template used for inference.
 
         system_prompt:
-            Fixed base instruction, before the runtime music state suffix.
+            Complete system instruction for one fixed playback state.
 
         tools:
             Registry whose actual declarations are rendered by the template.
     """
     sequences: list[list[int]] = []
-    for suffix, user in (
-        ("", "base"),
-        (" alpha", "first"),
-        (" zeta", "second"),
-        ("\nCurrent music playback state", "third"),
-    ):
+    rendered_system: str | None = None
+    for user in ("alpha", "zeta", "!", "中"):
         prompt = tokenizer.apply_chat_template(
             [
-                {"role": "system", "content": system_prompt + suffix},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user},
             ],
             tools=tool_declarations(tools),
             tokenize=False,
             add_generation_prompt=True,
         )
+        marker = "<|im_end|>\n"
+        end = prompt.find(marker)
+        if end < 0 or "<|im_start|>system\n" not in prompt[:end]:
+            raise ValueError("Unexpected LFM system template")
+        system = prompt[: end + len(marker)]
+        if rendered_system is not None and rendered_system != system:
+            raise ValueError("System template depends on user history")
+        rendered_system = system
         ids = tokenizer(prompt, add_special_tokens=False, return_tensors="np").input_ids
         if ids.ndim != 2 or ids.shape[0] != 1 or not ids.shape[1]:
             raise ValueError(
@@ -52,20 +58,33 @@ def stable_prefix(tokenizer: Any, system_prompt: str, tools: Any) -> tuple[int, 
         length += 1
     if not length:
         raise ValueError("Cannot derive a nonempty stable LFM prefix")
-    return tuple(sequences[0][:length])
+    prefix = tuple(sequences[0][:length])
+    decoded = tokenizer.decode(
+        list(prefix), skip_special_tokens=False, clean_up_tokenization_spaces=False
+    )
+    if rendered_system is None or not decoded.startswith(rendered_system):
+        raise ValueError("Stable prefix does not cover complete system and tools")
+    return prefix
 
 
 class LiveLFM2(LFM2):
-    """Own a single OpenCL runner with an explicitly initialized strict prefix."""
+    """Own one OpenCL runner with two explicitly initialized strict prefixes."""
 
     _live_active: bool = False
     """Whether generation is active, including synchronous callbacks."""
+
+    _base_prompt: str | None = None
+    """Base instruction used to construct both snapshots, or None when unloaded."""
 
     def load(self) -> Self:
         """Load the native tokenizer and exactly one capable OpenCL GPU; never fall back."""
         with self._lock:
             if self._live_active:
                 raise RuntimeError("Reentrant live model operation is not allowed")
+            if (self._model is None) != (self._base_prompt is None) or (
+                (self._model is None) != (self._tokenizer is None)
+            ):
+                raise RuntimeError("Inconsistent live model lifecycle state")
             if self._model is not None:
                 return self
             # Optional inference dependencies are loaded only when the model is opened.
@@ -112,24 +131,38 @@ class LiveLFM2(LFM2):
                 raise RuntimeError(
                     f"Expected exactly one OpenCL GPU, found {len(devices)}"
                 )
-            prefix = stable_prefix(tokenizer, self.config.system_prompt, self.tools)
+            base_prompt = self.config.system_prompt
+            prompts = tuple(
+                build_system_prompt({"status": "observed", "state": state}, base_prompt)
+                for state in ("on", "off")
+            )
+            prefixes = tuple(
+                stable_prefix(
+                    tokenizer,
+                    prompt,
+                    self.tools,
+                )
+                for prompt in prompts
+            )
             spec = WorkspaceSpec(
                 self.config.max_context_tokens,
                 min(128, self.config.max_context_tokens),
                 prepared_prefill=True,
                 prefix_cache=True,
+                prefix_slots=2,
             )
             runner = Runner(cl.CommandQueue(cl.Context([devices[0]])), path, spec)
             adapter = GPUGeneration(
                 runner,
                 tokenizer,
                 self.tools,
-                self._generation_config(),
-                prefix,
+                replace(self._generation_config(), system_prompt=prompts[1]),
+                prefixes[0],
                 strict_prefix_cache=True,
+                second_prefix=prefixes[1],
             )
             adapter.initialize_prefix()
-            self._model, self._tokenizer = adapter, tokenizer
+            self._model, self._tokenizer, self._base_prompt = adapter, tokenizer, base_prompt
             return self
 
     def close(self) -> None:
@@ -138,15 +171,21 @@ class LiveLFM2(LFM2):
             if self._live_active:
                 raise RuntimeError("Reentrant live model operation is not allowed")
             super().close()
+            self._base_prompt = None
 
     def _generation_config(self) -> GenerationConfig:
-        """Translate current serving settings without changing configured budgets."""
+        """Translate settings, mapping the loaded base prompt to the off snapshot."""
+        system_prompt = self.config.system_prompt
+        if self._base_prompt is not None and system_prompt == self._base_prompt:
+            system_prompt = build_system_prompt(
+                {"status": "observed", "state": "off"}, self._base_prompt
+            )
         return GenerationConfig(
             max_new_tokens=self.config.max_new_tokens,
             max_context_tokens=self.config.max_context_tokens,
             max_prompt_chars=self.config.max_prompt_chars,
             max_output_chars=self.config.max_output_chars,
-            system_prompt=self.config.system_prompt,
+            system_prompt=system_prompt,
             repetition_penalty=self.config.repetition_penalty,
         )
 
@@ -212,6 +251,8 @@ class LiveLFM2(LFM2):
                 raise RuntimeError("Reentrant live model operation is not allowed")
             if self._model is None or self._tokenizer is None:
                 raise RuntimeError("Load LFM2 before generating")
+            if self._base_prompt is None:
+                raise RuntimeError("Inconsistent live model lifecycle state")
             self._live_active = True
             failure: BaseException | None = None
             try:

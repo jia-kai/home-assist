@@ -45,21 +45,27 @@ class RunnerProtocol(Protocol):
         """
         ...
 
-    def cache_prefix(self, token_ids: list[int]) -> np.ndarray:
+    def cache_prefix(self, token_ids: list[int], *, slot: int = 0) -> np.ndarray:
         """Compute and snapshot a prefix from empty state.
 
         Args:
             token_ids:
                 Nonempty stable prefix IDs.
+
+            slot:
+                Snapshot index.
         """
         ...
 
-    def prefill_cached(self, token_ids: list[int]) -> np.ndarray:
+    def prefill_cached(self, token_ids: list[int], *, slot: int = 0) -> np.ndarray:
         """Restore a snapshot and prefill a matching complete prompt.
 
         Args:
             token_ids:
                 Complete prompt starting with the saved prefix.
+
+            slot:
+                Snapshot index.
         """
         ...
 
@@ -237,6 +243,17 @@ class GPUGeneration:
     strict_prefix_cache: bool = False
     """Require explicit prefix initialization, exact cache hits, and rollback."""
 
+    second_prefix: tuple[int, ...] | None = None
+    """Optional second strict prefix stored in an independent runner slot."""
+
+    _initial_second_prefix: tuple[int, ...] | None = field(
+        default=None, init=False, repr=False
+    )
+    """Immutable second prefix selected at construction."""
+
+    _active_slot: int = field(default=0, init=False, repr=False)
+    """Snapshot selected for the active strict request."""
+
     _strict_configured: bool = field(default=False, init=False, repr=False)
     """Strict mode selected at construction and immutable thereafter."""
 
@@ -268,7 +285,25 @@ class GPUGeneration:
         if self.strict_prefix_cache and prefix is None:
             raise ValueError("Strict prefix caching requires a stable prefix")
         self._initial_prefix = prefix
+        self._initial_second_prefix = self.second_prefix
         self._strict_configured = self.strict_prefix_cache
+        if self.second_prefix is not None:
+            if not self.strict_prefix_cache or prefix is None:
+                raise ValueError("Second prefix requires strict prefix caching")
+            if getattr(self.runner.workspace.spec, "prefix_slots", 1) != 2:
+                raise ValueError("Runner workspace must enable two prefix slots")
+            if (
+                not isinstance(self.second_prefix, tuple)
+                or not self.second_prefix
+                or any(
+                    type(token) is not int or not 0 <= token < VOCAB_SIZE
+                    for token in self.second_prefix
+                )
+                or len(self.second_prefix) > self.runner.workspace.spec.capacity
+                or self.second_prefix[: len(prefix)] == prefix
+                or prefix[: len(self.second_prefix)] == self.second_prefix
+            ):
+                raise ValueError("Invalid second stable prefix")
         if prefix is not None:
             if (
                 not isinstance(prefix, tuple)
@@ -325,6 +360,9 @@ class GPUGeneration:
             try:
                 self._reset()
                 self.runner.cache_prefix(list(prefix))
+                if self._initial_second_prefix is not None:
+                    self._reset()
+                    self.runner.cache_prefix(list(self._initial_second_prefix), slot=1)
                 self._cached_prefix = prefix
             except BaseException:
                 self._strict_faulted = True
@@ -337,6 +375,8 @@ class GPUGeneration:
             raise RuntimeError("Strict prefix mode was mutated")
         if self.stable_prefix != self._initial_prefix:
             raise RuntimeError("Strict stable prefix was mutated")
+        if self.second_prefix != self._initial_second_prefix:
+            raise RuntimeError("Strict second prefix was mutated")
         if self._strict_faulted:
             raise RuntimeError("Strict prefix snapshot is invalid after runner failure")
 
@@ -433,9 +473,16 @@ class GPUGeneration:
                 else:
                     try:
                         self._reset()
-                        prefix = self._initial_prefix
+                        prefix = (
+                            self._initial_prefix
+                            if self._active_slot == 0
+                            else self._initial_second_prefix
+                        )
                         assert prefix is not None
-                        self.runner.prefill_cached(list(prefix))
+                        if self._active_slot == 0:
+                            self.runner.prefill_cached(list(prefix))
+                        else:
+                            self.runner.prefill_cached(list(prefix), slot=1)
                     except BaseException as error:
                         self._strict_faulted = True
                         self._cached_prefix = None
@@ -521,13 +568,21 @@ class GPUGeneration:
                 raise ValueError("Request exceeds configured context budget")
             prefix = self.stable_prefix
             if self._strict_configured:
-                if prefix is None or tuple(tokens[: len(prefix)]) != prefix:
+                second = self._initial_second_prefix
+                if second is not None and tuple(tokens[: len(second)]) == second:
+                    prefix = second
+                    self._active_slot = 1
+                elif prefix is not None and tuple(tokens[: len(prefix)]) == prefix:
+                    self._active_slot = 0
+                else:
                     raise ValueError("Prompt does not match strict stable prefix")
                 self._strict_active = True
             self._reset()
             inference_start = time.perf_counter()
             if prefix is not None and tuple(tokens[: len(prefix)]) == prefix:
-                if self._cached_prefix != prefix:
+                if self._cached_prefix != prefix and not (
+                    self._strict_configured and self._active_slot == 1
+                ):
                     if self._strict_configured:
                         raise RuntimeError("Strict prefix snapshot is invalid")
                     self._cached_prefix = None
@@ -535,7 +590,11 @@ class GPUGeneration:
                     self._cached_prefix = prefix
                     self._reset()
                 try:
-                    logits = self.runner.prefill_cached(tokens)
+                    logits = (
+                        self.runner.prefill_cached(tokens, slot=1)
+                        if self._strict_configured and self._active_slot == 1
+                        else self.runner.prefill_cached(tokens)
+                    )
                 except BaseException:
                     # A failed restore invalidates the runner's snapshot.
                     self._cached_prefix = None

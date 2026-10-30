@@ -130,23 +130,29 @@ class FakeRunner:
             raise RuntimeError("fixture failure")
         return self.outputs[0]
 
-    def cache_prefix(self, token_ids: list[int]) -> np.ndarray:
+    def cache_prefix(self, token_ids: list[int], *, slot: int = 0) -> np.ndarray:
         """Save a simulated snapshot.
 
         Args:
             token_ids: Stable prefix IDs.
+
+            slot: Snapshot index, restricted to zero by this fixture.
         """
+        assert slot == 0
         self.cache_calls += 1
         self.prefix = tuple(token_ids)
         self.sequences[-1].extend(token_ids)
         return self.outputs[0]
 
-    def prefill_cached(self, token_ids: list[int]) -> np.ndarray:
+    def prefill_cached(self, token_ids: list[int], *, slot: int = 0) -> np.ndarray:
         """Restore an exact prefix and record the full resulting prompt.
 
         Args:
             token_ids: Complete prompt IDs.
+
+            slot: Snapshot index, restricted to zero by this fixture.
         """
+        assert slot == 0
         self.restore_calls += 1
         self._maybe_fail("prefill_cached")
         if self.fail_restore:

@@ -783,21 +783,53 @@ def test_live_music_prompt_and_announcement(pipeline: Pipeline) -> None:
 
 
 def test_music_unavailable_is_not_stale_context(pipeline: Pipeline) -> None:
-    """A failed status refresh marks music unavailable while allowing light requests.
+    """A failed status refresh maps to off while allowing light requests.
 
     Args:
         pipeline:
             Mock music provider and light tool.
 
     """
+    pipeline.music.prompt_context.return_value = {"status": "observed", "state": "on"}
     pipeline.app.assistant.refresh_music()
     pipeline.music.prompt_context.side_effect = MusicAssistantError("offline")
     pipeline.app.respond(
         VoiceTurn("Please switch the light on", 1, 2, threading.Event())
     )
-    assert '"status": "unavailable"' in pipeline.model.config.system_prompt
+    assert '"status": "observed", "state": "off"' in pipeline.model.config.system_prompt
     assert "Current Song" not in pipeline.model.config.system_prompt
     assert pipeline.timeline[-1] == "play:Light on."
+
+
+@pytest.mark.parametrize("status", ["player_required", "unavailable", "not_configured"])
+def test_music_nonobserved_prompt_is_off(pipeline: Pipeline, status: str) -> None:
+    """Map nonobserved music contexts to off without exposing provider metadata.
+
+    Args:
+        pipeline:
+            Mock music provider and model configuration.
+
+        status:
+            Nonobserved provider status to map to off.
+
+    """
+    pipeline.music.prompt_context.return_value = {"status": status, "title": "Private"}
+    pipeline.app.assistant.refresh_music()
+    assert '"status": "observed", "state": "off"' in pipeline.model.config.system_prompt
+    assert "Private" not in pipeline.model.config.system_prompt
+
+
+def test_music_not_configured_prompt_is_off(pipeline: Pipeline) -> None:
+    """Map an absent music client to off in the system prompt.
+
+    Args:
+        pipeline:
+            Mock model configuration with the music client removed.
+
+    """
+    pipeline.app.assistant.music = None
+    pipeline.app.assistant.refresh_music()
+    assert '"status": "observed", "state": "off"' in pipeline.model.config.system_prompt
 
 
 def test_disconnect_during_inference_suppresses_tools_and_tts(

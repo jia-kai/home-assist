@@ -95,8 +95,9 @@ capture after 500 ms of detected silence following speech, rather than waiting
 for the configured maximum duration. Initial silence does not trigger the
 endpoint, and speech resumption resets the trailing-silence counter.
 
-Background system music context contains only on/off state, with unavailable or
-unconfigured status kept explicit. Titles, artists, volume and source identifiers
+Background system music context contains only on/off state. Unavailable,
+unconfigured, or player-required status maps to off for routing; it does not
+confirm actual playback state. Titles, artists, volume and source identifiers
 are excluded from this context; `what_is_playing` supplies metadata for explicit
 queries and verified playback responses. Routing diagnostics distinguish the
 LLM-selected tool batch from implicit lookups inside playback handlers. Raw model

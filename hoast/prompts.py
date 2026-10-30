@@ -21,10 +21,11 @@ SYSTEM_PROMPT = (
 def build_system_prompt(
     context: Mapping[str, JsonValue], base_prompt: str = SYSTEM_PROMPT
 ) -> str:
-    """Append only playback state or explicit unavailability to routing instructions.
+    """Append only on/off playback state to routing instructions.
 
-    Extra provider metadata is deliberately excluded. Missing required state and
-    unknown status values fail rather than being interpreted as music off.
+    Unavailable, unconfigured and player-required contexts map to observed off.
+    Extra provider metadata is excluded. Missing observed state and unknown
+    status values fail rather than being interpreted as music off.
 
     Args:
         context:
@@ -40,7 +41,7 @@ def build_system_prompt(
     status = context["status"]
     if status not in ("observed", "player_required", "unavailable", "not_configured"):
         raise ValueError("Unexpected music prompt status")
-    safe: dict[str, JsonValue] = {"status": status}
+    safe: dict[str, JsonValue] = {"status": "observed", "state": "off"}
     if status == "observed":
         state = context["state"]
         if state not in ("on", "off"):

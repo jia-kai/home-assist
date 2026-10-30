@@ -124,7 +124,7 @@ class Assistant:
     """Loaded model session with configured weather, music, and light tools."""
 
     music: MusicClient | None = None
-    """Optional live music status source; absence is explicitly stated in the prompt."""
+    """Optional live music status source; absence maps to off in the prompt."""
 
     weather_cache: WeatherCache | None = None
     """Optional prepared weather cache shared with the registered handler."""
@@ -137,10 +137,10 @@ class Assistant:
         self.base_prompt = self.agent.session.model.config.system_prompt
 
     def refresh_music(self) -> None:
-        """Include only on/off music state or explicit unavailability in the system prompt.
+        """Include only on/off music state in the system prompt.
 
         Project the provider result onto status/state keys so media labels cannot
-        enter the background prompt, even if a provider supplies extra metadata.
+        enter the background prompt. Missing or unavailable music maps to off.
         """
         context = {"status": "not_configured"} if self.music is None else None
         if self.music is not None:
